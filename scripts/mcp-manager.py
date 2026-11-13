@@ -94,15 +94,15 @@ def verify_mcp(name):
 
     def send(message):
         data = json.dumps(message, separators=(",", ":"))
-        proc.stdin.write((data + "\\n").encode())
+        proc.stdin.write((data + "\n").encode())
         proc.stdin.flush()
 
     def receive(request_id):
         nonlocal buffer
 
         while time.monotonic() < deadline:
-            while b"\\n" in buffer:
-                line, _, rest = buffer.partition(b"\\n")
+            while b"\n" in buffer:
+                line, _, rest = buffer.partition(b"\n")
                 buffer = bytearray(rest)
 
                 try:
