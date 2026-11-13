@@ -1,0 +1,264 @@
+{
+  "index_patterns": [
+    "case-*-amcache-*",
+    "case-*-shimcache-*",
+    "case-*-mft-*",
+    "case-*-usn-*",
+    "case-*-registry-*",
+    "case-*-shellbags-*",
+    "case-*-jumplists-*",
+    "case-*-lnk-*",
+    "case-*-recyclebin-*",
+    "case-*-timeline-*",
+    "case-*-srum-*"
+  ],
+  "template": {
+    "settings": {
+      "index.number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "host.name": {
+          "type": "keyword"
+        },
+        "host.id": {
+          "type": "keyword"
+        },
+        "vhir.source_file": {
+          "type": "keyword"
+        },
+        "vhir.ingest_audit_id": {
+          "type": "keyword"
+        },
+        "vhir.table": {
+          "type": "keyword"
+        },
+        "vhir.vss_id": {
+          "type": "keyword"
+        },
+        "pipeline_version": {
+          "type": "keyword"
+        },
+        "vhir.parse_method": {
+          "type": "keyword"
+        },
+        "FileKeyLastWriteTimestamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastModifiedTimeUTC": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastWriteTimestamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastInteracted": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastModified": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "TargetModified": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "DeletedOn": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "Created0x10": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "UpdateTimestamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "Created0x30": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastModified0x10": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastModified0x30": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastRecordChange0x10": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastRecordChange0x30": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastAccess0x10": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastAccess0x30": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "KeyLastWriteTimestamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LinkDate": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "InstallDate": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "DriverLastWriteTime": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "DriverTimeStamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "CreatedOn": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "ModifiedOn": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "AccessedOn": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastWriteTime": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "FirstInteracted": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "SourceCreated": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "SourceModified": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "SourceAccessed": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "TargetCreated": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "TargetAccessed": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "TrackerCreatedOn": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "CreationTime": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "LastModifiedTime": {
+          "type": "date",
+          "format": "strict_date_optional_time||yyyy-MM-dd HH:mm:ss.SSSSSSS||yyyy-MM-dd HH:mm:ss||epoch_millis",
+          "ignore_malformed": true
+        },
+        "triage.verdict": {
+          "type": "keyword"
+        },
+        "triage.reason": {
+          "type": "keyword"
+        },
+        "triage.lolbin": {
+          "type": "boolean"
+        },
+        "triage.checked": {
+          "type": "boolean"
+        },
+        "triage.expected_paths": {
+          "type": "keyword"
+        },
+        "triage.confidence": {
+          "type": "keyword"
+        },
+        "threat_intel.verdict": {
+          "type": "keyword"
+        },
+        "threat_intel.confidence": {
+          "type": "integer"
+        },
+        "threat_intel.labels": {
+          "type": "keyword"
+        },
+        "threat_intel.source": {
+          "type": "keyword"
+        },
+        "threat_intel.ioc_type": {
+          "type": "keyword"
+        },
+        "threat_intel.ioc_value": {
+          "type": "keyword"
+        },
+        "threat_intel.enriched_at": {
+          "type": "date"
+        },
+        "threat_intel.checked": {
+          "type": "boolean"
+        },
+        "threat_intel.iocs.outcome": {"type": "keyword"},
+        "threat_intel.iocs.ioc_value": {"type": "keyword"},
+        "threat_intel.iocs.ioc_type": {"type": "keyword"}
+      }
+    }
+  },
+  "priority": 10
+}

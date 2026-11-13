@@ -1,0 +1,1259 @@
+"""Post-ingest threat-intel enrichment: each IOC is looked up with the
+threat-intel backend's lookup_ioc (through the gateway), and every platform's
+answer is stamped on the documents carrying it, as the platform gave it."""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from opensearchpy import OpenSearch
+
+# --- Rate-limit pacing + hint parsing (Fix F) ---
+#
+# lookup_ioc (threat intel) answers a drained query limit with an error
+# carrying a wait hint ("Rate limit exceeded for {limit_type}. Wait
+# {wait_seconds:.1f}s."), and a platform that rate-limits with an
+# UNAVAILABLE reason saying "Too Many Requests". Either is waited out and
+# retried, never counted as a circuit-breaker failure. Pacing + hint
+# parsing together prevent self-inflicted rate limits.
+
+_WAIT_RE = re.compile(r"[Ww]ait\s+([\d.]+)", re.IGNORECASE)
+
+# Env-configurable with lower-bound clamping. Read at call time so
+# tests can monkeypatch via monkeypatch.setenv after import. A typo of
+# 0 would disable pacing/halting entirely, defeating the purpose.
+
+
+def _min_interval_sec() -> float:
+    return max(10, int(os.environ.get("VHIR_INTEL_MIN_INTERVAL_MS", "100"))) / 1000.0
+
+
+def _circuit_threshold() -> int:
+    return max(1, int(os.environ.get("VHIR_INTEL_BREAKER_THRESHOLD", "10")))
+
+
+def _rate_limit_max_retries() -> int:
+    return max(1, int(os.environ.get("VHIR_INTEL_RATE_LIMIT_RETRIES", "5")))
+
+
+class IntelEnrichmentHalted(RuntimeError):
+    """Raised when an enrichment run cannot report itself complete: an
+    extracted IOC has no confirmed lookup (gateway missing, lookups failing,
+    rate limit exhausted, an unconfirmed not-found, the circuit breaker), or
+    a stamp did not land. The answers that were confirmed are still
+    stamped; the message says what is missing and why.
+
+    `summary` holds the run's counts when the halt comes after stamping:
+    documents were modified, and the caller records them."""
+
+    def __init__(self, reason: str, summary: dict | None = None):
+        super().__init__(reason)
+        self.summary = summary
+
+
+def _parse_wait_hint(msg: str, default: float = 20.0) -> float:
+    """Extract 'Wait X.Xs' seconds from a rate-limit message.
+
+    Returns hinted seconds + 0.5s jitter, clamped to [0.5, 120.0].
+    Falls back to default on unparseable input.
+    """
+    if not msg:
+        return default
+    m = _WAIT_RE.search(msg)
+    if not m:
+        return default
+    try:
+        return max(0.5, min(float(m.group(1)) + 0.5, 120.0))
+    except ValueError:
+        return default
+
+
+def _is_rate_limit(msg: str) -> bool:
+    """True if an OpenCTI error message indicates rate-limiting."""
+    lower = (msg or "").lower()
+    return "rate limit" in lower or "too many requests" in lower
+
+
+# --- Coverage map persistence (Fix F) ---
+#
+# The enrichment loop persists a per-IOC status map to
+# {case_dir}/enrichment/coverage-{run_id}.json via atomic rename on
+# every IOC completion. A crash mid-run leaves a valid JSON file on
+# disk reflecting the last-completed IOC, so the examiner can resume
+# enrichment targeting only the unenriched IOCs.
+
+
+def _coverage_path_for_run(run_id: str) -> Path:
+    """Resolve the on-disk coverage-map path for this enrichment run."""
+    from opensearch_mcp.paths import vhir_dir
+
+    active_case_file = vhir_dir() / "active_case"
+    case_dir: Path
+    if active_case_file.exists():
+        raw = active_case_file.read_text().strip()
+        case_dir = Path(raw) if raw else vhir_dir() / "cases" / "unknown"
+    else:
+        case_dir = vhir_dir() / "cases" / "unknown"
+    enrichment_dir = case_dir / "enrichment"
+    enrichment_dir.mkdir(parents=True, exist_ok=True)
+    safe_run = re.sub(r"[^A-Za-z0-9._-]", "_", run_id or "unknown")
+    return enrichment_dir / f"coverage-{safe_run}.json"
+
+
+def _atomic_write_coverage(path: Path, data: dict) -> None:
+    """Write coverage map via atomic rename.
+
+    POSIX os.replace is atomic on the same filesystem. Crash after
+    rename leaves a valid JSON; crash before leaves the previous
+    version intact.
+    """
+    tmp = path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, default=str))
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _load_coverage(path: Path) -> dict:
+    """Load existing coverage map (for resume) or return empty scaffold."""
+    try:
+        if path.exists():
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                data.setdefault("enriched", [])
+                data.setdefault("skipped", {})
+                return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"enriched": [], "skipped": {}}
+
+
+# Fields read for each IOC type. A bare name is a `keyword` field as the json
+# and delimited templates map it; its `.keyword` form is the sub-field a
+# dynamically mapped `text` field gets (csv, vol3). A form an index does not
+# have aggregates to nothing. The newer names were measured on real cases
+# (2026-09-30): the evidence held its IOCs under them and nothing read them.
+_IP_FIELDS = [
+    "source.ip",  # explicit ip type in evtx/accesslog/w3c templates
+    "destination.ip",  # ECS: w3c's server address; json indices as given
+    "destination.ip.keyword",
+    "ForeignAddr",  # Volatility netscan CSV via idx_ingest_delimited (keyword)
+    "ForeignAddr.keyword",  # dynamic in vol3_template
+    "LocalAddr",  # keyword where a delimited or json index declares it
+    "LocalAddr.keyword",  # dynamic in vol3_template
+    "ForeignAddress",  # Kansa netstat
+    "ForeignAddress.keyword",
+    "Raddr.IP",  # Velociraptor Windows.Network.Netstat remote address
+    "Raddr.IP.keyword",
+    "winlog.event_data.IpAddress",  # Security logons
+    "winlog.event_data.IpAddress.keyword",
+    "winlog.event_data.SourceIp",  # Sysmon network connections
+    "winlog.event_data.SourceIp.keyword",
+    "winlog.event_data.DestinationIp",
+    "winlog.event_data.DestinationIp.keyword",
+]
+
+_HASH_FIELDS = [
+    "SHA1",  # Velociraptor Windows.Detection.Amcache
+    "SHA1.keyword",  # dynamic in csv_template (Amcache, EZ CSV)
+    "SHA256",  # keyword in delimited and json indices
+    "SHA256.keyword",  # dynamic in csv_template
+    "MD5",
+    "MD5.keyword",  # dynamic in csv_template
+    "Hash.MD5",  # Velociraptor Windows.System.Pslist
+    "Hash.MD5.keyword",
+    "Hash.SHA1",
+    "Hash.SHA1.keyword",
+    "Hash.SHA256",
+    "Hash.SHA256.keyword",
+    "Hash",  # Kansa ProcsWMI (upper-case MD5); a Prefetch path hash fails validation
+    "Hash.keyword",
+    "winlog.event_data.Hashes",  # Sysmon 1/6/7: "MD5=…,SHA256=…,IMPHASH=…", parsed
+    "winlog.event_data.Hashes.keyword",
+    "SHA-256",  # Kansa Autorunsc, Velociraptor Windows.Sysinternals.Autoruns
+    "SHA-1",
+    "PathMD5Sum",  # Kansa SvcAll
+    "ServiceDLLMD5Sum",
+]
+
+# Bulk filesystem hashes — about 140,000 per host — are read only on request.
+_FILESYSTEM_HASH_FIELDS = [
+    "md5",  # bodyfile
+    "md5.keyword",
+]
+
+# json and delimited indices map strings as keyword; an index whose name also
+# matches another template's pattern maps them as text with a .keyword
+# sub-field. Both forms are listed, as for hashes and IPs.
+_DOMAIN_FIELDS = [
+    "dns.query",  # json
+    "dns.query.keyword",
+    "dns.question.name",  # ECS DNS events
+    "dns.question.name.keyword",
+    "destination.domain",  # ECS
+    "destination.domain.keyword",
+    "query",  # json, delimited
+    "query.keyword",
+    "source_host.keyword",  # B36 renamed field; often the collecting host
+    "server_name",  # delimited (Zeek ssl.log)
+    "server_name.keyword",
+    "winlog.event_data.QueryName",  # Sysmon DNS queries
+    "winlog.event_data.QueryName.keyword",
+]
+
+# The hashes of zero bytes. They identify no file — pslist records them for
+# processes with no image path (System, Registry) — and threat-intel sources
+# list them as indicators, so a lookup would mark those processes suspicious.
+_EMPTY_INPUT_HASHES = frozenset(
+    hashlib.new(algorithm, b"").hexdigest() for algorithm in ("md5", "sha1", "sha256")
+)
+
+# Hash kinds kept from a Sysmon `Hashes` value. IMPHASH hashes a PE's import
+# table, not the file, so it is never looked up as a file hash.
+_SYSMON_HASH_KINDS = frozenset({"MD5", "SHA1", "SHA256"})
+
+
+def _sysmon_hashes(value: str) -> list[str]:
+    """The MD5 / SHA1 / SHA256 parts of a Sysmon `Hashes` value."""
+    parts = []
+    for part in value.split(","):
+        kind, _, digest = part.strip().partition("=")
+        if kind.strip().upper() in _SYSMON_HASH_KINDS:
+            parts.append(digest.strip())
+    return parts
+
+
+_PARSED_FIELDS = {
+    "winlog.event_data.Hashes": _sysmon_hashes,
+    "winlog.event_data.Hashes.keyword": _sysmon_hashes,
+}
+
+
+# Unique values read per field in one run. A field with more is capped and
+# the run is incomplete. Documents already stamped are left out of the next
+# run without `force`, but values that are never stamped (malformed values,
+# the zero-byte hashes, private addresses) keep their place in the window.
+_EXTRACTION_CAP = 10_000
+
+
+class IOCExtractionError(RuntimeError):
+    """A request extraction depends on failed; its values are unknown, which
+    must not read as "no IOCs"."""
+
+
+def _is_external(ip_str: str) -> bool:
+    """Filter out RFC1918, loopback, link-local, multicast."""
+    try:
+        address = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    # `is_global` is True for multicast (224.0.0.251, 239.255.255.250,
+    # ff02::fb), which Sysmon DestinationIp and Kansa ARP carry.
+    return address.is_global and not address.is_multicast
+
+
+# Hash validation — covers every STIX file-hash type OpenCTI's
+# stix_cyber_observable schema accepts (UAT 2026-04-23 follow-up to the
+# rate-limit raise). Without this, the extractor used to ship any value
+# from a SHA256/SHA1/MD5 field to OpenCTI, including text fragments
+# that looked nothing like a hash — OpenCTI's fuzzy search would return
+# real-looking label matches (malware-bazaar, rat, loader) and stamp
+# clean docs MALICIOUS. Fast + noisy is worse than slow + noisy, so
+# validator ships before any bulk run against the raised rate limit.
+#
+# Hex hash lengths (all length-ambiguous — we do NOT pre-classify by
+# length; OpenCTI's stix_cyber_observable.list(search=...) multi-field
+# matches across all hash fields. Pre-classification would misattribute
+# IMPHASH as MD5, PESHA1 as SHA-1, etc.):
+#   32  — MD5, IMPHASH, AUTHENTIHASH, GIMPHASH, MD6, JA3, JA3S
+#   40  — SHA-1, RIPEMD-160, PESHA1  (NOTE: Ethereum wallets are 40-hex
+#         but always carry a `0x` prefix → _HEX_RE rejects them here;
+#         the 0x prefix makes the total length 42 and the `x` fails the
+#         hex class. Wallets in hash fields are therefore correctly
+#         dropped; a future crypto-wallet observable type would extract
+#         them from a dedicated field.)
+#   56  — SHA-224, SHA3-224
+#   64  — SHA-256, SHA3-256, PESHA256, BLAKE2s, BLAKE3
+#   96  — SHA-384, SHA3-384
+#   128 — SHA-512, SHA3-512, WHIRLPOOL, BLAKE2b
+#
+# Fuzzy hashes (non-hex):
+#   SSDEEP   — <n>:<base64ish>:<base64ish>
+#   TLSH     — T1/T2 + 70 hex (first char is T)
+#   TELFHASH — 70 lowercase alphanumeric
+#
+# Not supported (fall through to reject — rare enough in forensic
+# corpora that the 2-line addition isn't worth the surface area):
+#   JA4      — colon-segmented (e.g. t13d1516h2_8daaf6152771_...)
+#   JARM     — 62 hex
+# Add to _HEX_HASH_LENGTHS / a dedicated regex if they become needed.
+_HEX_HASH_LENGTHS = frozenset({32, 40, 56, 64, 96, 128})
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_SSDEEP_RE = re.compile(r"^\d+:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$")
+_TLSH_RE = re.compile(r"^T[12][0-9A-Fa-f]{70}$")
+_TELFHASH_RE = re.compile(r"^[a-z0-9]{70}$")
+
+
+def _is_valid_hash(val: str) -> bool:
+    """Validate a hash observable against STIX file-hash formats.
+
+    Accepts any hex hash at a recognised cryptographic length, plus
+    SSDEEP / TLSH / TELFHASH fuzzy hashes. Rejects everything else —
+    including text fragments from mis-mapped amcache/evtx/mft fields
+    that previously slipped through as `ioc_type=hash` and drove the
+    observed false-positive MALICIOUS stamps.
+    """
+    if not val:
+        return False
+    length = len(val)
+    if length in _HEX_HASH_LENGTHS and _HEX_RE.match(val):
+        return True
+    if length == 72 and _TLSH_RE.match(val):
+        return True
+    if length == 70 and _TELFHASH_RE.match(val):
+        return True
+    if _SSDEEP_RE.match(val):
+        return True
+    return False
+
+
+# Domain validation — RFC 1035 label rules, with pragmatic concessions:
+# single-label hostnames are rejected (netbios names aren't OpenCTI
+# observables), IP-as-string is rejected here (gets routed to ip path),
+# anything with whitespace, control chars, or path separators is
+# rejected (source_host.keyword picks up a lot of these from evtx).
+_DOMAIN_LABEL_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def _is_valid_domain(val: str) -> bool:
+    """Validate a domain observable against RFC 1035 label rules.
+
+    Rejects single-label hostnames (netbios), IP literals (routed via
+    the ip path), and anything with whitespace / control chars /
+    path separators. Accepts underscores ONLY in labels that are not
+    the TLD — pure-DNS policies reject underscores but many real
+    records (DMARC, DKIM TXT) include them, and OpenCTI stores them.
+    """
+    if not val or len(val) > 253:
+        return False
+    # Reject control chars, whitespace, slashes, and common garbage.
+    if any(c.isspace() or c in "\\/:\x00" for c in val):
+        return False
+    # Reject IP literals — they belong on the ip path.
+    try:
+        ipaddress.ip_address(val)
+        return False
+    except ValueError:
+        pass
+    labels = val.split(".")
+    if len(labels) < 2:
+        return False  # Single-label hostnames aren't DNS observables
+    for label in labels:
+        # Allow underscores in non-TLD labels (DMARC / DKIM etc.).
+        check = _DOMAIN_LABEL_RE
+        if label is not labels[-1] and "_" in label:
+            if not re.match(r"^(?!-)[A-Za-z0-9_-]{1,63}(?<!-)$", label):
+                return False
+            continue
+        if not check.match(label):
+            return False
+    tld = labels[-1]
+    if len(tld) < 2 or not tld.isalpha():
+        return False
+    return True
+
+
+def _lookup_form(ioc_type: str, value: str) -> str:
+    """The value as it is looked up and deduplicated: lower case where case
+    carries no meaning (hex hashes, IPs, domains). SSDEEP is base64 and TLSH
+    has a format prefix, so both are kept as they are."""
+    if ioc_type != "hash" or _HEX_RE.match(value):
+        return value.lower()
+    return value
+
+
+def _aggregatable(caps: dict, field: str) -> bool:
+    """Whether any index can run a terms aggregation on `field`.
+
+    An index that maps the field as text (PECmd prefetch's `Hash`, by dynamic
+    mapping) cannot. Where others can, the search returns their values and
+    that index's shards fail inside the 200; where none can, the search
+    fails, so the field is not searched. `caps` is a `_field_caps` response.
+    """
+    # `non_aggregatable_indices` is listed only when some indices of a type
+    # can aggregate the field and others cannot (a keyword without doc values).
+    return any(
+        entry.get("aggregatable") or entry.get("non_aggregatable_indices")
+        for entry in caps.get("fields", {}).get(field, {}).values()
+    )
+
+
+def extract_unique_iocs(
+    client: OpenSearch,
+    index_pattern: str,
+    force: bool = False,
+    include_filesystem: bool = False,
+    capped: dict[str, int] | None = None,
+) -> dict[str, dict[str, set[tuple[str, str]]]]:
+    """Extract unique IOCs from indexed data using aggregations.
+
+    Returns {ioc_type: {lookup value: {(field, value as stored)}}}: stamping
+    needs the stored form, which differs from the lookup value for an
+    upper-case hash and for every part of a Sysmon `Hashes` string.
+
+    If force=False, skip docs already enriched (threat_intel.checked: true).
+    `include_filesystem` adds bulk filesystem hashes (bodyfile). A field with
+    more than `_EXTRACTION_CAP` unique values is recorded in `capped`, with
+    how many more documents carry its unread values.
+
+    A failed request raises IOCExtractionError: its values are unknown, and
+    reading them as absent would report a case as having no IOCs.
+    """
+    iocs: dict[str, dict[str, set[tuple[str, str]]]] = {"ip": {}, "hash": {}, "domain": {}}
+    warnings: list[str] = []
+    # Per-field rejection counts. Without field attribution, operators
+    # can't tell WHICH field is feeding garbage values into the
+    # extractor — and can't tune the field list. Aggregate rejects
+    # per field and surface them as warnings at the end.
+    rejected_by_field: dict[str, int] = {}
+
+    query: dict = {"match_all": {}}
+    if not force:
+        query = {
+            "bool": {
+                "must_not": [{"exists": {"field": "threat_intel.checked"}}],
+            }
+        }
+
+    # Per-type validators (UAT 2026-04-23): without these, any value
+    # aggregated from a *_HASH_FIELDS / *_DOMAIN_FIELDS field was passed
+    # through to OpenCTI. OpenCTI's fuzzy-label match then produced
+    # real-looking MALICIOUS stamps on doc fragments like
+    # "astloggedonuser:[(-1,1)]..." — ~845K false positives in the
+    # observed case. Validators reject malformed values at extraction
+    # time so OpenCTI only ever sees something that parses as its
+    # claimed type. IP already had _is_external (which requires a
+    # parseable address).
+    validators: dict[str, Any] = {
+        "ip": _is_external,
+        "hash": _is_valid_hash,
+        "domain": _is_valid_domain,
+    }
+
+    hash_fields = _HASH_FIELDS + (_FILESYSTEM_HASH_FIELDS if include_filesystem else [])
+    field_sets = [("ip", _IP_FIELDS), ("hash", hash_fields), ("domain", _DOMAIN_FIELDS)]
+    try:
+        caps = client.field_caps(
+            index=index_pattern,
+            fields=",".join(field for _, fields in field_sets for field in fields),
+            request_timeout=60,
+        )
+    except Exception as e:
+        raise IOCExtractionError(
+            f"IOC extraction failed reading field mappings: {type(e).__name__}: {e}"
+        ) from e
+    for ioc_type, fields in field_sets:
+        validate = validators[ioc_type]
+        for field in fields:
+            if not _aggregatable(caps, field):
+                continue
+            try:
+                result = client.search(
+                    index=index_pattern,
+                    body={
+                        "query": query,
+                        "size": 0,
+                        "aggs": {"values": {"terms": {"field": field, "size": _EXTRACTION_CAP}}},
+                    },
+                    request_timeout=60,
+                )
+            except Exception as e:
+                raise IOCExtractionError(
+                    f"IOC extraction failed on {field}: {type(e).__name__}: {e}"
+                ) from e
+            agg_vals = result["aggregations"]["values"]
+            other_count = agg_vals.get("sum_other_doc_count", 0)
+            if other_count > 0:
+                warnings.append(
+                    f"{field}: capped at {_EXTRACTION_CAP:,} unique values; "
+                    f"{other_count} more documents carry values not read"
+                )
+                if capped is not None:
+                    capped[field] = other_count
+            split = _PARSED_FIELDS.get(field)
+            field_rejects = 0
+            for bucket in agg_vals["buckets"]:
+                stored = str(bucket["key"])
+                for val in split(stored) if split else [stored]:
+                    if validate(val):
+                        lookup = _lookup_form(ioc_type, val)
+                        if ioc_type == "hash" and lookup in _EMPTY_INPUT_HASHES:
+                            continue
+                        iocs[ioc_type].setdefault(lookup, set()).add((field, stored))
+                    else:
+                        field_rejects += 1
+            if field_rejects:
+                rejected_by_field[field] = rejected_by_field.get(field, 0) + field_rejects
+
+    for w in warnings:
+        print(f"WARNING: {w}", file=sys.stderr)
+
+    # Surface per-field rejection totals so operators can audit which
+    # mapped field is producing non-IOC text (e.g. amcache
+    # astloggedonuser bleeding into SHA256.keyword). Sorted high→low so
+    # the top offender is obvious.
+    if rejected_by_field:
+        total = sum(rejected_by_field.values())
+        print(
+            f"INFO: dropped {total} malformed values at extraction "
+            "(failed type validation; would otherwise produce OpenCTI "
+            "false-positive stamps):",
+            file=sys.stderr,
+        )
+        for field, count in sorted(rejected_by_field.items(), key=lambda kv: -kv[1])[:10]:
+            print(f"  {field}: {count} rejected", file=sys.stderr)
+
+    return iocs
+
+
+MATCH, NO_MATCH, UNAVAILABLE = "MATCH", "NO_MATCH", "UNAVAILABLE"
+_CONFIRMED = (MATCH, NO_MATCH)
+
+
+def _entry(ioc_type: str, value: str, outcome: str, reply: dict | None, reason: str = "") -> dict:
+    """One IOC's entry on a document: the outcome, when it was asked, and
+    each provider's answer verbatim under its own name."""
+    entry: dict[str, Any] = {
+        "ioc_type": ioc_type,
+        "ioc_value": value,
+        "outcome": outcome,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if reason:
+        entry["reason"] = reason[:500]
+    providers = (reply or {}).get("providers")
+    if isinstance(providers, dict):
+        for name, block in providers.items():
+            if isinstance(name, str) and isinstance(block, dict) and name not in entry:
+                entry[name] = block
+    return entry
+
+
+def _blocks(entry: dict) -> dict:
+    """An entry's per-provider answers (each under the provider's name)."""
+    return {k: v for k, v in entry.items() if isinstance(v, dict) and "outcome" in v}
+
+
+def _unanswered(entry: dict) -> list[str]:
+    """The providers whose block in `entry` isn't an answer (MATCH or NO_MATCH)."""
+    return [n for n, b in _blocks(entry).items() if b.get("outcome") not in _CONFIRMED]
+
+
+def _unconfirmed_why(resp: dict, value: str) -> str:
+    if resp.get("error"):
+        return f"error: {resp.get('message') or resp['error']}"
+    outcome = resp.get("outcome")
+    if outcome == UNAVAILABLE:
+        return f"unavailable: {resp.get('reason') or resp.get('note') or 'no reason given'}"
+    if outcome is None:
+        if resp.get("text"):  # tool output that isn't a JSON object
+            return f"unconfirmed: {str(resp['text'])[:200]}"
+        return "unconfirmed: the reply has no outcome (an older threat-intel backend)"
+    if outcome not in _CONFIRMED:
+        return f"unconfirmed: unknown outcome {str(outcome)[:40]!r}"
+    return "unconfirmed: the reply is for another IOC"
+
+
+def _rate_limited(resp: dict) -> str:
+    """The rate-limit message in a reply, or "": a query-limit error, or an
+    UNAVAILABLE with a rate-limited provider (waited out and retried even
+    when another provider is down)."""
+    if resp.get("error"):
+        msg = str(resp.get("message") or resp["error"])
+        return msg if _is_rate_limit(msg) else ""
+    if resp.get("outcome") != UNAVAILABLE:
+        return ""
+    reasons = [
+        str(block.get("reason") or "")
+        for block in _providers(resp).values()
+        if isinstance(block, dict) and block.get("outcome") == UNAVAILABLE
+    ]
+    return "; ".join(r for r in reasons if _is_rate_limit(r))
+
+
+def _providers(resp: dict) -> dict:
+    """The reply's per-provider answers; {} when it has none or they aren't
+    an object (that reply is then malformed, see batch_lookup)."""
+    providers = resp.get("providers")
+    return providers if isinstance(providers, dict) else {}
+
+
+def batch_lookup(
+    iocs: dict[str, set[str]],
+    on_progress=None,
+) -> dict[str, dict]:
+    """Look up IOCs with lookup_ioc (threat intel), through the gateway.
+
+    MATCH and NO_MATCH are confirmed. An UNAVAILABLE reply, a reply with no
+    `outcome` (an older backend) or for another IOC, and an error are not:
+    they still get an UNAVAILABLE entry (the "couldn't ask" outcome), stay
+    in the coverage map's skipped list and keep the run incomplete.
+
+    The circuit breaker counts consecutive failures per provider (a
+    provider's UNAVAILABLE) and for the backend itself (errors, unreadable
+    replies); it halts the run when the backend's count, or every
+    provider's, reaches the threshold, so one provider down never stops
+    another's answers. Rate limits are waited out and retried, never
+    counted. Pacing is ~10 QPS by default.
+
+    Returns {ioc_value: {"ioc_type", "confirmed", "entry"}} plus an
+    "_intel_coverage" key with the complete enriched/skipped map. The
+    coverage map is persisted after every IOC, so a crashed run resumes.
+    """
+    from opensearch_mcp.gateway import call_tool, gateway_available
+
+    if not gateway_available():
+        raise IntelEnrichmentHalted("gateway not configured — no IOC was looked up")
+
+    run_id = os.environ.get("VHIR_INGEST_RUN_ID", "") or f"enrich-{os.getpid()}"
+    coverage_path = _coverage_path_for_run(run_id)
+    coverage = _load_coverage(coverage_path)  # resume-aware
+    already_done = set(coverage["enriched"]) | set(coverage["skipped"].keys())
+
+    # Snapshot env-tuned thresholds at call time (allows monkeypatch in tests).
+    min_interval = _min_interval_sec()
+    circuit_threshold = _circuit_threshold()
+    rate_limit_max_retries = _rate_limit_max_retries()
+
+    results: dict = {}
+    total = sum(len(v) for v in iocs.values())
+    done = 0
+    backend_failures = 0  # consecutive errors and unreadable replies
+    provider_failures: dict[str, int] = {}  # consecutive UNAVAILABLE, per provider
+    last_call = 0.0  # monotonic clock of last request
+
+    def tripped() -> str:
+        if backend_failures >= circuit_threshold:
+            return f"{backend_failures} consecutive lookup errors"
+        if provider_failures and all(n >= circuit_threshold for n in provider_failures.values()):
+            names = ", ".join(sorted(provider_failures))
+            return f"every provider ({names}) unavailable {circuit_threshold} times in a row"
+        return ""
+
+    for ioc_type, values in iocs.items():
+        for value in values:
+            why_halt = tripped()
+            if why_halt:
+                print(f"WARNING: {why_halt} — halting enrichment", file=sys.stderr)
+                coverage["skipped"].setdefault(value, "circuit_breaker_halt")
+                _atomic_write_coverage(coverage_path, coverage)
+                results["_intel_coverage"] = coverage
+                return results
+
+            done += 1
+            if on_progress and done % 50 == 0:
+                on_progress("looking_up", done=done, total=total)
+
+            # Resume: skip IOCs previously handled (enriched or skipped).
+            if value in already_done:
+                continue
+
+            # Pacing: enforce minimum gap since previous request return.
+            elapsed = time.monotonic() - last_call
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+            attempt = 0
+            ioc_handled = False
+            while attempt < rate_limit_max_retries and not ioc_handled:
+                try:
+                    resp = call_tool("lookup_ioc", {"ioc": value}, timeout=15)
+                except Exception as e:
+                    backend_failures += 1
+                    why = f"exception: {str(e)[:120]}"
+                    coverage["skipped"][value] = why
+                    results[value] = {
+                        "ioc_type": ioc_type,
+                        "confirmed": False,
+                        "entry": _entry(ioc_type, value, UNAVAILABLE, None, why),
+                    }
+                    print(f"WARNING: lookup failed for {value}: {e}", file=sys.stderr)
+                    ioc_handled = True
+                    break
+                last_call = time.monotonic()
+                if not isinstance(resp, dict):
+                    resp = {"text": json.dumps(resp)}
+
+                limited = _rate_limited(resp)
+                if limited:
+                    wait = _parse_wait_hint(limited)
+                    print(
+                        f"INFO: rate-limited on {value}; sleeping "
+                        f"{wait:.1f}s (attempt {attempt + 1}/"
+                        f"{rate_limit_max_retries})",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait)
+                    attempt += 1
+                    continue
+
+                # Each provider's own run of failures (a provider that
+                # answered resets its count, whatever another one did)
+                for name, block in _providers(resp).items():
+                    if isinstance(block, dict):
+                        if block.get("outcome") == UNAVAILABLE:
+                            provider_failures[name] = provider_failures.get(name, 0) + 1
+                        else:
+                            provider_failures[name] = 0
+
+                outcome = resp.get("outcome")
+                malformed = "providers" in resp and not isinstance(resp["providers"], dict)
+                confirmed = not malformed and (
+                    not resp.get("error") and outcome in _CONFIRMED and resp.get("ioc") == value
+                )
+                if not confirmed:
+                    why = (
+                        "malformed reply: its providers aren't an object"
+                        if malformed
+                        else _unconfirmed_why(resp, value)
+                    )
+                    if malformed or outcome != UNAVAILABLE or resp.get("error"):
+                        backend_failures += 1
+                    else:
+                        backend_failures = 0  # the backend answered
+                    coverage["skipped"][value] = why[:160]
+                    # A reply's blocks are this IOC's only when the reply is about it
+                    about = not resp.get("error") and resp.get("ioc") == value
+                    results[value] = {
+                        "ioc_type": ioc_type,
+                        "confirmed": False,
+                        "entry": _entry(
+                            ioc_type, value, UNAVAILABLE, resp if about else None, why
+                        ),
+                    }
+                    print(f"WARNING: no confirmed answer for {value}: {why}", file=sys.stderr)
+                    ioc_handled = True
+                    break
+
+                backend_failures = 0
+                coverage["enriched"].append(value)
+                results[value] = {
+                    "ioc_type": ioc_type,
+                    "confirmed": True,
+                    "entry": _entry(ioc_type, value, outcome, resp),
+                }
+                ioc_handled = True
+                break
+
+            if not ioc_handled:
+                # Loop exhausted on rate-limits only — skip this IOC
+                # without counting as a breaker failure (transient).
+                print(
+                    f"WARNING: exhausted {rate_limit_max_retries} "
+                    f"rate-limit retries for {value}; skipping",
+                    file=sys.stderr,
+                )
+                coverage["skipped"][value] = "rate_limit_exhausted"
+                why = f"rate-limited: {rate_limit_max_retries} retries exhausted"
+                results[value] = {
+                    "ioc_type": ioc_type,
+                    "confirmed": False,
+                    "entry": _entry(ioc_type, value, UNAVAILABLE, None, why),
+                }
+
+            # Persist coverage after every IOC (resumability).
+            _atomic_write_coverage(coverage_path, coverage)
+
+    results["_intel_coverage"] = coverage
+    return results
+
+
+# The keys an older release stamped on a document, one IOC per document. A
+# forced run clears them (with `checked`), so those documents are looked up
+# again and get per-IOC entries.
+_LEGACY_KEYS = (
+    "threat_intel.verdict",
+    "threat_intel.confidence",
+    "threat_intel.labels",
+    "threat_intel.ioc_value",
+    "threat_intel.ioc_type",
+    "threat_intel.source",
+    "threat_intel.enriched_at",
+    "threat_intel.checked",
+)
+
+# One IOC's entry in `threat_intel.iocs`, keyed on its exact lookup form and
+# type, merged per provider: a provider's new answer (MATCH or NO_MATCH)
+# replaces its earlier block, and an earlier answer is kept when the new block
+# isn't one (an outage never erases what a platform said); a provider the
+# reply has no block for is no longer configured, and its earlier block goes.
+# A new entry with no block at all (an error, a reply about another IOC)
+# keeps every earlier block. The outcome is
+# then recomputed from the merged blocks (a reply has one per configured
+# provider). The document is `checked` only when every entry on it has an
+# answer in each of its blocks, so a later run asks again for the rest.
+# Nothing else on the document changes.
+_STAMP_SCRIPT = """
+boolean answered(def b, def ok) { return b instanceof Map && ok.contains(b.get('outcome')); }
+boolean isBlock(def b) { return b instanceof Map && b.containsKey('outcome'); }
+boolean complete(def e, def ok) {
+  boolean any = false;
+  for (def k : e.keySet()) {
+    def b = e.get(k);
+    if (isBlock(b)) { if (!answered(b, ok)) { return false; } any = true; }
+  }
+  return any;
+}
+def key = 'threat_intel.iocs';
+def entries = ctx._source[key];
+if (!(entries instanceof List)) { entries = new ArrayList(); }
+int at = -1;
+for (int i = 0; i < entries.size(); i++) {
+  def e = entries.get(i);
+  if (e instanceof Map && params.entry.ioc_value.equals(e.get('ioc_value'))
+      && params.entry.ioc_type.equals(e.get('ioc_type'))) { at = i; break; }
+}
+def merged = new HashMap(params.entry);
+boolean blockless = true;
+for (def k : merged.keySet()) { if (isBlock(merged.get(k))) { blockless = false; } }
+if (at >= 0 && entries.get(at) instanceof Map) {
+  def old = entries.get(at);
+  for (def k : old.keySet()) {
+    def ob = old.get(k);
+    // No block at all (an error, another IOC's reply): every earlier one stays
+    // Otherwise an earlier answer stays only for a provider the reply still
+    // has a block for (one no longer configured has none)
+    if (blockless ? isBlock(ob)
+        : answered(ob, params.answered) && isBlock(merged.get(k))
+          && !answered(merged.get(k), params.answered)) {
+      merged.put(k, ob);
+    }
+  }
+}
+def names = new HashSet();
+for (def k : merged.keySet()) { if (isBlock(merged.get(k))) { names.add(k); } }
+if (!names.isEmpty()) {
+  boolean match = false;
+  boolean open = false;
+  for (def n : names) {
+    def b = merged.get(n);
+    if (b instanceof Map && 'MATCH'.equals(b.get('outcome'))) { match = true; }
+    else if (!answered(b, params.answered)) { open = true; }
+  }
+  merged.put('outcome', match ? 'MATCH' : (open ? 'UNAVAILABLE' : 'NO_MATCH'));
+  if (!open) { merged.remove('reason'); }
+}
+if (at >= 0) { entries.set(at, merged); } else { entries.add(merged); }
+ctx._source[key] = entries;
+boolean done = true;
+for (def e : entries) {
+  if (!(e instanceof Map) || !complete(e, params.answered)) { done = false; }
+}
+if (done) { ctx._source['threat_intel.checked'] = true; }
+else { ctx._source.remove('threat_intel.checked'); }
+"""
+
+
+def clear_legacy_stamps(client: OpenSearch, index_pattern: str) -> tuple[int, int]:
+    """Remove an older release's one-IOC-per-document stamp keys (only those
+    keys); returns (documents cleared, documents left on a version conflict
+    after one retry)."""
+
+    def clear() -> dict:
+        return client.update_by_query(
+            index=index_pattern,
+            body={
+                "query": {"exists": {"field": "threat_intel.ioc_value"}},
+                "script": {
+                    "source": "for (k in params.keys) { ctx._source.remove(k) }",
+                    "lang": "painless",
+                    "params": {"keys": list(_LEGACY_KEYS)},
+                },
+            },
+            request_timeout=300,
+            conflicts="proceed",
+            refresh=True,
+        )
+
+    result = clear()
+    cleared = result.get("updated", 0)
+    if result.get("version_conflicts", 0):
+        result = clear()  # the documents still carrying a stamp, once more
+        cleared += result.get("updated", 0)
+    return cleared, result.get("version_conflicts", 0)
+
+
+def stamp_documents(
+    client: OpenSearch,
+    index_pattern: str,
+    ioc_results: dict[str, dict],
+    origins: dict[str, set[tuple[str, str]]],
+    force: bool = False,
+    op_id: str = "",
+) -> tuple[int, int, int]:
+    """Stamp each looked-up IOC's entry on the documents carrying it.
+
+    Returns (documents updated, version conflicts, stamp requests that failed).
+
+    `origins` maps each looked-up value to the (field, value as stored) pairs
+    extraction found it under. The documents are matched on those: the lookup
+    value is lower-cased, and a Sysmon `Hashes` part is stored inside the
+    whole string, so a term on the lookup value missed both.
+
+    A document carrying several IOCs gets one entry per IOC; a stamp for one
+    IOC touches only its own entry. Each request refreshes, so the next one
+    reads the document it just wrote: without the refresh a later request met
+    a stale version and skipped the document. A conflict that still happens
+    is counted and returned, never retried here. `force` is handled by the
+    caller (clear_legacy_stamps).
+    """
+    total_updated = 0
+    conflicts = 0
+    failed = 0
+
+    # A text-mapped domain field matches analyzed tokens (a term on
+    # evil.example.com matches not-evil.example.com), so each domain clause
+    # is limited to the indices that map that exact field as keyword, read
+    # now: a field can gain a text mapping while the lookups run.
+    domain_fields = sorted({f for w in origins.values() for f, _ in w if f in _DOMAIN_FIELDS})
+    keyword_indices: dict[str, list[str]] | None = {}
+    if domain_fields:
+        try:
+            caps = client.field_caps(
+                index=index_pattern,
+                fields=",".join(domain_fields),
+                include_unmapped=True,
+                request_timeout=60,
+            )
+            for f in domain_fields:
+                entry = caps.get("fields", {}).get(f, {}).get("keyword")
+                keyword_indices[f] = (
+                    (entry.get("indices") or caps.get("indices", [])) if entry else []
+                )
+        except Exception as e:
+            keyword_indices = None
+            print(f"WARNING: domain stamps skipped, mappings unreadable: {e}", file=sys.stderr)
+    for ioc_value, result in sorted(ioc_results.items()):
+        where = origins.get(ioc_value)
+        if not where:
+            continue
+
+        should_clauses = []
+        for field, stored in sorted(where):
+            clause = {"term": {field: stored}}
+            if field in _DOMAIN_FIELDS:
+                if not (keyword_indices and keyword_indices.get(field)):
+                    continue
+                clause = {
+                    "bool": {"filter": [clause, {"terms": {"_index": keyword_indices[field]}}]}
+                }
+            should_clauses.append(clause)
+        if not should_clauses:
+            failed += 1
+            continue
+
+        entry = dict(result["entry"])
+        entry.setdefault("reason", "")
+        if not entry["reason"]:
+            entry.pop("reason")
+        if op_id:  # the enrichment step that wrote this provider entry
+            entry["op_id"] = op_id
+        try:
+            response = client.update_by_query(
+                index=index_pattern,
+                body={
+                    "query": {
+                        "bool": {
+                            "should": should_clauses,
+                            "minimum_should_match": 1,
+                        }
+                    },
+                    "script": {
+                        "source": _STAMP_SCRIPT,
+                        "lang": "painless",
+                        "params": {
+                            "entry": entry,
+                            "answered": list(_CONFIRMED),
+                        },
+                    },
+                },
+                request_timeout=120,
+                conflicts="proceed",
+                requests_per_second=1000,
+                refresh=True,
+            )
+            total_updated += response.get("updated", 0)
+            conflicts += response.get("version_conflicts", 0)
+        except Exception as e:
+            failed += 1
+            print(
+                f"WARNING: Update failed for {ioc_value}: {e}",
+                file=sys.stderr,
+            )
+
+    return total_updated, conflicts, failed
+
+
+def _incomplete(
+    iocs: dict[str, dict],
+    coverage: dict,
+    conflicts: int,
+    failed_stamps: int,
+    capped: dict[str, int] | None = None,
+) -> str | None:
+    """Why the run is not complete, or None if it is: every value was read,
+    every extracted IOC has a confirmed lookup and every stamp landed."""
+    enriched = set(coverage.get("enriched", []))
+    skipped = coverage.get("skipped", {})
+    extracted = [value for found in iocs.values() for value in found]
+    causes: dict[str, int] = {}
+    first = ""
+    for value in extracted:
+        if value in enriched:
+            continue
+        detail = skipped.get(value, "not looked up")
+        cause = detail.split(":", 1)[0].strip()
+        causes[cause] = causes.get(cause, 0) + 1
+        first = first or f"{value}: {detail}"
+    parts = []
+    if causes:
+        breakdown = ", ".join(f"{cause} {n}" for cause, n in sorted(causes.items()))
+        missing = sum(causes.values())
+        parts.append(
+            f"{missing} of {len(extracted)} IOCs have no confirmed lookup ({breakdown}; "
+            f"first: {first})"
+        )
+    if conflicts:
+        parts.append(f"{conflicts} documents skipped on a version conflict while stamping")
+    if failed_stamps:
+        parts.append(f"{failed_stamps} stamp requests failed")
+    if capped:
+        parts.append(_capped_reason(capped))
+    return "; ".join(parts) or None
+
+
+_PROVIDER_LABELS = {"opencti": "OpenCTI", "misp": "MISP"}
+
+
+def _not_answered(results: dict[str, dict]) -> dict[str, int]:
+    """How many of this run's IOCs each provider didn't answer."""
+    counts: dict[str, int] = {}
+    for r in results.values():
+        for name in _unanswered(r["entry"]):
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+_UNCHECKED_REMOVED = (
+    "couldn't check for stored answers from providers that are no longer configured; "
+    "this run may drop them"
+)
+
+
+def _removed_providers(
+    client, index_pattern: str, configured: set[str]
+) -> tuple[dict[str, int], bool]:
+    """Providers whose answers are stored on the case's documents but that no
+    reply this run carries (every reply about an IOC has a block per
+    configured provider), with how many documents hold one; and whether that
+    couldn't be checked in full (a request failed, or answered for only part
+    of the indices)."""
+    try:
+        caps = client.field_caps(
+            index=index_pattern, fields="threat_intel.iocs.*.outcome", request_timeout=60
+        )
+    except Exception:
+        return {}, True
+    unchecked = bool(caps.get("failures"))
+    stored = {
+        f.split(".")[2]
+        for f in caps.get("fields", {})
+        if f.count(".") == 3 and f.endswith(".outcome")
+    }
+    removed = {}
+    for name in sorted(stored - configured):
+        try:
+            resp = client.count(
+                index=index_pattern,
+                body={"query": {"exists": {"field": f"threat_intel.iocs.{name}.outcome"}}},
+            )
+        except Exception:
+            unchecked = True
+            continue
+        shards = resp.get("_shards") or {}
+        if shards.get("failed") or resp.get("timed_out"):
+            unchecked = True
+        if resp.get("count"):
+            removed[name] = resp["count"]
+    return removed, unchecked
+
+
+def _removed_warnings(removed: dict[str, int], unchecked: bool = False) -> list[str]:
+    warnings = [
+        f"{_PROVIDER_LABELS.get(name, name)} is no longer configured: its earlier answers "
+        f"on {n} documents are dropped from each document this run stamps; re-add it and "
+        "run with force to restore them."
+        for name, n in sorted(removed.items())
+    ]
+    return warnings + ([_UNCHECKED_REMOVED] if unchecked else [])
+
+
+def _not_answered_reason(counts: dict[str, int]) -> str:
+    return "; ".join(
+        f"{_PROVIDER_LABELS.get(name, name)}: {n} not answered"
+        for name, n in sorted(counts.items())
+    )
+
+
+def _capped_reason(capped: dict[str, int]) -> str:
+    return (
+        f"extraction was capped at {_EXTRACTION_CAP:,} unique values per field "
+        f"({', '.join(sorted(capped))}); values beyond the cap were not checked"
+    )
+
+
+def enrich_case(
+    client: OpenSearch,
+    case_id: str,
+    force: bool = False,
+    on_progress=None,
+    include_filesystem: bool = False,
+    audit=None,
+) -> dict:
+    """Full enrichment pipeline for a case.
+
+    `include_filesystem` also looks up bulk filesystem hashes (bodyfile).
+    The run is a reference step, written before its first write; every IOC
+    entry it stamps carries the step's id (`op_id`).
+
+    Returns summary dict, with the step's id as `reference_op`.
+    """
+    from opensearch_mcp import __version__, ops
+    from opensearch_mcp.case_scope import case_read_scope
+
+    index_pattern = case_read_scope(case_id, client)
+    from opensearch_mcp.write_context import case_dir_for
+
+    audit = ops.case_writer(audit, case_dir_for(case_id))  # the enriched case's audit
+    ref = ops.reference_step(
+        audit, "enrich_intel", "threat intel (lookup_ioc through the gateway)",
+        f"opensearch-mcp {__version__}; provider versions unknown",
+        {"case_id": case_id, "force": force, "include_filesystem": include_filesystem},
+    )  # fmt: skip
+
+    if on_progress:
+        on_progress("extracting", message="Extracting unique IOCs from indexed data")
+    capped: dict[str, int] = {}
+    iocs = extract_unique_iocs(
+        client, index_pattern, force=force, include_filesystem=include_filesystem, capped=capped
+    )
+
+    # Under force, an older release's one-IOC stamps are cleared first (even
+    # when no IOC is left to look up): the run then gives those documents
+    # per-IOC entries
+    legacy_cleared, legacy_left = clear_legacy_stamps(client, index_pattern) if force else (0, 0)
+    legacy_reason = (
+        f"{legacy_left} legacy stamps not cleared (version conflicts)" if legacy_left else ""
+    )
+
+    total_iocs = sum(len(v) for v in iocs.values())
+    if on_progress:
+        on_progress(
+            "extracted",
+            ips=len(iocs["ip"]),
+            hashes=len(iocs["hash"]),
+            domains=len(iocs["domain"]),
+        )
+
+    if total_iocs == 0:
+        if capped or legacy_reason:
+            raise IntelEnrichmentHalted(
+                "; ".join(
+                    r for r in (_capped_reason(capped) if capped else "", legacy_reason) if r
+                )
+            )
+        return {
+            "status": "no_iocs",
+            "message": "No external IOCs found in indexed data",
+            "legacy_stamps_cleared": legacy_cleared,
+            "reference_op": ref,
+        }
+
+    if on_progress:
+        on_progress("looking_up", total=total_iocs)
+    started = datetime.now(timezone.utc).isoformat()
+    results = batch_lookup(iocs, on_progress=on_progress)
+    finished = datetime.now(timezone.utc).isoformat()
+    coverage = results.pop("_intel_coverage", {})
+
+    outcomes = [r["entry"]["outcome"] if r["confirmed"] else UNAVAILABLE for r in results.values()]
+    matched = outcomes.count(MATCH)
+    not_found = outcomes.count(NO_MATCH)
+    unavailable = outcomes.count(UNAVAILABLE)
+    # Per provider: an IOC another provider matched still lacks this one's answer
+    not_answered = _not_answered(results)
+    # A provider the replies no longer carry loses its stored answers on every
+    # document this run stamps: say so before it happens
+    configured = {n for r in results.values() for n in _blocks(r["entry"])}
+    # The providers' own versions aren't known: the step's later fact names
+    # the providers that replied and when they were asked
+    ops.later(
+        audit, ref, "enrich_intel", "providers looked up",
+        extra={"lookups": {"providers": sorted(configured), "started": started,
+                           "finished": finished}},
+    )  # fmt: skip
+    warnings = (
+        _removed_warnings(*_removed_providers(client, index_pattern, configured))
+        if configured
+        else []
+    )
+
+    if on_progress:
+        on_progress("stamping", matched=matched)
+    origins = {value: where for found in iocs.values() for value, where in found.items()}
+    updated, conflicts, failed_stamps = stamp_documents(
+        client, index_pattern, results, origins, force=force, op_id=ref
+    )
+
+    counts = {
+        "reference_op": ref,
+        "iocs_extracted": total_iocs,
+        "iocs_looked_up": len(results),
+        "matched": matched,
+        "not_found": not_found,
+        "unavailable": unavailable,
+        "documents_updated": updated,
+        "version_conflicts": conflicts,
+        "legacy_stamps_cleared": legacy_cleared,
+        "not_answered": not_answered,
+        "warnings": warnings,
+    }
+    # Complete only when every IOC had a confirmed lookup and every stamp
+    # landed. A run that looked nothing up read "complete, 0 malicious".
+    reason = "; ".join(
+        r
+        for r in (
+            _not_answered_reason(not_answered),
+            _incomplete(iocs, coverage, conflicts, failed_stamps, capped),
+            legacy_reason,
+        )
+        if r
+    )
+    if reason:
+        raise IntelEnrichmentHalted(reason, summary={"status": "incomplete", **counts})
+
+    return {"status": "complete", **counts}

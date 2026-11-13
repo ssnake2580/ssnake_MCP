@@ -1,0 +1,368 @@
+"""An ingest whose worker dies before writing a status still shows, as failed.
+
+`idx_ingest` wrote no status at all, and the memory launcher's only record
+was a pid-0 placeholder it removed after the spawn, so a worker that died
+at argparse or at mount left nothing: the start said `started`, and
+idx_ingest_status showed nothing. The launchers now write a `starting`
+record under the worker's pid, and a dead worker's status carries the end of
+its log. These run real workers, in a scratch HOME; the cluster isn't used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+from unittest import mock
+
+import pytest
+from registry_rows import register
+
+from opensearch_mcp import ingest_status, shard_capacity
+from opensearch_mcp import server as srv
+
+FAKE_WORKER = """
+import os, sys, time
+from datetime import datetime, timezone
+from opensearch_mcp.ingest_status import write_status
+rid = os.environ["VHIR_INGEST_RUN_ID"]
+t0 = datetime.now(timezone.utc).isoformat()
+hosts = [{"hostname": "h1", "artifacts": [{"name": "x", "status": "running"}]}]
+write_status("c1", os.getpid(), rid, "running", hosts, {"indexed": 5}, t0)
+time.sleep(float(sys.argv[1]))
+hosts[0]["artifacts"][0]["status"] = "complete"
+write_status("c1", os.getpid(), rid, "complete", hosts, {"indexed": 10}, t0)
+"""
+
+
+@pytest.fixture
+def case(tmp_path, monkeypatch):
+    """A scratch HOME with an active case, an image and a memory dump; the
+    workers inherit the HOME, so their status files land beside ours."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(ingest_status, "_STATUS_DIR", tmp_path / ".vhir" / "ingest-status")
+    case_dir = tmp_path / "cases" / "c1"
+    case_dir.mkdir(parents=True)
+    (case_dir / "CASE.yaml").write_text("case_id: c1\n")
+    (tmp_path / ".vhir").mkdir()
+    (tmp_path / ".vhir" / "active_case").write_text(str(case_dir))
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "disk.raw").write_bytes(b"\0" * 4096)
+    (evidence / "mem.raw").write_bytes(b"\0" * 4096)
+    register(case_dir, evidence / "disk.raw", evidence / "mem.raw")
+    monkeypatch.setattr(shard_capacity, "check_shard_headroom", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(srv, "get_client", lambda: mock.MagicMock())
+    monkeypatch.setattr(srv, "_get_os", lambda: mock.MagicMock())
+    return evidence
+
+
+def _final(timeout: float = 30) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        ingests = srv.idx_ingest_status(case_id="c1").get("ingests", [])
+        if ingests and ingests[0]["status"] in ("failed", "complete"):
+            return ingests[0]
+        if time.monotonic() > deadline:
+            return {"status": None, "ingests": ingests}
+        time.sleep(0.25)
+
+
+def test_a_memory_worker_that_dies_at_argparse(case, monkeypatch):
+    spawn = srv._spawn_ingest
+    monkeypatch.setattr(srv, "_spawn_ingest", lambda cmd, *a: spawn(cmd + ["--no-such-flag"], *a))
+    resp = srv.idx_ingest_memory(path=str(case / "mem.raw"), hostname="h1", dry_run=False)
+    # a worker that already failed when the launch answers is said to have
+    # failed there and then: either way the run ends failed, and its log says why
+    assert resp["status"] in ("started", "failed"), resp
+    status = _final()
+    assert status["status"] == "failed", status
+    assert any("unrecognized arguments: --no-such-flag" in line for line in status["log_tail"]), (
+        status
+    )
+
+
+def test_an_image_that_cannot_be_mounted(case, monkeypatch, tmp_path):
+    """The mount step needs fdisk; the worker's PATH here has none. A stand-in
+    sudo runs its command unprivileged, so the sudo check passes on a host
+    without passwordless sudo and the worker gets as far as fdisk."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    sudo = bindir / "sudo"
+    sudo.write_text('#!/bin/sh\n[ "$1" = "-n" ] && shift\nexec "$@"\n')
+    sudo.chmod(0o755)
+    path = f"{bindir}:/usr/bin:/bin"
+    if shutil.which("fdisk", path=path):
+        pytest.skip("fdisk is on /usr/bin or /bin here")
+    monkeypatch.setenv("PATH", path)
+    resp = srv.idx_ingest(path=str(case / "disk.raw"), hostname="h1", dry_run=False)
+    # a worker that already failed when the launch answers is said to have
+    # failed there and then (it fails fast here, without fdisk): either way the
+    # run ends failed, and its log says why
+    assert resp["status"] in ("started", "failed"), resp
+    status = _final()
+    assert status["status"] == "failed", status
+    assert status["log_tail"], status
+    # The whole log: a short tail can start after the mount line. The worker
+    # writes "failed" before its traceback reaches the log: wait for that.
+    deadline = time.monotonic() + 30
+    while True:
+        log = Path(status["log_file"]).read_text().splitlines()
+        if any("'fdisk'" in line for line in log) or time.monotonic() > deadline:
+            break
+        time.sleep(0.1)
+    assert "Mounting disk.raw..." in log, status
+    mounting = log.index("Mounting disk.raw...")
+    assert any("'fdisk'" in line for line in log[mounting:]), status  # the mount said why
+
+
+def _no_sudo(tmp_path, monkeypatch) -> None:
+    """A stand-in sudo that asks for a password: `sudo -n` fails."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    sudo = bindir / "sudo"
+    sudo.write_text("#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n")
+    sudo.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+
+
+def test_a_worker_that_dies_before_its_starting_status_says_why(case, monkeypatch, tmp_path):
+    """The worker fails its sudo check about 0.3 s after the spawn, before the
+    launch writes the "starting" status it would have filled in. The sweep
+    takes the cause from the worker's log, not "detected by sweep", and the
+    cause names what the examiner can do."""
+    from opensearch_mcp.containers import SUDO_REMEDY
+
+    _no_sudo(tmp_path, monkeypatch)
+    spawn = srv._spawn_ingest
+
+    def dead_first(*a):  # the worker is dead before the launch writes its status
+        proc = spawn(*a)
+        proc.wait(timeout=60)
+        return proc
+
+    monkeypatch.setattr(srv, "_spawn_ingest", dead_first)
+    resp = srv.idx_ingest(path=str(case / "disk.raw"), hostname="h1", dry_run=False)
+    assert resp["status"] in ("started", "failed"), resp
+    status = _final()
+    assert status["status"] == "failed", status
+    assert f"PermissionError: {SUDO_REMEDY}" in status["message"], status
+    assert "detected by sweep" not in status["message"], status
+    [disk] = [json.loads(f.read_text()) for f in ingest_status._STATUS_DIR.glob("*.json")]
+    assert disk["error"] == f"process_died_unexpectedly: PermissionError: {SUDO_REMEDY}", disk
+
+
+def test_the_dry_run_names_the_register_step_without_sudo(case, monkeypatch, tmp_path):
+    """Without passwordless sudo, the preview says how to ingest the image by
+    a mount of one's own: link it into evidence/ and register it, since the
+    evidence gate refuses a mounted folder that isn't registered."""
+    _no_sudo(tmp_path, monkeypatch)
+    resp = srv.idx_ingest(path=str(case / "disk.raw"), hostname="h1", dry_run=True)
+    assert resp.get("status") == "preview", resp
+    warning = resp.get("warning", "")
+    assert "sudo without a password" in warning, resp
+    assert "link the mount into the case's evidence/ folder" in warning, resp
+    assert "register that link as evidence" in warning, resp
+    assert "point idx_ingest at the mount" not in warning, resp
+
+
+def test_the_sweep_reads_a_cause_only_from_an_ingest_log(tmp_path, monkeypatch):
+    """A status's log_file is read only in ingest-logs/, only its end, and only
+    an error line and up to 2 after it, to a blank line."""
+    monkeypatch.setattr(ingest_status, "_STATUS_DIR", tmp_path / "ingest-status")
+    logs = tmp_path / "ingest-logs"
+    logs.mkdir()
+    elsewhere = tmp_path / "other.log"
+    elsewhere.write_text("PermissionError: from outside\n")
+    assert ingest_status._log_cause(str(elsewhere)) == ""
+    (logs / "ln.log").symlink_to(elsewhere)  # a link out of ingest-logs/ is outside it too
+    assert ingest_status._log_cause(str(logs / "ln.log")) == ""
+    log = logs / "r1.log"
+    log.write_text(
+        "Running scope as unit: vhir-ingest-1.scope\n"
+        + "Error: the first\n"
+        + "x" * 9000
+        + "\nTraceback (most recent call last):\n"
+        + "ValueError: one\ntwo\nthree\nfour\n"
+    )
+    assert ingest_status._log_cause(str(log)) == "ValueError: one\ntwo\nthree"
+    log.write_text("KeyError: k\n\nafter\n")
+    assert ingest_status._log_cause(str(log)) == "KeyError: k"
+    log.write_text("Running scope as unit: vhir-ingest-1.scope\nKilled\n")
+    assert ingest_status._log_cause(str(log)) == ""
+    log.write_text("OSError: " + "y" * 2000 + "\n")
+    assert len(ingest_status._log_cause(str(log))) == 500
+    assert ingest_status._log_cause("") == ingest_status._log_cause(None) == ""
+    os.mkfifo(logs / "fifo.log")  # never opened: a pipe would hold the sweep
+    assert ingest_status._log_cause(str(logs / "fifo.log")) == ""
+
+
+def test_a_worker_that_runs_still_goes_running_then_complete(case, monkeypatch, tmp_path):
+    worker = tmp_path / "worker.py"
+    worker.write_text(FAKE_WORKER)
+    spawn = srv._spawn_ingest
+    monkeypatch.setattr(
+        srv, "_spawn_ingest", lambda cmd, *a: spawn([sys.executable, str(worker), "2"], *a)
+    )
+    srv.idx_ingest_memory(path=str(case / "mem.raw"), hostname="h1", dry_run=False)
+    seen = []
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        ingests = srv.idx_ingest_status(case_id="c1").get("ingests", [])
+        status = ingests[0]["status"] if ingests else None
+        if not seen or seen[-1] != status:
+            seen.append(status)
+        if status == "complete":
+            break
+        time.sleep(0.1)
+    assert "failed" not in seen, json.dumps(seen)
+    assert seen[-1] == "complete" and "running" in seen, seen
+    assert sorted(f.name for f in ingest_status._STATUS_DIR.glob("*.json")) == [
+        f"c1-{ingests[0]['pid']}-{ingests[0]['run_id']}.json"
+    ]  # the launcher's pre-spawn record is gone
+
+
+def test_a_starting_record_never_replaces_the_workers(case):
+    ingest_status.write_status("c1", 77, "r", "running", [], {"indexed": 3}, "t0")
+    ingest_status.write_status("c1", 77, "r", "starting", [], {"indexed": 0}, "t0")
+    (path,) = ingest_status._STATUS_DIR.glob("*.json")
+    record = json.loads(path.read_text())
+    assert (record["status"], record["totals"]) == ("running", {"indexed": 3})
+
+
+def test_an_archive_password_reaches_neither_the_log_nor_the_status(case, monkeypatch, tmp_path):
+    """A failed extraction printed the exception, which quotes the 7z
+    command and its -p<password>. This 7z echoes its arguments back too."""
+    secret = "s3cret-Pw-7f2a"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "7z").write_text('#!/bin/sh\necho "ERROR: Wrong password, args: $*" >&2\nexit 2\n')
+    (bindir / "7z").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    monkeypatch.setenv("VHIR_ARCHIVE_PASSWORD", secret)
+    (case / "mem.zip").write_bytes(b"PK\x03\x04" + b"\0" * 60)
+    register(case.parent / "cases" / "c1", case / "mem.zip")
+    resp = srv.idx_ingest_memory(path=str(case / "mem.zip"), hostname="h1", dry_run=False)
+    # the worker fails fast: the launch may say so already (see above)
+    assert resp["status"] in ("started", "failed"), resp
+    status = _final()
+    assert status["status"] == "failed", status
+    assert secret not in json.dumps(status)
+    assert secret not in Path(resp["log_file"]).read_text()
+    assert any(
+        "Failed to extract" in line and "7z exited 2" in line for line in status["log_tail"]
+    )
+
+
+def _pieces(secret: str, n: int = 5) -> list[str]:
+    return [secret[i : i + n] for i in range(len(secret) - n + 1)]
+
+
+def test_no_piece_of_the_password_survives_the_cut(case, monkeypatch, tmp_path):
+    """7z's output is cut to its last 500 characters. Cut before replacing
+    the password, and a window starting inside it keeps a piece."""
+    secret = "s3cret-Pw-7f2a"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "7z").write_text(
+        "#!/bin/sh\n"
+        "IFS= read -r pw\n"  # the password, as 7z reads it: from stdin
+        "printf 'ERROR %s' \"$pw\" >&2\n"
+        "head -c 495 /dev/zero | tr '\\0' y >&2\n"
+        "exit 2\n"
+    )
+    (bindir / "7z").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    monkeypatch.setenv("VHIR_ARCHIVE_PASSWORD", secret)
+    (case / "mem.zip").write_bytes(b"PK\x03\x04" + b"\0" * 60)
+    register(case.parent / "cases" / "c1", case / "mem.zip")
+    resp = srv.idx_ingest_memory(path=str(case / "mem.zip"), hostname="h1", dry_run=False)
+    status = _final()
+    assert status["status"] == "failed", status
+    seen = json.dumps(status) + Path(resp["log_file"]).read_text()
+    assert [p for p in _pieces(secret) if p in seen] == []
+    assert any("7z exited 2" in line for line in status["log_tail"]), status
+
+
+def test_a_memory_archives_password_goes_on_7zs_stdin_never_its_command_line(
+    case, monkeypatch, tmp_path
+):
+    secret = "s3cret-Pw-7f2a"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    seen = tmp_path / "seen"
+    (bindir / "7z").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" > {seen}.argv\ncat > {seen}.stdin\nexit 2\n'
+    )
+    (bindir / "7z").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    monkeypatch.setenv("VHIR_ARCHIVE_PASSWORD", secret)
+    (case / "mem.zip").write_bytes(b"PK\x03\x04" + b"\0" * 60)
+    register(case.parent / "cases" / "c1", case / "mem.zip")
+    srv.idx_ingest_memory(path=str(case / "mem.zip"), hostname="h1", dry_run=False)
+    assert _final()["status"] == "failed"
+    argv = Path(f"{seen}.argv").read_text()
+    assert argv.startswith("x ") and secret not in argv and "-p" not in argv.split(), argv
+    assert Path(f"{seen}.stdin").read_text() == secret + "\n"
+
+
+def test_the_memory_command_gives_7z_the_password_on_stdin_in_a_new_session(case, monkeypatch):
+    """In-process: the 7z call itself."""
+    import subprocess
+
+    from opensearch_mcp import ingest_cli
+
+    secret = "s3cret-Pw-7f2a"
+    monkeypatch.setenv("VHIR_ARCHIVE_PASSWORD", secret)
+    calls, real_run = [], subprocess.run
+
+    def run(cmd, *a, **k):
+        if cmd and cmd[0] == "7z":
+            calls.append((cmd, k))
+            raise subprocess.CalledProcessError(2, cmd, b"", b"")
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    (case / "mem.zip").write_bytes(b"PK\x03\x04" + b"\0" * 60)
+    register(case.parent / "cases" / "c1", case / "mem.zip")
+    args = argparse.Namespace(
+        path=str(case / "mem.zip"), case="c1", hostname="h1", tier=1, plugins=None, yes=True
+    )
+    with pytest.raises(SystemExit):
+        ingest_cli.cmd_ingest_memory(args)
+    ((cmd, k),) = calls
+    assert not any(secret in c for c in cmd) and not any(c.startswith("-p") for c in cmd), cmd
+    assert k["input"] == (secret + "\n").encode() and k["start_new_session"] is True
+
+
+def test_a_7z_timeout_doesnt_print_the_password(case, monkeypatch, capsys):
+    """A timeout's message quotes the command too."""
+    import subprocess
+
+    from opensearch_mcp import ingest_cli
+
+    secret = "s3cret-Pw-7f2a"
+    monkeypatch.setenv("VHIR_ARCHIVE_PASSWORD", secret)
+    real_run = subprocess.run
+
+    def run(cmd, *a, **k):
+        if cmd and cmd[0] == "7z":
+            raise subprocess.TimeoutExpired(cmd, 600)
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    (case / "mem.zip").write_bytes(b"PK\x03\x04" + b"\0" * 60)
+    register(case.parent / "cases" / "c1", case / "mem.zip")
+    args = argparse.Namespace(
+        path=str(case / "mem.zip"), case="c1", hostname="h1", tier=1, plugins=None, yes=True
+    )
+    with pytest.raises(SystemExit):
+        ingest_cli.cmd_ingest_memory(args)
+    out = capsys.readouterr()
+    printed = out.out + out.err
+    assert secret not in printed
+    assert "7z timed out after 600s" in printed

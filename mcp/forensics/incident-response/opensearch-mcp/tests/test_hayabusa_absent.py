@@ -1,0 +1,139 @@
+"""With hayabusa missing, an evtx ingest and the detections list say so.
+
+The detection phase only ran when hayabusa was on the PATH, so without it
+nothing was logged or written and the status read "Ingest complete"; with
+its rules missing, the detection row read done with 0 alerts. And
+idx_list_detections answered "0 Hayabusa alerts" the same way whether or not
+anything could have produced one. Ingests run in-process with the cluster
+stubbed; the evtx parsing and the hayabusa batch are real.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+from unittest import mock
+
+import pytest
+from _helpers import make_windows_tree
+
+from opensearch_mcp import ingest, ingest_status
+from opensearch_mcp import ingest_cli as cli
+from opensearch_mcp import server as srv
+
+_which = shutil.which
+
+
+def _hayabusa(monkeypatch, installed: bool) -> None:
+    def which(name, *a, **k):
+        if name == "hayabusa":
+            return "/usr/local/bin/hayabusa" if installed else None
+        return _which(name, *a, **k)
+
+    monkeypatch.setattr(shutil, "which", which)
+
+
+@pytest.fixture
+def evtx_ingest(tmp_path, monkeypatch):
+    """Run an evtx ingest of one host and return idx_ingest_status's view."""
+    monkeypatch.setattr(ingest_status, "_STATUS_DIR", tmp_path / "vhir" / "ingest-status")
+    monkeypatch.setenv("VHIR_INGEST_RUN_ID", "run-hayabusa-absent")
+    for name in (
+        "get_client",
+        "_preflight_shard_capacity",
+        "_ensure_case_active",
+        "AuditWriter",
+    ):
+        monkeypatch.setattr(cli, name, mock.MagicMock())
+    monkeypatch.setattr(cli, "_load_case_host_dict", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_resolve_case_id", lambda c: "c1")
+    root = tmp_path / "evidence"
+    make_windows_tree(root / "host-a")
+
+    def run(skip_triage: bool = True) -> dict:
+        if not skip_triage:  # triage enrichment runs, and finds nothing to do
+            from opensearch_mcp import triage_remote
+
+            monkeypatch.setattr(triage_remote, "enrich_remote", lambda *a, **k: {})
+        args = argparse.Namespace(
+            path=str(root / "host-a"),
+            case="c1",
+            hostname="host-a",
+            include="evtx",
+            yes=True,
+            skip_triage=skip_triage,
+        )
+        cli.cmd_ingest(args)
+        (status,) = srv.idx_ingest_status(case_id="c1")["ingests"]
+        return status
+
+    return run
+
+
+def _hayabusa_errors(status: dict) -> list[str]:
+    """The status's errors for the detection step. Other artifacts in the
+    tree fail where their parsers aren't installed, as on CI. The detections'
+    line names no host (SPEC-HC-018)."""
+    assert any(i["artifact"] == "hayabusa-detection" for i in status["checklist"]), status
+    return [e for e in status.get("errors", []) if e.startswith("hayabusa-detection: ")]
+
+
+class TestTheIngestStatus:
+    def test_hayabusa_not_installed(self, evtx_ingest, monkeypatch):
+        _hayabusa(monkeypatch, installed=False)
+        status = evtx_ingest()
+        assert status["message"].startswith("Ingest complete with "), status["message"]
+        (error,) = _hayabusa_errors(status)
+        assert error.startswith("hayabusa-detection: detections skipped: hayabusa not")
+        # Valhuntir's installer only: the current SIFT release has no Hayabusa
+        assert "cast install" not in error
+        assert "`vhir setup hayabusa` (the current Hayabusa release" in error
+
+    @pytest.mark.parametrize("skip_triage", [True, False], ids=["triage skipped", "triage run"])
+    def test_hayabusa_rules_missing(self, evtx_ingest, monkeypatch, skip_triage):
+        """Not done with 0 alerts: the evidence ingested, and the detection
+        step's error is in the status, whether or not triage runs after it."""
+        _hayabusa(monkeypatch, installed=True)
+        monkeypatch.setattr(ingest, "_resolve_hayabusa_rules_dir", lambda: None)
+        status = evtx_ingest(skip_triage)
+        assert status["message"].startswith("Ingest complete with "), status["message"]
+        assert _hayabusa_errors(status) == ["hayabusa-detection: host-a: rules_not_found"]
+
+    def test_hayabusa_ran(self, evtx_ingest, monkeypatch):
+        _hayabusa(monkeypatch, installed=True)
+        monkeypatch.setattr(ingest, "run_hayabusa_batch", lambda *a, **k: {"host-a": 5})
+        status = evtx_ingest()
+        assert _hayabusa_errors(status) == []
+
+
+@pytest.fixture
+def detections(monkeypatch):
+    """idx_list_detections on a cluster with no Hayabusa alerts, with the
+    Security Analytics plugin missing or present."""
+    client = mock.MagicMock()
+    client.count.return_value = {"count": 0}
+    monkeypatch.setattr(srv, "_get_os", lambda: client)
+    monkeypatch.setattr(srv.audit, "log", lambda **kw: None)
+
+    def run(plugin: bool) -> str:
+        if plugin:
+            client.transport.perform_request.return_value = {"findings": []}
+        else:
+            client.transport.perform_request.side_effect = RuntimeError("404 security_analytics")
+        return srv.idx_list_detections()["suggestion"]
+
+    return run
+
+
+class TestTheDetectionsList:
+    @pytest.mark.parametrize("plugin", [False, True], ids=["no sigma plugin", "sigma plugin"])
+    def test_hayabusa_not_installed(self, detections, monkeypatch, plugin):
+        _hayabusa(monkeypatch, installed=False)
+        assert "Hayabusa not installed" in detections(plugin)
+
+    @pytest.mark.parametrize("plugin", [False, True], ids=["no sigma plugin", "sigma plugin"])
+    def test_hayabusa_installed(self, detections, monkeypatch, plugin):
+        _hayabusa(monkeypatch, installed=True)
+        suggestion = detections(plugin)
+        assert "Hayabusa runs during evtx ingest if installed." in suggestion
+        assert "not installed" not in suggestion

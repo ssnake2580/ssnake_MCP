@@ -1,0 +1,330 @@
+"""Ingest EZ Tools CSV output into OpenSearch with native schema."""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import re
+import sys
+from collections.abc import Callable
+from datetime import datetime, timezone
+from functools import cache
+from pathlib import Path
+
+from opensearchpy import OpenSearch
+
+from opensearch_mcp.bulk import OLD_RID_KEY, flush_bulk
+
+csv.field_size_limit(10 * 1024 * 1024)  # 10 MB — L2T CSV can have >131 KB fields
+
+_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
+def _ez_time(value: str) -> datetime | None:
+    """An EZ tool's time (`2023-01-21 13:00:59.3935272`, with or without the
+    fraction, or ISO) as UTC, or None when it isn't one. The tools write UTC
+    with no zone, and Python 3.10 reads at most 6 fraction digits."""
+    try:
+        ts = datetime.fromisoformat(_FRACTION.sub(r"\1", value.strip().replace("Z", "+00:00")))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+@cache
+def _date_fields() -> frozenset[str]:
+    """The csv template's date fields: a blank one is left out of the record,
+    so it isn't counted as a value the mapping couldn't parse."""
+    from opensearch_mcp.mappings import csv_date_fields
+
+    return csv_date_fields()
+
+
+# Stands in for NUL while Python 3.10's csv reads a line. A lone surrogate
+# never comes out of decoding a file with errors="replace".
+_NUL_STANDIN = "\udc00"
+
+
+def _dict_rows(f):
+    """csv.DictReader rows, keeping NUL in values on Python 3.10 as 3.11+
+    does (3.10's reader raises "line contains NUL" at the first one)."""
+    if sys.version_info >= (3, 11):
+        yield from csv.DictReader(f)
+        return
+    seen = False
+
+    def lines():
+        nonlocal seen
+        for line in f:
+            if "\x00" in line:
+                seen = True
+                line = line.replace("\x00", _NUL_STANDIN)
+            yield line
+
+    def back(v):
+        return v.replace(_NUL_STANDIN, "\x00") if isinstance(v, str) else v
+
+    for row in csv.DictReader(lines()):
+        if seen:
+            row = {
+                back(k): [back(x) for x in v] if isinstance(v, list) else back(v)
+                for k, v in row.items()
+            }
+        yield row
+
+
+def _detect_encoding(path: Path) -> str:
+    """Detect CSV encoding from BOM.
+
+    PowerShell 5.1 Export-Csv outputs UTF-16LE with BOM. Use "utf-16"
+    codec (not "utf-16-le") which auto-detects endianness AND strips
+    the BOM. The "utf-16-le" codec leaves \\ufeff prepended to the
+    first column name, breaking csv.DictReader lookups.
+    """
+    with open(path, "rb") as f:
+        bom = f.read(4)
+    if bom[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    return "utf-8-sig"
+
+
+# Fields containing per-run volatile data (temp dir paths) or VSS metadata.
+# Excluded from content hash to ensure dedup stability across re-ingests.
+# The host fields too: the stored id carries the machine key, and a renamed
+# or merged machine must give a re-ingested row the same id.
+_VOLATILE_KEYS = {
+    "PluginDetailFile",
+    "SourceFile",
+    "HivePath",
+    "vhir.vss_id",
+    "host.id",
+    "host.name",
+}
+
+
+def _doc_id(
+    index_name: str,
+    row: dict,
+    natural_key: str | None = None,
+    volatile_keys: set[str] | None = None,
+) -> str:
+    """Generate deterministic ID for dedup on re-ingest.
+
+    If natural_key is provided (e.g., MFT 4-field key), use it directly.
+    Falls back to content hash if any natural key part is empty.
+    volatile_keys are excluded from content hash (temp dir paths, etc.).
+
+    ORDERING: natural key check MUST precede volatile key stripping
+    (VSS MFT dedup depends on this — vhir.vss_id is in _VOLATILE_KEYS
+    but used as 5th natural key component for MFT when VSS is active).
+    """
+    if natural_key:
+        key_parts = [row.get(k, "") for k in natural_key.split(":")]
+        if all(key_parts):
+            return hashlib.sha256(f"{index_name}:{':'.join(key_parts)}".encode()).hexdigest()[:20]
+    if volatile_keys:
+        stable = {k: v for k, v in row.items() if k not in volatile_keys}
+    else:
+        stable = row
+    # Coerce non-str keys to str and drop None keys — pathological
+    # rows (prose files walked as CSV, sloppy JSON emitters with null
+    # keys) can produce mixed-type dicts where json.dumps(sort_keys=True)
+    # fails with TypeError comparing None to str. Deterministic coerce
+    # keeps the hash stable for well-typed rows and prevents aborting
+    # the walk on bad rows. Used by delimited AND json ingests.
+    stable = {str(k): v for k, v in stable.items() if k is not None}
+    content = json.dumps(stable, sort_keys=True)
+    return hashlib.sha256(f"{index_name}:{content}".encode()).hexdigest()[:20]
+
+
+def _track_replaced(actions: list[dict], seen: dict, collided: dict, source_file: str) -> None:
+    """After a write: count each row whose stored id (the stamped machine key
+    and the record id) an earlier file of the run already sent, against this
+    file: a record in the case is never replaced, so this file's copy isn't
+    stored."""
+    for action in actions:
+        src = action.get("_source") or {}
+        stored = (src.get("vhir.host_key"), src.get("vhir.rid", action.get("_id")))
+        earlier = seen.setdefault(stored, source_file)  # the first file to send it
+        if earlier != source_file:
+            collided[(source_file, earlier)] = collided.get((source_file, earlier), 0) + 1
+
+
+def _resolve_cached(host_dict, raw: str) -> str | None:
+    """Per-batch resolve memoization (see parse_evtx._resolve_cached)."""
+    cache = getattr(host_dict, "_resolve_cache", None)
+    if cache is None:
+        cache = {}
+        host_dict._resolve_cache = cache
+    if raw in cache:
+        return cache[raw]
+    val = host_dict.resolve(raw)
+    cache[raw] = val
+    return val
+
+
+def ingest_csv(
+    csv_path: Path,
+    client: OpenSearch,
+    index_name: str,
+    hostname: str,
+    source_file: str = "",
+    ingest_audit_id: str = "",
+    pipeline_version: str = "",
+    table_name: str = "",
+    natural_key: str | None = None,
+    time_field: str | None = None,
+    time_from: datetime | None = None,
+    time_to: datetime | None = None,
+    vss_id: str = "",
+    parse_method: str = "",
+    host_dict=None,
+    row_host: bool = True,
+    hive: str = "",
+    row_source=None,
+    seen: dict | None = None,
+    collided: dict | None = None,
+    id_source: str | Callable[[dict], str] = "",
+    timestamp_from: str = "",
+) -> tuple[int, int, int]:
+    """Read CSV, bulk index each row as a document.
+
+    hive: a user hive's volume-relative path, stored as vhir.hive and part of
+    the _id (HivePath isn't), so identical rows from two users stay two docs.
+
+    Returns (count_indexed, count_skipped, count_bulk_failed).
+    count_skipped = rows dropped by time range filter.
+
+    timestamp_from: a column whose EZ time sets each record's @timestamp
+    (UTC), for a tool whose index is searched and charted by @timestamp.
+
+    `seen` ((machine key, record id) -> the first file that sent it, one per
+    index for a run) and `collided` ((file whose row isn't stored, the earlier
+    file that sent it) -> rows): a row whose stored id another file of the run
+    already sent isn't stored again, and that is counted against this file.
+    Counted after each write, from the machine key the write stamped:
+    identical rows of two machines (one case index) are two documents, never
+    a loss, and counting resolves no host itself.
+    """
+    track = seen is not None and collided is not None and not natural_key
+    count = 0
+    skipped = 0
+    bulk_failed = 0
+    actions: list[dict] = []
+    replacements_logged = False
+
+    # L4: per-call cache reset (see parse_evtx note).
+    if host_dict is not None and hasattr(host_dict, "_resolve_cache"):
+        host_dict._resolve_cache = {}
+
+    encoding = _detect_encoding(csv_path)
+
+    with open(csv_path, encoding=encoding, errors="replace") as f:
+        for row in _dict_rows(f):
+            # Log if replacement chars detected
+            if not replacements_logged and "\ufffd" in str(row):
+                print(
+                    f"WARNING: Replacement chars in {csv_path.name} — "
+                    f"binary data decoded with errors='replace'",
+                    file=sys.stderr,
+                )
+                replacements_logged = True
+
+            # Time range filter
+            if time_field and (time_from or time_to):
+                ts_str = row.get(time_field, "")
+                if ts_str:
+                    ts = _ez_time(ts_str)
+                    if ts:
+                        if time_from and ts < time_from:
+                            skipped += 1
+                            continue
+                        if time_to and ts > time_to:
+                            skipped += 1
+                            continue
+
+            # Per spec Rev 5 Fix C: prefer a per-row hostname from the
+            # shared priority list (Kansa "Host", Windows "ComputerName",
+            # Velociraptor "Hostname", nested "ClientInfo.Hostname", etc.)
+            # so multi-host CSVs stamp per-row correctly. Fall back to
+            # the operator/auto-detected ingest hostname when the row
+            # doesn't carry one of the priority fields.
+            from opensearch_mcp.hostname import extract_host_from_record
+
+            per_row_host = extract_host_from_record(row)
+            raw_host = (per_row_host if row_host else None) or hostname
+            row["host.name"] = raw_host
+            # host.id stamping (v1 host-identity). Resolve via dict;
+            # on miss, stamp host.id = raw (parser resolve-miss policy).
+            if raw_host:
+                if host_dict is not None:
+                    resolved = _resolve_cached(host_dict, raw_host)
+                    row["host.id"] = resolved if resolved else raw_host
+                else:
+                    row["host.id"] = raw_host
+            if table_name:
+                row["vhir.table"] = table_name
+            if hive:
+                row["vhir.hive"] = hive
+
+            # VSS: for natural key tools (MFT), inject vss_id BEFORE _doc_id
+            # so it becomes part of the natural key. For content-hash tools,
+            # vhir.vss_id is in _VOLATILE_KEYS and stripped from the hash.
+            if vss_id:
+                row["vhir.vss_id"] = vss_id
+
+            # Compute dedup ID BEFORE adding provenance fields.
+            # Provenance differs across re-ingests (different source_file),
+            # but evidence content is the same — ID must be stable.
+            # Also strip volatile fields that change per-run (temp dir paths).
+            _id = old_rid = _doc_id(index_name, row, natural_key, volatile_keys=_VOLATILE_KEYS)
+            # the profile path the run read is in the id (a row's own, when given
+            # per row), case-folded: Windows paths are case-insensitive
+            src = (id_source(row) if callable(id_source) else id_source).lower()
+            if src:
+                _id = _doc_id(
+                    index_name,
+                    {**row, "\x00id_source": src},
+                    natural_key,
+                    volatile_keys=_VOLATILE_KEYS,
+                )
+            for k in [k for k, v in row.items() if k in _date_fields() and v == ""]:
+                del row[k]  # a blank date: no value, not an unparsed one
+
+            # the time a timeline reads, from the tool's own time column
+            if timestamp_from and (ts := _ez_time(str(row.get(timestamp_from) or ""))):
+                row["@timestamp"] = ts.isoformat()
+
+            # Provenance fields (added after ID computation)
+            if source_file:
+                # A tool that reads several files gives each row its own
+                row["vhir.source_file"] = (row_source and row_source(row)) or source_file
+            if ingest_audit_id:
+                row["vhir.ingest_audit_id"] = ingest_audit_id
+            if pipeline_version:
+                row["pipeline_version"] = pipeline_version
+            if parse_method:
+                row["vhir.parse_method"] = parse_method
+
+            action = {"_index": index_name, "_id": _id, "_source": row}
+            if src:  # the id 0.6.4 gave it
+                action[OLD_RID_KEY] = old_rid
+            actions.append(action)
+
+            if len(actions) >= 1000:
+                flushed, failed = flush_bulk(client, actions)
+                count += flushed
+                bulk_failed += failed
+                if track:
+                    _track_replaced(actions, seen, collided, source_file)
+                actions = []
+
+    if actions:
+        flushed, failed = flush_bulk(client, actions)
+        count += flushed
+        bulk_failed += failed
+        if track:
+            _track_replaced(actions, seen, collided, source_file)
+
+    return count, skipped, bulk_failed

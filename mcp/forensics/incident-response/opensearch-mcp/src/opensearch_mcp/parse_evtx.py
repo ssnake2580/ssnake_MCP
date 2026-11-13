@@ -1,0 +1,190 @@
+"""Parse .evtx files with pyevtx-rs and index into OpenSearch."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime
+from pathlib import Path
+
+from evtx import PyEvtxParser
+from opensearchpy import OpenSearch
+
+from opensearch_mcp import __version__
+from opensearch_mcp.bulk import flush_bulk
+from opensearch_mcp.normalize import normalize_event
+from opensearch_mcp.write_context import HEADER_SID_KEY
+
+_PIPELINE_VERSION = f"opensearch-mcp-{__version__}"
+_FILE_HEADER = 4096  # the evtx file header block
+_CHUNK = 65536
+
+
+def evtx_truncation(evtx_path: Path) -> list[str]:
+    """How a file with a valid evtx header is cut short; empty if it isn't.
+
+    The parser walks whole chunks by file size: it drops a partial last chunk
+    without a word and never reads the header's chunk count, which a live log
+    often leaves stale (lower than the chunks it holds). So both are checked.
+    A file without the signature is left to the parser, which fails it.
+    """
+    with open(evtx_path, "rb") as f:
+        head = f.read(44)
+    if len(head) < 44 or head[:8] != b"ElfFile\x00":
+        return []
+    declared = int.from_bytes(head[42:44], "little")  # number of chunks
+    size = evtx_path.stat().st_size
+    whole, partial = divmod(max(size - _FILE_HEADER, 0), _CHUNK)
+    cuts = []
+    if partial:
+        cuts.append(f"ends mid-chunk at byte {size:,}")
+    if whole < declared:
+        cuts.append(f"{whole} of {declared} declared chunks present")
+    return cuts
+
+
+def _resolve_cached(host_dict, raw: str) -> str | None:
+    """Per-batch resolve memoization. host_dict carries a `._resolve_cache`
+    dict initialized on first call. Reset across parse_and_index calls by
+    reattaching a fresh cache on the dict instance.
+    """
+    cache = getattr(host_dict, "_resolve_cache", None)
+    if cache is None:
+        cache = {}
+        host_dict._resolve_cache = cache
+    if raw in cache:
+        return cache[raw]
+    val = host_dict.resolve(raw)
+    cache[raw] = val
+    return val
+
+
+def _java_text(value) -> str:
+    """`value` as the ingest pipeline's String.valueOf writes it."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return "[" + ", ".join(_java_text(v) for v in value) + "]"
+    return str(value)
+
+
+def _normalise_data(doc: dict) -> None:
+    """A non-object `winlog.event_data.Data` goes to `Data_raw` as the bound
+    pipeline would put it, so the pipeline leaves the record as sent and its
+    content hash holds for the stored record."""
+    ed = doc.get("winlog.event_data")
+    if isinstance(ed, dict) and "Data" in ed and not isinstance(ed["Data"], dict):
+        ed["Data_raw"] = _java_text(ed.pop("Data"))
+
+
+def parse_and_index(
+    evtx_path: Path,
+    client: OpenSearch,
+    index_name: str,
+    source_file: str = "",
+    ingest_audit_id: str = "",
+    time_from: datetime | None = None,
+    time_to: datetime | None = None,
+    reduced_ids: set[int] | None = None,
+    vss_id: str = "",
+    host_dict=None,
+) -> tuple[int, int, int]:
+    """Parse evtx file and bulk index into OpenSearch.
+
+    Returns (count_indexed, count_skipped, count_bulk_failed).
+    """
+    parser = PyEvtxParser(str(evtx_path))
+    actions: list[dict] = []
+    count = 0
+    skipped = 0
+    bulk_failed = 0
+
+    # L4: per-call cache reset so unbounded growth across many files is
+    # bounded by per-call unique-hostname cardinality (typically <100).
+    if host_dict is not None and hasattr(host_dict, "_resolve_cache"):
+        host_dict._resolve_cache = {}
+
+    for record in parser.records_json():
+        try:
+            data = json.loads(record["data"])
+        except (json.JSONDecodeError, KeyError, RuntimeError):
+            skipped += 1
+            continue
+
+        doc = normalize_event(data)
+        _normalise_data(doc)
+
+        # host.id stamping (v1 host-identity).
+        # normalize_event already wrote host.name from system.Computer.
+        # Resolve via case dict; on miss, stamp host.id = raw (parser
+        # resolve-miss policy).
+        raw_host = doc.get("host.name")
+        if raw_host:
+            if host_dict is not None:
+                resolved = _resolve_cached(host_dict, raw_host)
+                doc["host.id"] = resolved if resolved else raw_host
+            else:
+                doc["host.id"] = raw_host
+
+        # Time range filter (before ID computation — filtered docs don't need IDs)
+        if time_from or time_to:
+            try:
+                ts = datetime.fromisoformat(doc["@timestamp"].replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                ts = None
+            if ts:
+                if time_from and ts < time_from:
+                    skipped += 1
+                    continue
+                if time_to and ts > time_to:
+                    skipped += 1
+                    continue
+
+        # Reduced mode filter
+        if reduced_ids:
+            if doc.get("event.code") not in reduced_ids:
+                skipped += 1
+                continue
+
+        # Deterministic ID: source_file + event_record_id + TimeCreated.
+        # NOT content hash — Windows can log identical events with
+        # different record IDs (all are real evidence, must be preserved).
+        # Re-ingest from the SAME file deduplicates (same record IDs).
+        # Re-ingest from a DIFFERENT file (e.g., KAPE vs disk image)
+        # adds new docs (different source_file = different IDs).
+        # TimeCreated: a reinstalled machine restarts its record numbers,
+        # so the same path and number can be two different events.
+        record_id = record.get("event_record_id", "")
+        created = record.get("timestamp") or doc.get("@timestamp", "")
+        id_input = f"{index_name}:{source_file}:{record_id}:{created}"
+        doc_hash = hashlib.sha256(id_input.encode()).hexdigest()[:20]
+
+        # Provenance fields — injected after ID computation
+        doc["pipeline_version"] = _PIPELINE_VERSION
+        if source_file:
+            doc["vhir.source_file"] = source_file
+        if ingest_audit_id:
+            doc["vhir.ingest_audit_id"] = ingest_audit_id
+        if vss_id:
+            doc["vhir.vss_id"] = vss_id
+        doc["vhir.parse_method"] = "pyevtx-rs"
+
+        # its winlog.user.identifier is the record header's SID (never sent)
+        actions.append(
+            {"_index": index_name, "_id": doc_hash, "_source": doc, HEADER_SID_KEY: True}
+        )
+
+        if len(actions) >= 1000:
+            flushed, failed = flush_bulk(client, actions)
+            count += flushed
+            bulk_failed += failed
+            actions = []
+
+    if actions:
+        flushed, failed = flush_bulk(client, actions)
+        count += flushed
+        bulk_failed += failed
+
+    return count, skipped, bulk_failed
