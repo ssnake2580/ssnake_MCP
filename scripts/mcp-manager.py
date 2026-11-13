@@ -92,9 +92,10 @@ def main():
     for name in configured:
         enabled = "true" if name in selected else "false"
         # JSON quoting safely handles TOML keys with punctuation.
-        key = json.dumps(name)
+        if not all(c.isalnum() or c in "_-" for c in name):
+            raise ValueError(f"Unsupported MCP config name: {name}")
         args.extend([
-            "-c", f"mcp_servers.{key}.enabled={enabled}"
+            "-c", f"mcp_servers.{name}.enabled={enabled}"
         ])
 
     print("Selected MCP:", ", ".join(sorted(selected)), flush=True)
