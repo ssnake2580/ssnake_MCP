@@ -141,23 +141,45 @@
     {
       "name": "GitHub",
       "category": "development",
-      "status": "planned",
+      "status": "configured",
       "implementation_url": null,
-      "execution": null
+      "execution": {
+        "type": "stdio",
+        "command": "bash",
+        "authentication": "local-token-file",
+        "endpoint": "https://api.githubcopilot.com/mcp/readonly"
+      }
     },
     {
       "name": "Docker",
       "category": "development",
-      "status": "planned",
+      "status": "configured",
       "implementation_url": null,
-      "execution": null
+      "execution": {
+        "type": "stdio",
+        "command": "docker.exe",
+        "args": [
+          "mcp",
+          "gateway",
+          "run",
+          "--profile",
+          "ssnake_mcp"
+        ],
+        "server": "io-github-CloudCorpRecords-containerport",
+        "image": "ghcr.io/cloudcorprecords/containerport:0.1.0",
+        "tools_listed": 10
+      }
     },
     {
       "name": "Context7",
       "category": "development",
-      "status": "planned",
+      "status": "configured",
       "implementation_url": null,
-      "execution": null
+      "execution": {
+        "type": "http",
+        "url": "https://mcp.context7.com/mcp",
+        "authentication": "oauth"
+      }
     },
     {
       "name": "arXiv",
@@ -210,16 +232,33 @@
     {
       "name": "Memory",
       "category": "automation",
-      "status": "planned",
+      "status": "configured",
       "implementation_url": null,
-      "execution": null
+      "execution": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-memory@2.1.1"
+        ],
+        "environment": [
+          "MEMORY_FILE_PATH"
+        ]
+      }
     },
     {
       "name": "SQLite",
       "category": "automation",
-      "status": "planned",
+      "status": "configured",
       "implementation_url": null,
-      "execution": null
+      "execution": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": [
+          "mcp-server-sqlite"
+        ],
+        "database": "local-only"
+      }
     }
   ]
 }
