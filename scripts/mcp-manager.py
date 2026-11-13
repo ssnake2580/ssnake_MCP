@@ -40,7 +40,47 @@ def find(servers, name):
                  if s["name"].casefold() == name.casefold()), None)
 
 
-def verify_mcp(name):
+
+def save_verification(name, protocol, tool_count):
+    from datetime import datetime, timezone
+
+    url = f"repos/{REPO}/contents/{REGISTRY}"
+    result = subprocess.run(
+        ["gh", "api", url + "?ref=main"],
+        capture_output=True, text=True, check=True
+    )
+    metadata = json.loads(result.stdout)
+    data = json.loads(base64.b64decode(metadata["content"]))
+
+    server = find(data["servers"], name)
+    if server is None:
+        raise ValueError(f"Registry entry not found: {name}")
+
+    server["verification"] = {
+        "status": "passed",
+        "protocol_version": protocol,
+        "tool_count": tool_count,
+        "verified_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    encoded = base64.b64encode(
+        (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode()
+    ).decode()
+
+    subprocess.run(
+        [
+            "gh", "api", "--method", "PUT", url,
+            "-f", f"message=verify: update {name} MCP status",
+            "-f", f"content={encoded}",
+            "-f", f"sha={metadata['sha']}",
+            "--silent"
+        ],
+        check=True
+    )
+    print("[OK] Verification saved to GitHub Registry")
+
+
+def verify_mcp(name, save=False):
     import os
     import select
     import time
@@ -178,6 +218,8 @@ def verify_mcp(name):
             raise RuntimeError("Invalid tools/list response")
 
         print("Tools:", len(tools))
+        if save:
+            save_verification(name, result["protocolVersion"], len(tools))
         print("[OK] MCP protocol verification successful")
         return 0
 
@@ -230,10 +272,12 @@ def main():
         return 0
 
     if action == "verify":
-        if len(args) != 2:
-            print("Usage: mcp verify NAME")
+        if len(args) not in (2, 3) or (
+            len(args) == 3 and args[2] != "--save"
+        ):
+            print("Usage: mcp verify NAME [--save]")
             return 1
-        return verify_mcp(args[1])
+        return verify_mcp(args[1], save="--save" in args[2:])
 
     servers = registry()
 
