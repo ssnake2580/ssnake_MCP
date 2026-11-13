@@ -186,7 +186,13 @@
       "category": "automation",
       "status": "planned",
       "implementation_url": null,
-      "execution": null
+      "execution": null,
+      "verification": {
+        "status": "passed",
+        "protocol_version": "2025-06-18",
+        "tool_count": 25,
+        "verified_at": "2026-11-13T09:31:17.991418+00:00"
+      }
     },
     {
       "name": "Notion",
