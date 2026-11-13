@@ -1,0 +1,195 @@
+{
+  "schema_version": "1.0",
+  "description": "Private MCP registry for Codex and Claude Code",
+  "servers": [
+    {
+      "name": "Volatility",
+      "category": "forensics",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Sleuth Kit",
+      "category": "forensics",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Autopsy",
+      "category": "forensics",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "REA",
+      "category": "reversing",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Ghidra",
+      "category": "reversing",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Rizin",
+      "category": "reversing",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "GDB",
+      "category": "reversing",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Burp Suite",
+      "category": "web-security",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Nuclei",
+      "category": "web-security",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "YARA",
+      "category": "malware",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "VirusTotal",
+      "category": "malware",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Wireshark",
+      "category": "network",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Zeek",
+      "category": "network",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Shodan",
+      "category": "network",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Censys",
+      "category": "network",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Filesystem",
+      "category": "development",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "GitHub",
+      "category": "development",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Docker",
+      "category": "development",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Context7",
+      "category": "development",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "arXiv",
+      "category": "research",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Semantic Scholar",
+      "category": "research",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Brave Search",
+      "category": "research",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "n8n",
+      "category": "automation",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Playwright",
+      "category": "automation",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Notion",
+      "category": "automation",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "Memory",
+      "category": "automation",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    },
+    {
+      "name": "SQLite",
+      "category": "automation",
+      "status": "planned",
+      "implementation_url": null,
+      "execution": null
+    }
+  ]
+}
