@@ -26,9 +26,21 @@
     {
       "name": "REA",
       "category": "reversing",
-      "status": "planned",
-      "implementation_url": null,
-      "execution": null
+      "status": "installed",
+      "implementation_url": "https://github.com/morluto/rea",
+      "execution": {
+        "type": "stdio",
+        "command": "/home/kimminchan/.nvm/versions/node/v24.22.1/bin/node",
+        "args": [
+          "/home/kimminchan/projects/rea/scripts/rea.mjs",
+          "mcp"
+        ],
+        "client": "codex",
+        "environment": [
+          "JAVA_HOME",
+          "GHIDRA_INSTALL_DIR"
+        ]
+      }
     },
     {
       "name": "Ghidra",
