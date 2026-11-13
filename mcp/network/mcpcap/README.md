@@ -1,0 +1,527 @@
+# mcpcap
+
+<!-- mcp-name: ai.mcpcap/mcpcap -->
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mcpcap/mcpcap/main/readme-assets/mcpcap-logo.png" alt="mcpcap logo" width="240" />
+</p>
+
+A modular Python MCP (Model Context Protocol) server for analyzing PCAP files. mcpcap exposes protocol-specific analysis tools that accept a local file path or remote HTTP URL at call time, so the server stays stateless and works cleanly with MCP clients.
+
+## Overview
+
+mcpcap uses a modular architecture to analyze different network protocols found in PCAP files. Each module provides specialized analysis tools that can be called independently with any PCAP file, making it perfect for integration with Claude Desktop and other MCP clients.
+
+### Key Features
+
+- **Stateless MCP Tools**: Each analysis call supplies its own PCAP path or URL
+- **Modular Architecture**: DNS, DHCP, ICMP, TCP, SIP, and CapInfos modules with easy extensibility for new protocols
+- **Advanced TCP Analysis**: Connection lifecycle, traffic patterns, retransmissions, and flow inspection
+- **Local & Remote PCAP Support**: Analyze files from local storage or HTTP URLs
+- **Scapy Integration**: Leverages scapy's comprehensive packet parsing capabilities
+- **Specialized Analysis Prompts**: Security, networking, and forensic analysis guidance
+- **JSON Responses**: Structured data format optimized for LLM consumption
+
+## Installation
+
+mcpcap requires Python 3.10 or greater.
+
+### Using pip
+
+```bash
+pip install mcpcap
+```
+
+### Using uv
+
+```bash
+uv add mcpcap
+```
+
+### Using uvx (for one-time usage)
+
+```bash
+uvx mcpcap
+```
+
+### Using Docker
+
+Build the image from the repository root:
+
+```bash
+docker build -t mcpcap .
+```
+
+Run it over HTTP for MCP clients that connect to a network endpoint:
+
+```bash
+docker run --rm \
+  -p 127.0.0.1:8080:8080 \
+  -v "$(pwd)/examples:/pcaps:ro" \
+  mcpcap --transport http --host 0.0.0.0 --port 8080 --allow-unauthenticated-http
+```
+
+Run it over stdio for clients that can spawn `docker run` directly:
+
+```bash
+docker run --rm -i \
+  -v "$(pwd)/examples:/pcaps:ro" \
+  mcpcap
+```
+
+When you mount local captures into the container, use the container path in tool calls:
+
+```text
+analyze_dns_packets("/pcaps/dns.pcap")
+```
+
+Remote `http://` and `https://` PCAP URLs work without a volume mount because mcpcap downloads them inside the container at call time.
+
+### Using Docker Compose
+
+For the default HTTP workflow, start the bundled Compose service:
+
+```bash
+docker compose up
+```
+
+This pulls `ghcr.io/mcpcap/mcpcap:latest`, publishes `http://127.0.0.1:8080/mcp` only on host loopback, and mounts `./examples` into the container as `/pcaps`.
+
+```text
+analyze_dns_packets("/pcaps/dns.pcap")
+```
+
+To analyze your own captures, change the volume in [docker-compose.yml](docker-compose.yml) from `./examples:/pcaps:ro` to your local capture directory.
+
+For local development against the checked-out source instead of GHCR:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+## Quick Start
+
+### 1. Start the MCP Server
+
+Start mcpcap as a stateless MCP server:
+
+```bash
+# Default stdio transport for Claude Desktop and similar clients
+mcpcap
+
+# Start with specific modules only
+mcpcap --modules dns,tcp
+
+# With packet analysis limits
+mcpcap --max-packets 1000
+
+# Start an HTTP transport server for remote MCP clients
+mcpcap --transport http --host 127.0.0.1 --port 8080
+```
+
+### 2. Connect Your MCP Client
+
+Use stdio transport for local MCP clients like Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "mcpcap": {
+      "command": "mcpcap",
+      "args": []
+    }
+  }
+}
+```
+
+Use HTTP transport when your MCP client expects a network endpoint:
+
+```bash
+mcpcap --transport http --host 127.0.0.1 --port 8080
+```
+
+Point your HTTP-capable MCP client at:
+
+```text
+http://127.0.0.1:8080/mcp
+```
+
+Docker users can publish the same endpoint with:
+
+```bash
+docker run --rm \
+  -p 127.0.0.1:8080:8080 \
+  -v "/path/to/captures:/pcaps:ro" \
+  mcpcap --transport http --host 0.0.0.0 --port 8080 --allow-unauthenticated-http
+```
+
+Or with Compose:
+
+```bash
+docker compose up
+```
+
+HTTP binds on non-loopback interfaces require the `MCPCAP_AUTH_TOKEN` environment secret. Set a strong random secret through your secret manager or enter it without recording it in shell history:
+
+```bash
+read -rs -p "HTTP bearer token: " MCPCAP_AUTH_TOKEN
+export MCPCAP_AUTH_TOKEN
+mcpcap --transport http --host 0.0.0.0 --port 8080
+```
+
+Clients must send `Authorization: Bearer <secret>` on every request. Use a TLS reverse proxy and an HTTPS URL for remote clients. A configured token also protects loopback endpoints; stdio is unaffected. The Docker examples use `--allow-unauthenticated-http` to bind inside the container while publishing only to host loopback. Keep that loopback mapping and use a trusted local Docker network; other containers on the same network can reach the service. Compose forwards `MCPCAP_AUTH_TOKEN` when set, so you can also secure the local container endpoint. See the [HTTP integration guide](docs/source/user-guide/mcp-integration.md) for details.
+
+### 3. Analyze PCAP Files
+
+Use the analysis tools with any PCAP file by providing the file path or URL when you call the tool:
+
+**DNS Analysis:**
+```
+analyze_dns_packets("/path/to/dns.pcap")
+analyze_dns_packets("https://example.com/remote.pcap")
+```
+
+**DHCP Analysis:**
+```
+analyze_dhcp_packets("/path/to/dhcp.pcap")
+analyze_dhcp_packets("https://example.com/dhcp-capture.pcap")
+```
+
+**ICMP Analysis:**
+```
+analyze_icmp_packets("/path/to/icmp.pcap")
+analyze_icmp_packets("https://example.com/ping-capture.pcap")
+```
+
+**TCP Connection Analysis:**
+```
+analyze_tcp_connections("/path/to/capture.pcap")
+analyze_tcp_connections("/path/to/capture.pcap", server_ip="192.168.1.1", server_port=80)
+```
+
+**TCP Pattern Analysis:**
+```
+analyze_tcp_anomalies("/path/to/capture.pcap", server_ip="10.0.0.1")
+```
+
+**TCP Retransmission Analysis:**
+```
+analyze_tcp_retransmissions("/path/to/capture.pcap")
+```
+
+**Traffic Flow Analysis:**
+```
+analyze_traffic_flow("/path/to/capture.pcap", server_ip="192.168.1.100")
+```
+
+**SIP Analysis:**
+```
+analyze_sip_packets("/path/to/voip-signaling.pcap")
+analyze_sip_packets("https://example.com/sip-call-flow.pcap")
+```
+
+**CapInfos Analysis:**
+```
+analyze_capinfos("/path/to/any.pcap")
+analyze_capinfos("https://example.com/capture.pcap")
+```
+
+If you are using Docker with a bind mount, pass the in-container path instead of the host path:
+
+```text
+analyze_capinfos("/pcaps/dns.pcap")
+```
+
+## Available Tools
+
+### DNS Analysis Tools
+
+- **`analyze_dns_packets(pcap_file)`**: Complete DNS traffic analysis
+  - Extract DNS queries and responses
+  - Identify queried domains and subdomains
+  - Analyze query types (A, AAAA, MX, CNAME, etc.)
+  - Track query frequency and patterns
+  - Detect potential security issues
+
+### DHCP Analysis Tools
+
+- **`analyze_dhcp_packets(pcap_file)`**: Complete DHCP traffic analysis
+  - Track DHCP transactions (DISCOVER, OFFER, REQUEST, ACK)
+  - Identify DHCP clients and servers
+  - Monitor IP address assignments and lease information
+  - Analyze DHCP options and configurations
+  - Detect DHCP anomalies and security issues
+
+### ICMP Analysis Tools
+
+- **`analyze_icmp_packets(pcap_file)`**: Complete ICMP traffic analysis
+  - Analyze ping requests and replies with response times
+  - Identify network connectivity and reachability issues
+  - Track TTL values and routing paths (traceroute data)
+  - Detect ICMP error messages (unreachable, time exceeded)
+  - Monitor for potential ICMP-based attacks or reconnaissance
+
+### TCP Analysis Tools
+
+- **`analyze_tcp_connections(pcap_file, server_ip=None, server_port=None, detailed=False)`**: TCP connection state analysis
+  - Track TCP three-way handshake (SYN, SYN-ACK, ACK)
+  - Analyze connection lifecycle and termination (FIN, RST)
+  - Identify successful vs failed connections
+  - Filter by server IP and/or port
+  - Detect connection issues and abnormal closures
+
+- **`analyze_tcp_anomalies(pcap_file, server_ip=None, server_port=None)`**: Observational TCP traffic analysis
+  - Summarize handshakes, flags, resets, and retransmissions
+  - Surface directional RST and retransmission patterns
+  - Report connection lifecycle metrics
+  - Return factual traffic patterns for further investigation
+
+- **`analyze_tcp_retransmissions(pcap_file, server_ip=None, threshold=0.02)`**: TCP retransmission analysis
+  - Measure overall and per-connection retransmission rates
+  - Identify connections with quality issues
+  - Compare against configurable thresholds
+  - Detect network congestion and packet loss
+
+- **`analyze_traffic_flow(pcap_file, server_ip, server_port=None)`**: Bidirectional traffic flow analysis
+  - Analyze client-to-server vs server-to-client traffic
+  - Identify traffic asymmetry
+  - Determine RST packet sources
+  - Interpret connection patterns and behaviors
+
+### SIP Analysis Tools
+
+- **`analyze_sip_packets(pcap_file)`**: SIP signaling analysis
+  - Parse SIP requests and responses across UDP and TCP transports
+  - Extract call identifiers, CSeq values, endpoints, and key signaling headers
+  - Summarize request methods and response code classes
+  - Surface user agents, signaling servers, and transport usage
+  - Support VoIP troubleshooting, security review, and forensic reconstruction
+
+### CapInfos Analysis Tools
+
+- **`analyze_capinfos(pcap_file)`**: PCAP file metadata and statistics
+  - File information (size, name, link layer encapsulation)
+  - Packet statistics (count, data size, average packet size)
+  - Temporal analysis (duration, timestamps, packet rates)
+  - Data throughput metrics (bytes/second, bits/second)
+  - Similar to Wireshark's capinfos(1) utility
+
+## Analysis Prompts
+
+mcpcap provides specialized analysis prompts to guide LLM analysis:
+
+### DNS Prompts
+- **`security_analysis`** - Focus on threat detection, DGA domains, DNS tunneling
+- **`network_troubleshooting`** - Identify DNS performance and configuration issues
+- **`forensic_investigation`** - Timeline reconstruction and evidence collection
+
+### DHCP Prompts
+- **`dhcp_network_analysis`** - Network administration and IP management
+- **`dhcp_security_analysis`** - Security threats and rogue DHCP detection
+- **`dhcp_forensic_investigation`** - Forensic analysis of DHCP transactions
+
+### ICMP Prompts
+- **`icmp_network_diagnostics`** - Network connectivity and path analysis
+- **`icmp_security_analysis`** - ICMP-based attacks and reconnaissance detection
+- **`icmp_forensic_investigation`** - Timeline reconstruction and network mapping
+
+### TCP Prompts
+- **`tcp_connection_troubleshooting`** - Connection issues, handshake analysis, termination patterns
+- **`tcp_security_analysis`** - Attack detection, firewall analysis, anomaly identification
+
+### SIP Prompts
+- **`sip_security_analysis`** - Registration abuse, toll fraud, and signaling exposure review
+- **`sip_troubleshooting_analysis`** - Call setup progression, routing mismatches, and response-code failures
+- **`sip_forensic_investigation`** - Timeline reconstruction by Call-ID, CSeq, endpoint, and transport
+
+## Configuration Options
+
+### Module Selection
+
+```bash
+# Load specific modules
+mcpcap --modules dns              # DNS analysis only
+mcpcap --modules tcp              # TCP analysis only
+mcpcap --modules dhcp             # DHCP analysis only
+mcpcap --modules icmp             # ICMP analysis only
+mcpcap --modules sip              # SIP analysis only
+mcpcap --modules dns,tcp          # DNS and TCP analysis
+mcpcap --modules dns,dhcp,icmp,tcp,sip,capinfos    # All modules (default)
+```
+
+### Analysis Limits
+
+```bash
+# Limit packet analysis for large files
+mcpcap --max-packets 1000
+```
+
+### Transport Options
+
+```bash
+# Default stdio transport
+mcpcap
+
+# HTTP transport for network-accessible MCP clients
+mcpcap --transport http
+
+# HTTP transport on a custom interface and port (requires MCPCAP_AUTH_TOKEN)
+mcpcap --transport http --host 0.0.0.0 --port 9000
+```
+
+### Complete Configuration Example
+
+```bash
+mcpcap --modules dns,dhcp,icmp,tcp,sip,capinfos --max-packets 500
+```
+
+## CLI Reference
+
+```bash
+mcpcap [--modules MODULES] [--max-packets N] [--transport {stdio,http}] [--host HOST] [--port PORT] [--allow-unauthenticated-http]
+```
+
+**Options:**
+- `--modules MODULES`: Comma-separated modules to load (default: `dns,dhcp,icmp,tcp,sip,capinfos`)
+  - Available modules: `dns`, `dhcp`, `icmp`, `tcp`, `sip`, `capinfos`
+- `--max-packets N`: Maximum packets to analyze per file (default: unlimited)
+- `--transport {stdio,http}`: MCP transport to expose (default: `stdio`)
+- `--host HOST`: Host to bind for HTTP transport (default: `127.0.0.1`)
+- `--port PORT`: Port to bind for HTTP transport (default: `8080`)
+- `--allow-unauthenticated-http`: Permit a non-loopback bind without a token only for isolated local deployments, such as Docker with a loopback-published port
+
+**Examples:**
+```bash
+# Start with all modules
+mcpcap
+
+# DNS and TCP analysis only
+mcpcap --modules dns,tcp
+
+# TCP analysis for troubleshooting connections
+mcpcap --modules tcp
+
+# With packet limits for large files
+mcpcap --max-packets 1000
+
+# Expose mcpcap over HTTP
+mcpcap --transport http --host 127.0.0.1 --port 8080
+```
+
+## Examples
+
+Example PCAP files are included in the `examples/` directory:
+
+- `dns.pcap` - DNS traffic for testing DNS analysis
+- `dhcp.pcap` - DHCP 4-way handshake capture
+
+There is currently no bundled ICMP sample capture in `examples/`.
+
+### Using with MCP Inspector
+
+```bash
+npm install -g @modelcontextprotocol/inspector
+npx @modelcontextprotocol/inspector mcpcap
+```
+
+Then test the tools:
+```javascript
+// In the MCP Inspector web interface
+analyze_dns_packets("./examples/dns.pcap")
+analyze_dhcp_packets("./examples/dhcp.pcap")
+analyze_capinfos("./examples/dns.pcap")
+analyze_tcp_connections("/absolute/path/to/capture.pcap")
+analyze_sip_packets("/absolute/path/to/voip-signaling.pcap")
+```
+
+## Architecture
+
+mcpcap's modular design supports easy extension:
+
+### Core Components
+1. **BaseModule**: Shared file handling, validation, and remote download
+2. **Protocol Modules**: DNS, DHCP, ICMP, TCP, SIP, and CapInfos implementations
+3. **MCP Interface**: Tool registration and prompt management
+4. **FastMCP Framework**: MCP server implementation
+
+### Tool Flow
+```
+MCP Client Request → analyze_*_packets(pcap_file)
+                  → BaseModule.analyze_packets()
+                  → Module._analyze_protocol_file()
+                  → Structured JSON Response
+```
+
+### Adding New Modules
+
+Create new protocol modules by:
+
+1. Inheriting from `BaseModule`
+2. Implementing `_analyze_protocol_file(pcap_file)`
+3. Registering analysis tools with the MCP server
+4. Adding specialized analysis prompts
+
+Future modules might include:
+- HTTP/HTTPS traffic analysis
+- UDP connection analysis
+- BGP routing analysis
+- SSL/TLS certificate analysis
+- Network forensics tools
+- Port scan detection
+
+## Remote File Support
+
+Both analysis tools accept remote PCAP files via HTTP/HTTPS URLs:
+
+```bash
+# Examples of remote analysis
+analyze_dns_packets("https://raw.githubusercontent.com/mcpcap/mcpcap/main/examples/dns.pcap")
+analyze_dhcp_packets("https://example.com/network-capture.pcap")
+analyze_icmp_packets("https://example.com/ping-test.pcap")
+analyze_capinfos("https://example.com/network-metadata.pcap")
+analyze_tcp_connections("https://example.com/tcp-session.pcap")
+analyze_sip_packets("https://example.com/sip-signaling.pcap")
+```
+
+**Features:**
+- Automatic temporary download and cleanup
+- Support for `.pcap`, `.pcapng`, and `.cap` files
+- HTTP/HTTPS protocols supported
+
+## Security Considerations
+
+When analyzing PCAP files:
+- Files may contain sensitive network information
+- Remote downloads are performed over HTTPS when possible
+- Temporary files are cleaned up automatically
+- Consider the source and trustworthiness of remote files
+
+## Contributing
+
+Contributions welcome! Areas for contribution:
+
+- **New Protocol Modules**: Add support for HTTP, BGP, TLS, RTP, etc.
+- **Enhanced Analysis**: Improve existing DNS/DHCP analysis
+- **Security Features**: Add more threat detection capabilities
+- **Performance**: Optimize analysis for large PCAP files
+
+## License
+
+MIT
+
+## Requirements
+
+- Python 3.10+
+- scapy (packet parsing and analysis)
+- requests (remote file access)
+- fastmcp (MCP server framework)
+
+## Documentation
+
+- **GitHub**: [github.com/mcpcap/mcpcap](https://github.com/mcpcap/mcpcap)
+- **Documentation**: [docs.mcpcap.ai](https://docs.mcpcap.ai)
+- **Website**: [mcpcap.ai](https://mcpcap.ai)
+
+## Support
+
+For questions, issues, or feature requests, please open an issue on GitHub.

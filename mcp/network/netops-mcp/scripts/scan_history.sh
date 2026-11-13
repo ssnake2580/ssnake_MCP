@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+#
+# scan_history.sh — NetOpsMCP publication HARD GATE (REL-10)
+#
+# Scans the ENTIRE git history (all refs) before the repository is made public,
+# and reports whether the history is publication-clean.
+#
+# It checks two independent surfaces:
+#
+#   1. Secrets / credentials in any commit on any ref:
+#        - private-key blocks (RSA/OPENSSH/EC/DSA/PGP/PRIVATE)
+#        - AWS access key IDs (AKIA...)
+#        - GitHub / Slack provider tokens
+#        - real bearer tokens (excluding documented placeholders)
+#
+#   2. Planning / AI-tool / coverage / log artifacts that must never ship:
+#        .planning, CLAUDE.md, .claude, get-shit-done, .codex, .cursor,
+#        .agents, htmlcov, logs, .impeccable
+#        (each must have ZERO commits across all refs)
+#
+# Benign high-entropy allowlist (see RESEARCH Pitfall 3):
+#   - uv.lock package-integrity hashes  (files.pythonhosted.org  sha256:<64hex>)
+#   - the README example digest 0f70...25 (= sha256 of the literal "YOUR-KEY")
+#
+# Tooling: if `gitleaks` (with .gitleaks.toml) or `detect-secrets` are installed
+# they augment the scan, but a zero-install patterned baseline over
+# `git log -p --all` ALWAYS runs so the gate is deterministic on any host
+# (CONTEXT-sanctioned fallback). The script is READ-ONLY — it never rewrites
+# history.
+#
+# Exit codes:
+#   0  PASS   — history is publication-clean (0 findings). Gate is green.
+#   1  BLOCKER— at least one finding. DO NOT push/publish. Surface to a human.
+#              History rewrite is irreversible (force-push) and is NEVER done here.
+#
+# Usage:  bash scripts/scan_history.sh
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || { echo "FATAL: cannot cd to repo root" >&2; exit 2; }
+
+FINDINGS=0
+README_EXAMPLE_DIGEST='sha256:0f70dbbe4175927d0c7ff3bdc45622f13e6a5d306248731395a8995974effe25'
+
+section() { printf '\n=== %s ===\n' "$1"; }
+
+# Count matching lines, FAILING CLOSED (WR-03). grep exit codes: 0=match,
+# 1=no match, >=2=error (bad regex, read/encoding failure, ...). A security
+# hard gate must never report "clean" for a check it could not actually run, so
+# on a grep error we emit a non-numeric sentinel; the caller detects it and
+# aborts non-zero. (The old `|| true` forced exit 0 and turned every error into
+# a silent "0 matches".) NOTE: this runs inside command substitution, so a bare
+# `exit` here would only leave the subshell — the abort must happen in the
+# caller after it inspects this output.
+count_matches() {
+    local out rc
+    out=$(grep -icE "$1"); rc=$?
+    if [ "$rc" -ge 2 ]; then
+        printf 'GREP_ERROR'
+        return 2
+    fi
+    printf '%s' "${out:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# 0. Header
+# ---------------------------------------------------------------------------
+printf 'NetOpsMCP publication hard gate (REL-10)\n'
+printf 'repo: %s\n' "$REPO_ROOT"
+printf 'refs scanned: %s | commits (all refs): %s\n' \
+    "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" \
+    "$(git rev-list --all --count)"
+
+# ---------------------------------------------------------------------------
+# 1. Forbidden artifact paths — must have 0 commits across ALL refs
+# ---------------------------------------------------------------------------
+section "Artifact absence check (all refs)"
+ARTIFACT_PATHS=(.planning CLAUDE.md .claude get-shit-done .codex .cursor .agents htmlcov logs .impeccable)
+for p in "${ARTIFACT_PATHS[@]}"; do
+    n=$(git log --all --oneline -- "$p" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$n" -ne 0 ]; then
+        printf 'FINDING: %-16s appears in %s commit(s) of git history\n' "$p" "$n"
+        FINDINGS=$((FINDINGS + 1))
+    else
+        printf 'ok: %-16s (0 commits)\n' "$p"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# 2. Targeted secret patterns over the full-history diff (all refs)
+# ---------------------------------------------------------------------------
+# The ENTIRE tracked tree is scanned — including this script and .gitleaks.toml.
+# A hard publication gate must not carry a blind spot: a real secret committed
+# into the scanner's own definition files would otherwise ship undetected. The
+# only pattern that used to self-match the scanner's source (the redundant PEM
+# filename check) has been removed (it was fully covered by the private-key
+# block pattern below), so no whole-file self-exclusion is needed.
+#
+# Strip git diff hunk-header lines (`@@ -a,b +c,d @@ <context>`): git copies a
+# nearby line into the header as context and TRUNCATES it to a fixed width. That
+# truncation can chop an allowlisted digest (or a uv.lock package hash) mid-hash,
+# producing a prefix token that the per-token allowlist no longer recognizes — a
+# false positive. Hunk headers are pure metadata; their context is always
+# duplicated in full as a +/context line in the hunk body, so dropping them is
+# lossless for real-secret detection.
+section "Targeted secret patterns (git log -p --all, full tree)"
+DIFF_ALL="$(git log -p --all -- . | sed '/^@@/d')"
+
+check_pattern() {
+    local label="$1" regex="$2" hits
+    hits=$(printf '%s\n' "$DIFF_ALL" | count_matches "$regex")
+    # Fail closed (WR-03): if the count is not a plain integer, the underlying
+    # grep errored (or returned the GREP_ERROR sentinel) — treat an un-runnable
+    # check as fatal rather than a silent pass. check_pattern runs in the main
+    # shell (not a subshell), so this exit terminates the whole gate.
+    if ! printf '%s' "$hits" | grep -qE '^[0-9]+$'; then
+        printf 'FATAL: secret pattern "%s" could not be evaluated (grep error) — failing closed\n' "$label" >&2
+        exit 2
+    fi
+    if [ "$hits" -ne 0 ]; then
+        printf 'FINDING: %-34s %s hit(s)\n' "$label" "$hits"
+        FINDINGS=$((FINDINGS + 1))
+    else
+        printf 'ok: %-34s 0\n' "$label"
+    fi
+}
+
+check_pattern "private-key blocks"          'BEGIN (RSA|OPENSSH|EC|DSA|PGP|PRIVATE) '
+check_pattern "AWS access key id (AKIA)"     'AKIA[0-9A-Z]{16}'
+check_pattern "GitHub token (ghp/gho/ghs/ghu)" 'gh[posu]_[A-Za-z0-9]{36}'
+check_pattern "Slack token (xox...)"         'xox[baprs]-[0-9A-Za-z-]{10,}'
+check_pattern "Google API key (AIza...)"     'AIza[0-9A-Za-z_-]{35}'
+# NOTE: a separate PEM private-key filename pattern was intentionally removed.
+# It was fully subsumed by the private-key-block check above (which already
+# matches real PEM header lines), and it was the sole pattern that self-matched
+# this script's own source — the reason the scanner-def files used to be
+# excluded from the diff wholesale. Do NOT re-add a literal PEM header string
+# here: it would self-match the private-key-block check and fail this gate.
+
+# Real bearer tokens on ADDED lines, excluding documented placeholders.
+# The placeholder allowlist is anchored to the TOKEN (the value right after
+# "Bearer "), not to the whole line (WR-02): a line whose bearer value is a real
+# token but which also happens to contain a benign word like "example" elsewhere
+# (e.g. a trailing "# example config" comment) must still be flagged.
+BEARER_DETECT='^\+.*Bearer [A-Za-z0-9_.-]{20,}'
+BEARER_PLACEHOLDER='Bearer (YOUR|EXAMPLE|XXXX|PLACEHOLDER|CHANGEME|<|\.\.\.)'
+section "Real bearer tokens (added lines, excluding placeholders)"
+# Fail closed (WR-01): capture the PRIMARY detect-grep exit code. grep rc >=2 is
+# a real error (bad regex / read/encoding failure); an un-runnable secret check
+# must abort the gate, never silently report 0. The old
+# `... | grep -iE "$BEARER_DETECT" 2>/dev/null | ... | wc -l` swallowed the error
+# and printed "ok: 0" — a fail-OPEN window this stage no longer has. rc 0 (match)
+# and rc 1 (no match) are both normal and proceed.
+bearer_detected=$(printf '%s\n' "$DIFF_ALL" | grep -iE "$BEARER_DETECT"); rc=$?
+if [ "$rc" -ge 2 ]; then
+    printf 'FATAL: bearer-token detect grep error — failing closed\n' >&2
+    exit 2
+fi
+if [ "$rc" -eq 0 ]; then
+    # Exclude documented placeholders (per-token anchored, WR-02) and count.
+    bearer_hits=$(printf '%s\n' "$bearer_detected" | grep -viE "$BEARER_PLACEHOLDER" | wc -l | tr -d ' ')
+else
+    bearer_hits=0
+fi
+bearer_hits=${bearer_hits:-0}
+if [ "$bearer_hits" -ne 0 ]; then
+    printf 'FINDING: real bearer token(s): %s\n' "$bearer_hits"
+    printf '%s\n' "$bearer_detected" | grep -viE "$BEARER_PLACEHOLDER" | head -10
+    FINDINGS=$((FINDINGS + 1))
+else
+    printf 'ok: real bearer tokens 0\n'
+fi
+
+# ---------------------------------------------------------------------------
+# 3. High-entropy sha256 triage — every hit must be allowlisted
+# ---------------------------------------------------------------------------
+section "High-entropy sha256 triage (allowlist: uv.lock hashes + README example)"
+# Allowlist PER TOKEN, not per line (WR-02). A naive `grep -v` of any line that
+# mentions files.pythonhosted.org or the README digest would silently drop a
+# real secret co-located on the same line. Instead:
+#   1. neutralize only the genuine uv.lock package-hash token — recognized by
+#      the structured `url = "https://files.pythonhosted.org/...",
+#      hash = "sha256:<hex>"` shape (a bare mention of the URL is NOT enough);
+#   2. extract every remaining sha256 token individually (grep -oiE);
+#   3. drop only the exact README example-digest token.
+# Anything left is a finding, even if it shared a line with a benign hash.
+# Residual (documented): a secret injected into the exact structured uv.lock
+# url+hash position is still trusted — the same public-lockfile assumption the
+# .gitleaks.toml `^uv\.lock$` path allowlist already makes.
+UVLOCK_HASH_STRUCT='url = "https://files\.pythonhosted\.org/[^"]*", hash = "sha256:[a-f0-9]{16,}"'
+# Fail closed (WR-01): gate the FIRST-STAGE sha256 grep before neutralization.
+# The old `grep -iE 'sha256:...' 2>/dev/null | ...` swallowed a grep error, which
+# would have emptied the candidate stream and made the triage report every hash
+# "allowlisted" (fail-OPEN) — the highest-value allowlist stage. rc >=2 aborts;
+# rc 0/1 are normal. Downstream filters run on the already-extracted tokens.
+SHA_CANDIDATES=$(printf '%s\n' "$DIFF_ALL" | grep -iE 'sha256:[a-f0-9]{16,}'); rc=$?
+if [ "$rc" -ge 2 ]; then
+    printf 'FATAL: sha256 triage detect grep error — failing closed\n' >&2
+    exit 2
+fi
+UNEXPECTED_SHA_LIST=$(printf '%s\n' "$SHA_CANDIDATES" \
+    | sed -E "s#${UVLOCK_HASH_STRUCT}#UVLOCK_PKG_HASH#g" \
+    | grep -oiE 'sha256:[a-f0-9]{16,}' \
+    | grep -viF "$README_EXAMPLE_DIGEST")
+UNEXPECTED_SHA=$(printf '%s' "$UNEXPECTED_SHA_LIST" | grep -c . )
+UNEXPECTED_SHA=${UNEXPECTED_SHA:-0}
+TOTAL_SHA=$(printf '%s\n' "$SHA_CANDIDATES" | grep -oiE 'sha256:[a-f0-9]{16,}' | grep -c .)
+TOTAL_SHA=${TOTAL_SHA:-0}
+if [ "$UNEXPECTED_SHA" -ne 0 ]; then
+    printf 'FINDING: %s sha256 token(s) outside the uv.lock/README allowlist:\n' "$UNEXPECTED_SHA"
+    printf '%s\n' "$UNEXPECTED_SHA_LIST" | head -20
+    FINDINGS=$((FINDINGS + 1))
+else
+    printf 'ok: all %s sha256 token(s) allowlisted (uv.lock package hashes + README example digest)\n' "$TOTAL_SHA"
+fi
+
+# ---------------------------------------------------------------------------
+# 3b. Merge-safe blob sweep (IN-01) — entry-path-independent
+# ---------------------------------------------------------------------------
+# The diff baseline above uses `git log -p --all`, which omits merge-commit diffs
+# by default. A secret introduced ONLY in a merge-conflict resolution — present
+# in the merge tree but in neither parent's non-merge diff — is therefore
+# invisible to the diff baseline (this history carries 27 merge commits). This
+# sweep reads every BLOB object in the object graph directly, regardless of how
+# it entered history (normal commit, merge resolution, dangling), and greps the
+# high-confidence, ALLOWLIST-FREE provider-token / private-key patterns over the
+# raw content. Only patterns with a negligible benign-collision rate are used
+# here — the sha256 / bearer allowlist logic stays on the diff baseline, where
+# per-token neutralization is possible. The object graph is small (hundreds of
+# blobs), so this adds no meaningful runtime. Fails closed like every other stage.
+section "Merge-safe blob sweep (all blob objects, IN-01)"
+BLOB_SECRET_RE='AKIA[0-9A-Z]{16}|gh[posu]_[A-Za-z0-9]{36}|xox[baprs]-[0-9A-Za-z-]{10,}|AIza[0-9A-Za-z_-]{35}|BEGIN (RSA|OPENSSH|EC|DSA|PGP|PRIVATE) '
+BLOB_SHAS="$(mktemp)"
+BLOB_DUMP="$(mktemp)"
+trap 'rm -f "${BLOB_SHAS:-}" "${BLOB_DUMP:-}"' EXIT
+
+# Enumerate unique blob object SHAs only (batch-check is content-free and fast).
+git rev-list --all --objects \
+    | awk '{print $1}' \
+    | git cat-file --batch-check='%(objectname) %(objecttype)' \
+    | awk '$2 == "blob" {print $1}' \
+    | sort -u > "$BLOB_SHAS"
+for st in "${PIPESTATUS[@]}"; do
+    if [ "$st" -ge 2 ]; then
+        printf 'FATAL: blob enumeration error (git rc %s) — failing closed\n' "$st" >&2
+        exit 2
+    fi
+done
+
+# Stream the raw content of exactly those blobs and scan it.
+git cat-file --batch < "$BLOB_SHAS" > "$BLOB_DUMP" 2>/dev/null; rc=$?
+if [ "$rc" -ge 2 ]; then
+    printf 'FATAL: blob content read error (git rc %s) — failing closed\n' "$rc" >&2
+    exit 2
+fi
+
+n_blobs=$(grep -c . "$BLOB_SHAS"); n_blobs=${n_blobs:-0}
+blob_hits_list=$(grep -aiE "$BLOB_SECRET_RE" "$BLOB_DUMP"); rc=$?
+if [ "$rc" -ge 2 ]; then
+    printf 'FATAL: blob sweep grep error — failing closed\n' >&2
+    exit 2
+fi
+blob_hits=$(printf '%s' "$blob_hits_list" | grep -c .); blob_hits=${blob_hits:-0}
+if [ "$blob_hits" -ne 0 ]; then
+    printf 'FINDING: %s provider-token/private-key hit(s) in raw blob objects (merge-safe):\n' "$blob_hits"
+    printf '%s\n' "$blob_hits_list" | head -20
+    FINDINGS=$((FINDINGS + 1))
+else
+    printf 'ok: blob sweep clean (%s blob object(s), no provider-token/private-key match)\n' "$n_blobs"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Scanner augmentation (optional — patterned baseline above is authoritative)
+# ---------------------------------------------------------------------------
+section "Scanner augmentation (optional)"
+DS_BIN=""
+if command -v detect-secrets >/dev/null 2>&1; then
+    DS_BIN="detect-secrets"
+elif [ -x "$REPO_ROOT/.venv/bin/detect-secrets" ]; then
+    DS_BIN="$REPO_ROOT/.venv/bin/detect-secrets"
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+    echo "gitleaks found — scanning all refs with .gitleaks.toml allowlist"
+    if gitleaks detect --source . --config .gitleaks.toml --log-opts="--all" --redact -v; then
+        echo "ok: gitleaks reported no findings"
+    else
+        echo "FINDING: gitleaks reported findings (review output above)"
+        FINDINGS=$((FINDINGS + 1))
+    fi
+elif [ -n "$DS_BIN" ]; then
+    echo "detect-secrets found ($DS_BIN) — scanning tracked files"
+    if "$DS_BIN" scan --all-files >/tmp/.ds_scan.json 2>/dev/null; then
+        ds_secrets=$(grep -c '"type"' /tmp/.ds_scan.json 2>/dev/null || echo 0)
+        if [ "${ds_secrets:-0}" -ne 0 ]; then
+            echo "FINDING: detect-secrets flagged ${ds_secrets} potential secret(s) — review /tmp/.ds_scan.json"
+            FINDINGS=$((FINDINGS + 1))
+        else
+            echo "ok: detect-secrets reported no findings"
+        fi
+    fi
+    rm -f /tmp/.ds_scan.json
+else
+    echo "note: no gitleaks/detect-secrets on PATH — the zero-install patterned"
+    echo "      baseline above is the authoritative gate (CONTEXT-sanctioned)."
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Result
+# ---------------------------------------------------------------------------
+section "RESULT"
+if [ "$FINDINGS" -eq 0 ]; then
+    echo "PASS — full git history is publication-clean (0 findings across all refs)."
+    exit 0
+fi
+echo "BLOCKER — ${FINDINGS} finding(s). DO NOT push or make the repository public."
+echo "Surface the finding(s) to a human. History rewrite is irreversible"
+echo "(requires force-push) and is NEVER performed by this script."
+exit 1

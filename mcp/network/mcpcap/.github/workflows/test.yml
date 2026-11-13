@@ -1,0 +1,130 @@
+name: Test
+
+permissions:
+  contents: read
+  packages: read
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        # Fetch full history for setuptools-scm to work properly
+        fetch-depth: 0
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: "0.12.19"
+
+    - name: Cache uv dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/uv
+        key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-uv-${{ matrix.python-version }}-
+          ${{ runner.os }}-uv-
+
+    - name: Install dependencies
+      run: |
+        uv sync --locked --extra dev --extra test --group build --no-install-project
+        uv sync --locked --extra dev --extra test --group build --no-build-isolation
+
+    - name: Check version detection
+      run: |
+        uv run --locked --no-sync python -c "import mcpcap; print('Version:', mcpcap.__version__)"
+
+    - name: Run linting with ruff
+      run: |
+        uv run --locked --no-sync ruff check .
+        uv run --locked --no-sync ruff format --check .
+
+    - name: Run tests with pytest
+      run: |
+        uv run --locked --no-sync python -m pytest tests/ -v
+
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Build Docker image
+      run: |
+        docker build \
+          --build-arg MCPPCAP_VERSION=0.0.0.dev0 \
+          --build-arg VCS_REF=${GITHUB_SHA} \
+          --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+          -t mcpcap:test .
+
+    - name: Verify stdio image startup
+      run: |
+        docker run --rm -i mcpcap:test --help
+
+    - name: Verify HTTP container startup
+      run: |
+        docker run -d --rm --name mcpcap-http -p 127.0.0.1:8080:8080 mcpcap:test --transport http --host 0.0.0.0 --port 8080 --allow-unauthenticated-http
+        for attempt in $(seq 1 20); do
+          if curl --silent --show-error --output /dev/null http://127.0.0.1:8080/mcp; then
+            exit 0
+          fi
+          sleep 1
+        done
+        docker logs mcpcap-http
+        exit 1
+
+    - name: Stop HTTP container
+      if: always()
+      run: docker stop mcpcap-http || true
+
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: "0.12.19"
+
+    - name: Cache uv dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/uv
+        key: ${{ runner.os }}-uv-check-version-${{ hashFiles('uv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-uv-check-version-
+          ${{ runner.os }}-uv-
+
+    - name: Install locked version tools
+      run: |
+        uv sync --locked --group build --no-install-project
+
+    - name: Verify version can be determined
+      run: |
+        uv run --locked --no-sync python -c "from setuptools_scm import get_version; print('Detected version:', get_version())"

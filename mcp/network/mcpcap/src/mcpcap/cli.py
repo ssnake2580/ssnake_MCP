@@ -1,0 +1,102 @@
+"""CLI entry point for mcpcap.
+
+This module provides the command-line interface for mcpcap, handling argument parsing
+and server initialization.
+"""
+
+import argparse
+import sys
+
+from .core import Config, MCPServer
+
+
+def main():
+    """Main function to parse arguments and start the MCP server.
+
+    Parses command-line arguments, initializes the configuration and MCP server,
+    and handles graceful shutdown and error conditions.
+
+    Returns:
+        int: Exit code (0 for success, 1 for error)
+
+    Raises:
+        KeyboardInterrupt: If the user interrupts the server
+        Exception: For any unexpected errors during server operation
+    """
+    parser = argparse.ArgumentParser(description="mcpcap MCP Server")
+
+    # Analysis options
+    parser.add_argument(
+        "--modules",
+        help="Comma-separated list of modules to load (default: dns,dhcp,icmp,tcp,sip,capinfos)",
+        default="dns,dhcp,icmp,tcp,sip,capinfos",
+    )
+    parser.add_argument(
+        "--max-packets",
+        type=int,
+        help="Maximum number of packets to analyze per file (default: unlimited)",
+    )
+    parser.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "http"],
+        help="Transport type (default: stdio)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port for HTTP transport (default: 8080)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for HTTP transport (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--allow-unauthenticated-http",
+        action="store_true",
+        help=(
+            "Allow HTTP without MCPCAP_AUTH_TOKEN on non-loopback hosts; "
+            "only for isolated local deployments"
+        ),
+    )
+
+    args = parser.parse_args()
+
+    try:
+        # Parse modules
+        modules = (
+            args.modules.split(",")
+            if args.modules
+            else ["dns", "dhcp", "icmp", "tcp", "sip", "capinfos"]
+        )
+
+        # Initialize configuration
+        config = Config(
+            modules=modules,
+            max_packets=args.max_packets,
+            transport=args.transport,
+            host=args.host,
+            port=args.port,
+            allow_unauthenticated_http=args.allow_unauthenticated_http,
+        )
+
+        # Create and start MCP server
+        server = MCPServer(config)
+        server.run()
+        return 0
+
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\\nServer stopped by user", file=sys.stderr)
+        return 0
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    exit(main())

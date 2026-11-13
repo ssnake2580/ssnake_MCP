@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+.venv-demo/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Capture files (incl. testdata/ — regenerate via scripts/make_iec61850_test_pcaps.py
+# or download per docs/testing/analyze_iec61850-functional-test-plan.md)
+*.pcap
+*.cap
+testdata/
+*.pcapng
+
+# Temporary files
+*.tmp
+*.log
+
+# Build artifacts
+build/
+*.egg-info/
+.pytest_cache/

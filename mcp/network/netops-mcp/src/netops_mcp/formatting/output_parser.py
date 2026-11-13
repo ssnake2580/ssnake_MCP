@@ -1,0 +1,225 @@
+"""
+Output parser for NetOps MCP.
+
+This module provides utilities for parsing output from various system tools
+and converting them into structured data.
+"""
+
+import re
+from typing import Any, Dict, List
+
+
+class OutputParser:
+    """Parses output from various system tools."""
+
+    @staticmethod
+    def parse_ping_output(output: str) -> Dict[str, Any]:
+        """Parse ping command output.
+
+        Args:
+            output: Raw ping output
+
+        Returns:
+            Dictionary with parsed ping statistics
+        """
+        stats: Dict[str, Any] = {
+            "packets_transmitted": 0,
+            "packets_received": 0,
+            "packet_loss_percent": 0,
+            "min_rtt": 0,
+            "avg_rtt": 0,
+            "max_rtt": 0,
+            "mdev_rtt": 0,
+        }
+
+        lines = output.split("\n")
+        for line in lines:
+            if "packets transmitted" in line:
+                # Linux iputils: "4 packets transmitted, 4 received"
+                # macOS/BSD:     "4 packets transmitted, 4 packets received" (WR-03)
+                match = re.search(r"(\d+) packets transmitted, (\d+)(?: packets)? received", line)
+                if match:
+                    stats["packets_transmitted"] = int(match.group(1))
+                    stats["packets_received"] = int(match.group(2))
+                    if stats["packets_transmitted"] > 0:
+                        stats["packet_loss_percent"] = 100 - (
+                            stats["packets_received"] / stats["packets_transmitted"] * 100
+                        )
+                    else:
+                        # Zero packets transmitted (BUG-01): total loss.
+                        stats["packet_loss_percent"] = 100
+                    if stats["packets_received"] == 0:
+                        # No replies (BUG-01 / WR-02): rtt values are
+                        # meaningless — report them as null instead of
+                        # misleading integer zeros for dead hosts.
+                        stats["min_rtt"] = None
+                        stats["avg_rtt"] = None
+                        stats["max_rtt"] = None
+                        stats["mdev_rtt"] = None
+
+            # Linux: "rtt min/avg/max/mdev = ..."
+            # macOS/BSD: "round-trip min/avg/max/stddev = ..." (WR-03)
+            elif "rtt min/avg/max/mdev" in line or "round-trip min/avg/max" in line:
+                match = re.search(r"(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)", line)
+                if match:
+                    stats["min_rtt"] = float(match.group(1))
+                    stats["avg_rtt"] = float(match.group(2))
+                    stats["max_rtt"] = float(match.group(3))
+                    stats["mdev_rtt"] = float(match.group(4))
+
+        return stats
+
+    @staticmethod
+    def parse_traceroute_output(output: str) -> List[Dict[str, Any]]:
+        """Parse traceroute command output.
+
+        Args:
+            output: Raw traceroute output
+
+        Returns:
+            List of hop information
+        """
+        hops = []
+        lines = output.split("\n")
+
+        for line in lines:
+            if line.strip() and not line.startswith("traceroute"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    # WR-05: continuation/diagnostic lines (wrapped responder
+                    # lines, MPLS extensions) have a non-numeric first token;
+                    # skip them instead of letting ValueError escape and turn
+                    # the whole successful traceroute into an error response.
+                    try:
+                        hop_number = int(parts[0])
+                    except ValueError:
+                        continue  # not a hop line
+                    # WR-02: default (resolving) traceroute prints
+                    # "hostname (ip)", so the real IP is the parenthesized
+                    # token in parts[2] — not parts[1]. With -n output or
+                    # silent "* * *" hops there is no such token and host/ip
+                    # stay identical.
+                    ip = parts[1]
+                    times_start = 2
+                    if len(parts) > 2 and parts[2].startswith("(") and parts[2].endswith(")"):
+                        ip = parts[2][1:-1]
+                        times_start = 3
+                    hop_info: Dict[str, Any] = {
+                        "hop_number": hop_number,
+                        "host": parts[1],
+                        "ip": ip,
+                        "times": [],
+                    }
+
+                    # Extract response times
+                    for part in parts[times_start:]:
+                        if part != "*":
+                            try:
+                                hop_info["times"].append(float(part))
+                            except ValueError:
+                                pass
+
+                    hops.append(hop_info)
+
+        return hops
+
+    @staticmethod
+    def parse_mtr_output(output: str) -> Dict[str, Any]:
+        """Parse mtr command output.
+
+        Args:
+            output: Raw mtr output
+
+        Returns:
+            Dictionary with mtr statistics
+        """
+        stats: Dict[str, Any] = {"target": "", "hops": []}
+
+        lines = output.split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("Start") or line.startswith("HOST:"):
+                continue
+
+            parts = line.split()
+            if len(parts) >= 8:
+                try:
+                    # Skip header lines and non-numeric entries.
+                    # Real mtr --report hop lines start with "1.|--", "2.|--",
+                    # etc. (WR-01): strip the ".|--" decoration so the hop
+                    # number parses instead of every line being skipped.
+                    hop_token = parts[0].rstrip(".|-")  # "1.|--" -> "1"
+                    hop_num = int(hop_token)
+                    hop_info: Dict[str, Any] = {
+                        "hop": hop_num,
+                        "host": parts[1],
+                        "loss_percent": float(parts[2].rstrip("%")),
+                        "snt": int(parts[3]),
+                        "last": float(parts[4]),
+                        "avg": float(parts[5]),
+                        "best": float(parts[6]),
+                        "worst": float(parts[7]),
+                    }
+                    stats["hops"].append(hop_info)
+                except (ValueError, IndexError):
+                    # Skip malformed lines
+                    continue
+
+        return stats
+
+    @staticmethod
+    def parse_ss_output(output: str) -> List[Dict[str, Any]]:
+        """Parse ss command output.
+
+        Args:
+            output: Raw ss output
+
+        Returns:
+            List of connection information
+        """
+        connections = []
+        lines = output.split("\n")
+
+        for line in lines:
+            if line.strip() and not line.startswith("State"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    conn_info = {
+                        "state": parts[0],
+                        "recv_q": parts[1],
+                        "send_q": parts[2],
+                        "local_address": parts[3],
+                        "peer_address": parts[4] if len(parts) > 4 else "",
+                    }
+                    connections.append(conn_info)
+
+        return connections
+
+    @staticmethod
+    def parse_netstat_output(output: str) -> List[Dict[str, Any]]:
+        """Parse netstat command output.
+
+        Args:
+            output: Raw netstat output
+
+        Returns:
+            List of connection information
+        """
+        connections = []
+        lines = output.split("\n")
+
+        for line in lines:
+            if line.strip() and not line.startswith("Proto"):
+                parts = line.split()
+                if len(parts) >= 6:
+                    conn_info = {
+                        "protocol": parts[0],
+                        "recv_q": parts[1],
+                        "send_q": parts[2],
+                        "local_address": parts[3],
+                        "foreign_address": parts[4],
+                        "state": parts[5],
+                    }
+                    connections.append(conn_info)
+
+        return connections

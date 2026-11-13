@@ -1,0 +1,24 @@
+node_modules/
+dist/
+*.js
+*.d.ts
+*.map
+!tsup.config.ts
+!vitest.config.ts
+.env
+.env.*
+coverage/
+.DS_Store
+CLAUDE.md
+BOOTSTRAP.md
+SOUL.md
+TASK_*.md
+IMPLEMENTATION_*.md
+*_SUMMARY.md
+POLISH_NOTES.md
+FRONTEND_DESIGN.md
+
+# Claude Code session files (never commit)
+.claude/
+.codex/
+.learnings/

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "netdiag-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["netdiag-mcp"]
+    }
+  }
+}

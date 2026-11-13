@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netdiag-mcp"
+dynamic = ["version"]
+description = "MCP server wrapping dig, ping, mtr, whois and TLS/HTTP checks for on-demand network diagnostics"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "AIKAWA Shigechika"},
+]
+keywords = ["dns", "dig", "ping", "mtr", "whois", "tls", "network", "mcp", "model-context-protocol", "diagnostics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: Internet",
+]
+dependencies = [
+    "httpx>=0.27",
+    "mcp>=2,<3",
+    # zoneinfo reads the operating system's tz database and falls back to
+    # this package when there is none. Windows ships no tz database at all,
+    # and minimal Linux images often drop it, so current_time would fail
+    # there without it.
+    "tzdata",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[project.scripts]
+netdiag-mcp = "netdiag_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/shigechika/netdiag-mcp"
+Repository = "https://github.com/shigechika/netdiag-mcp"
+Issues = "https://github.com/shigechika/netdiag-mcp/issues"
+
+[tool.setuptools]
+packages = ["netdiag_mcp"]
+
+[tool.setuptools.dynamic]
+version = {attr = "netdiag_mcp.__version__"}
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+# scripts/smoke_harness.py is shared verbatim across the servers in this
+# family and is formatted at a narrower width there. Reformatting it here
+# would make every future sync produce a spurious diff and invite the copies
+# to drift apart, so it is excluded from *formatting* only -- `ruff check`
+# does not consult this list, so its lint rules still apply.
+format.exclude = ["scripts/smoke_harness.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

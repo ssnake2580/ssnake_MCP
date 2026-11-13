@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mcpcap - Network Traffic Analysis for LLMs</title>
+    <meta name="description" content="A modular Python MCP server for analyzing PCAP files over stdio or HTTP, with Docker and Docker Compose support for DNS, DHCP, ICMP, TCP, SIP, and CapInfos analysis">
+
+    <!-- Favicon -->
+    <link rel="icon" href="https://raw.githubusercontent.com/mcpcap/mcpcap/main/readme-assets/mcpcap-logo.png" type="image/png">
+    <link rel="apple-touch-icon" href="https://raw.githubusercontent.com/mcpcap/mcpcap/main/readme-assets/mcpcap-logo.png">
+
+    <!-- Theme and Mobile -->
+    <meta name="theme-color" content="#2563eb">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://mcpcap.ai/">
+    <meta property="og:title" content="mcpcap - Network Traffic Analysis for LLMs">
+    <meta property="og:description" content="A modular Python MCP server for analyzing PCAP files over stdio or HTTP, with Docker and Docker Compose support for DNS, DHCP, ICMP, TCP, SIP, and CapInfos analysis">
+    <meta property="og:image" content="https://raw.githubusercontent.com/mcpcap/mcpcap/main/readme-assets/mcpcap-logo.png">
+
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image">
+    <meta property="twitter:url" content="https://mcpcap.ai/">
+    <meta property="twitter:title" content="mcpcap - Network Traffic Analysis for LLMs">
+    <meta property="twitter:description" content="A modular Python MCP server for analyzing PCAP files over stdio or HTTP, with Docker and Docker Compose support for DNS, DHCP, ICMP, TCP, SIP, and CapInfos analysis">
+    <meta property="twitter:image" content="https://raw.githubusercontent.com/mcpcap/mcpcap/main/readme-assets/mcpcap-logo.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Sitemap -->
+    <link rel="sitemap" type="application/xml" href="/sitemap.xml">
+
+    <!-- Resource hints for performance -->
+    <link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
+    <link rel="dns-prefetch" href="https://docs.mcpcap.ai">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="navbar" role="navigation" aria-label="Main navigation">
+        <div class="nav-container">
+            <div class="nav-brand">
+                <img src="https://raw.githubusercontent.com/mcpcap/mcpcap/main/readme-assets/mcpcap-logo.png" alt="mcpcap logo" class="logo-img">
+                <span class="logo">mcpcap</span>
+            </div>
+            <div class="nav-menu" id="navMenu" role="menu">
+                <a href="#features" class="nav-link" role="menuitem">Features</a>
+                <a href="#modules" class="nav-link" role="menuitem">Modules</a>
+                <a href="#quickstart" class="nav-link" role="menuitem">Quick Start</a>
+                <a href="#docs" class="nav-link" role="menuitem">Docs</a>
+                <a href="https://github.com/mcpcap/mcpcap" class="nav-link nav-github" target="_blank" role="menuitem" aria-label="View mcpcap on GitHub">GitHub</a>
+            </div>
+            <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation menu" aria-expanded="false" aria-controls="navMenu">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </button>
+        </div>
+    </nav>
+
+    <main role="main">
+    <header class="hero">
+        <div class="hero-container">
+            <div class="hero-content">
+                <h1 class="hero-title">
+                    Network Traffic Analysis
+                    <span class="gradient-text">for LLMs</span>
+                </h1>
+                <p class="hero-description">
+                    A stateless Python MCP server providing protocol-specific tools for analyzing PCAP files. Run it over stdio, expose it over HTTP, or start the published GHCR image with Docker Compose. Tools accept local file paths or remote URLs as parameters.
+                </p>
+                <div class="hero-actions">
+                    <a href="#quickstart" class="btn btn-primary">Get Started</a>
+                    <a href="https://github.com/mcpcap/mcpcap" class="btn btn-secondary" target="_blank">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M12 0C5.374 0 0 5.373 0 12 0 17.302 3.438 21.8 8.207 23.387c.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/>
+                        </svg>
+                        View on GitHub
+                    </a>
+                </div>
+                <div class="hero-stats">
+                    <div class="stat">
+                        <span class="stat-number">6</span>
+                        <span class="stat-label">Protocol Modules</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-number">Python 3.10+</span>
+                        <span class="stat-label">Requirements</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-number">MIT</span>
+                        <span class="stat-label">License</span>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-visual">
+                <div class="terminal-window">
+                    <div class="terminal-header">
+                        <div class="terminal-controls">
+                            <span class="control red"></span>
+                            <span class="control yellow"></span>
+                            <span class="control green"></span>
+                        </div>
+                        <span class="terminal-title">mcpcap</span>
+                    </div>
+                    <div class="terminal-body">
+                        <div class="terminal-cursor"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <section id="features" class="features">
+        <div class="container">
+            <h2 class="section-title">Key Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14-7H5m14 14H5"/>
+                        </svg>
+                    </div>
+                    <h3 class="feature-title">Modular Architecture</h3>
+                    <p class="feature-description">Easily extensible architecture allows adding new protocol analyzers without modifying core functionality.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9-9a9 9 0 00-9 9"/>
+                        </svg>
+                    </div>
+                    <h3 class="feature-title">Local & Remote PCAP</h3>
+                    <p class="feature-description">Analyze local capture files or remote HTTP URLs by passing the target PCAP directly to each tool call.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/>
+                        </svg>
+                    </div>
+                    <h3 class="feature-title">Scapy Integration</h3>
+                    <p class="feature-description">Leverages the powerful scapy library for comprehensive packet parsing and network analysis.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                        </svg>
+                    </div>
+                    <h3 class="feature-title">stdio or HTTP</h3>
+                    <p class="feature-description">Use the default stdio transport for local MCP apps or expose an HTTP endpoint for network-accessible MCP clients.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+                        </svg>
+                    </div>
+                    <h3 class="feature-title">JSON Output</h3>
+                    <p class="feature-description">Structured JSON responses make analysis results easy for LLMs to understand and process.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+                        </svg>
+                    </div>
+                    <h3 class="feature-title">Security Focus</h3>
+                    <p class="feature-description">Built with security analysis in mind, providing insights into network traffic patterns and anomalies.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="modules" class="modules">
+        <div class="container">
+            <h2 class="section-title">Protocol Modules</h2>
+            <div class="modules-grid">
+                <div class="module-card">
+                    <div class="module-header">
+                        <h3 class="module-title">DNS Module</h3>
+                        <span class="module-badge">Active</span>
+                    </div>
+                    <p class="module-description">Comprehensive DNS packet analysis with query tracking, domain extraction, and response monitoring.</p>
+                    <ul class="module-features">
+                        <li>DNS query and response analysis</li>
+                        <li>Domain and subdomain identification</li>
+                        <li>Query type analysis (A, AAAA, MX, etc.)</li>
+                        <li>DNS server identification</li>
+                    </ul>
+                </div>
+                <div class="module-card">
+                    <div class="module-header">
+                        <h3 class="module-title">DHCP Module</h3>
+                        <span class="module-badge">Active</span>
+                    </div>
+                    <p class="module-description">DHCP transaction monitoring with IP assignment tracking and configuration analysis.</p>
+                    <ul class="module-features">
+                        <li>DHCP transaction tracking</li>
+                        <li>IP address lease monitoring</li>
+                        <li>Client and server identification</li>
+                        <li>Configuration option analysis</li>
+                    </ul>
+                </div>
+                <div class="module-card">
+                    <div class="module-header">
+                        <h3 class="module-title">ICMP Module</h3>
+                        <span class="module-badge">Active</span>
+                    </div>
+                    <p class="module-description">ICMP packet analysis for network diagnostics, connectivity testing, and error detection.</p>
+                    <ul class="module-features">
+                        <li>Ping request/reply analysis</li>
+                        <li>Network connectivity testing</li>
+                        <li>Traceroute path tracking</li>
+                        <li>Error message detection</li>
+                    </ul>
+                </div>
+                <div class="module-card">
+                    <div class="module-header">
+                        <h3 class="module-title">TCP Module</h3>
+                        <span class="module-badge">Active</span>
+                    </div>
+                    <p class="module-description">Connection-centric TCP analysis for handshakes, resets, retransmissions, and bidirectional traffic flow.</p>
+                    <ul class="module-features">
+                        <li>Connection lifecycle analysis</li>
+                        <li>Directional RST and retransmission tracking</li>
+                        <li>Traffic flow asymmetry inspection</li>
+                        <li>Server IP and port filtering</li>
+                    </ul>
+                </div>
+                <div class="module-card">
+                    <div class="module-header">
+                        <h3 class="module-title">SIP Module</h3>
+                        <span class="module-badge">Active</span>
+                    </div>
+                    <p class="module-description">SIP signaling analysis for VoIP registration, call setup, response codes, and endpoint tracing.</p>
+                    <ul class="module-features">
+                        <li>SIP request and response parsing</li>
+                        <li>Call-ID and CSeq correlation</li>
+                        <li>User-Agent and server banner extraction</li>
+                        <li>UDP and TCP signaling visibility</li>
+                    </ul>
+                </div>
+                <div class="module-card">
+                    <div class="module-header">
+                        <h3 class="module-title">CapInfos Module</h3>
+                        <span class="module-badge">Active</span>
+                    </div>
+                    <p class="module-description">PCAP file metadata and statistics analysis, similar to Wireshark's capinfos utility.</p>
+                    <ul class="module-features">
+                        <li>File information and size analysis</li>
+                        <li>Packet statistics and counts</li>
+                        <li>Data throughput calculations</li>
+                        <li>Link layer encapsulation detection</li>
+                    </ul>
+                </div>
+                <div class="module-card coming-soon">
+                    <div class="module-header">
+                        <h3 class="module-title">HTTP Module</h3>
+                        <span class="module-badge">Coming Soon</span>
+                    </div>
+                    <p class="module-description">HTTP/HTTPS traffic analysis for web communication patterns and security assessment.</p>
+                    <ul class="module-features">
+                        <li>Request/response analysis</li>
+                        <li>Header examination</li>
+                        <li>Content type detection</li>
+                        <li>Security header validation</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="quickstart" class="quickstart">
+        <div class="container">
+            <h2 class="section-title">Quick Start</h2>
+            <div class="quickstart-content">
+                <div class="quickstart-steps">
+                    <div class="step">
+                        <div class="step-number">1</div>
+                        <div class="step-content">
+                            <h3 class="step-title">Install mcpcap</h3>
+                            <p class="step-description">Install with pip or uv, or pull the published container with Docker Compose</p>
+                        </div>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">2</div>
+                        <div class="step-content">
+                            <h3 class="step-title">Start the Server</h3>
+                            <p class="step-description">Run mcpcap over stdio, expose HTTP, or launch the GHCR image with Compose</p>
+                        </div>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">3</div>
+                        <div class="step-content">
+                            <h3 class="step-title">Connect & Analyze</h3>
+                            <p class="step-description">Provide file paths or URLs to analyze PCAP files (no uploads)</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="code-examples">
+                    <div class="code-tabs">
+                        <button class="code-tab active" data-tab="install">Install</button>
+                        <button class="code-tab" data-tab="docker">Docker</button>
+                        <button class="code-tab" data-tab="stdio">stdio</button>
+                        <button class="code-tab" data-tab="http">HTTP</button>
+                        <button class="code-tab" data-tab="remote">Remote Files</button>
+                    </div>
+                    <div class="code-content">
+                        <pre class="code-block active" id="install">
+<code># Using pip
+pip install mcpcap
+
+# Using uv
+uv add mcpcap
+
+# One-time usage
+uvx mcpcap</code>
+                        </pre>
+                        <pre class="code-block" id="docker">
+<code># Start the published container over HTTP
+docker compose up
+
+# MCP endpoint
+http://127.0.0.1:8080/mcp
+
+# Mounted sample capture path inside the container
+analyze_dns_packets("/pcaps/dns.pcap")</code>
+                        </pre>
+                        <pre class="code-block" id="stdio">
+<code># Start MCP server for Claude Desktop and similar clients
+mcpcap
+
+# Then use tools with local file PATHS (not uploads)
+analyze_dns_packets("/path/to/capture.pcap")
+analyze_dhcp_packets("/path/to/dhcp.pcap")
+analyze_icmp_packets("/path/to/network.pcap")
+analyze_tcp_connections("/path/to/tcp-session.pcap")
+analyze_sip_packets("/path/to/voip-signaling.pcap")
+analyze_capinfos("/path/to/capture.pcap")</code>
+                        </pre>
+                        <pre class="code-block" id="http">
+<code># Start MCP server with HTTP transport
+mcpcap --transport http --host 127.0.0.1 --port 8080
+
+# Connect your MCP client to:
+http://127.0.0.1:8080/mcp
+</code>
+                        </pre>
+                        <pre class="code-block" id="remote">
+<code># Start MCP server
+mcpcap
+
+# Then use tools with remote URLs (not uploads)
+analyze_dns_packets("https://example.com/capture.pcap")
+analyze_dhcp_packets("https://example.com/dhcp.pcap")
+analyze_icmp_packets("https://example.com/network.pcap")
+analyze_tcp_connections("https://example.com/tcp-session.pcap")
+analyze_sip_packets("https://example.com/sip-signaling.pcap")
+analyze_capinfos("https://example.com/capture.pcap")</code>
+                        </pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="cta">
+        <div class="container">
+            <div class="cta-content">
+                <h2 class="cta-title">Ready to analyze your network traffic?</h2>
+                <p class="cta-description">Join developers using mcpcap to bring network analysis capabilities to their LLM applications.</p>
+                <div class="cta-actions">
+                    <a href="https://docs.mcpcap.ai" class="btn btn-primary">Read Documentation</a>
+                    <a href="https://github.com/mcpcap/mcpcap" class="btn btn-secondary" target="_blank">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M12 0C5.374 0 0 5.373 0 12 0 17.302 3.438 21.8 8.207 23.387c.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/>
+                        </svg>
+                        Contribute on GitHub
+                    </a>
+                </div>
+            </div>
+        </div>
+    </section>
+    </main>
+
+    <footer class="footer" role="contentinfo">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-brand">
+                    <img src="https://raw.githubusercontent.com/mcpcap/mcpcap/main/readme-assets/mcpcap-logo.png" alt="mcpcap" class="footer-logo-img">
+                    <span class="logo">mcpcap</span>
+                    <p class="footer-tagline">Network analysis for the AI age</p>
+                </div>
+                <div class="footer-links">
+                    <div class="link-group">
+                        <h4 class="link-title">Product</h4>
+                        <a href="#features" class="footer-link">Features</a>
+                        <a href="#modules" class="footer-link">Modules</a>
+                        <a href="https://docs.mcpcap.ai" class="footer-link">Documentation</a>
+                    </div>
+                    <div class="link-group">
+                        <h4 class="link-title">Community</h4>
+                        <a href="https://github.com/mcpcap/mcpcap" class="footer-link">GitHub</a>
+                        <a href="https://github.com/mcpcap/mcpcap/issues" class="footer-link">Issues</a>
+                        <a href="https://github.com/mcpcap/mcpcap/discussions" class="footer-link">Discussions</a>
+                    </div>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2025 mcpcap contributors. MIT License.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>

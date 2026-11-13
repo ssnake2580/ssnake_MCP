@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Tag being released: the pushed tag on tag-push events, or the `tag` input
+  # on manual dispatch. Previously the input was declared but never read, so
+  # dispatch silently pushed branch-tagged images and skipped the Release.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # softprops/action-gh-release — create the Release
+      packages: write         # push image to GHCR
+      security-events: write  # codeql-action/upload-sarif — publish Trivy SARIF
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        # On manual dispatch, build from the tag being released rather than
+        # the branch head; on tag push this is github.ref (the tag), i.e.
+        # identical to the previous default behavior.
+        ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v6
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        # value= derives the semver tags from RELEASE_TAG so a manual dispatch
+        # of tag X yields the same version tags (and meta.outputs.version) as
+        # pushing tag X; on tag pushes RELEASE_TAG equals github.ref_name, so
+        # the output is unchanged from the previous ref-derived behavior.
+        tags: |
+          type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+          type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
+          type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }}
+        # :latest only moves on real tag pushes ('auto' keeps the prerelease
+        # exclusion: an rc tag never becomes :latest); manually dispatching an
+        # older tag must not roll the :latest image back in the registry.
+        flavor: |
+          latest=${{ github.event_name == 'push' && 'auto' || 'false' }}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+    
+    - name: Run Trivy vulnerability scanner on image
+      uses: aquasecurity/trivy-action@v0.36.0
+      # Security reporting is best-effort and must never block the Release: a
+      # Trivy hiccup here would otherwise flip success() false and skip the
+      # create-release step below (CR-01). continue-on-error keeps the step's
+      # conclusion 'success' so the tagged Release is still created.
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        format: 'sarif'
+        output: 'trivy-image-results.sarif'
+
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v4
+      if: always()
+      # Best-effort (see above): a SARIF upload failure (e.g. transient
+      # code-scanning API error) must not fail the job and skip create-release.
+      continue-on-error: true
+      with:
+        sarif_file: 'trivy-image-results.sarif'
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v3
+      # Runs on tag pushes and on manual dispatch: tag_name points the Release
+      # at RELEASE_TAG, so dispatching with an existing tag X creates the same
+      # Release that pushing tag X would have created.
+      if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+      with:
+        tag_name: ${{ env.RELEASE_TAG }}
+        generate_release_notes: true
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+

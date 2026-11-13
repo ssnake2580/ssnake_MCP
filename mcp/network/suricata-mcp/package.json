@@ -1,0 +1,61 @@
+{
+  "name": "suricata-mcp",
+  "version": "2.0.0",
+  "description": "MCP server for Suricata IDS/IPS EVE JSON log analysis and rule management",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "suricata-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "generate-eve": "tsx scripts/generate-eve.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "author": "Solomon Neas <me@solomonneas.dev>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lidless-labs/suricata-mcp.git"
+  },
+  "homepage": "https://github.com/lidless-labs/suricata-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/lidless-labs/suricata-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "suricata",
+    "ids",
+    "ips",
+    "network-security",
+    "eve-json",
+    "soc",
+    "intrusion-detection",
+    "threat-hunting"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.12"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}

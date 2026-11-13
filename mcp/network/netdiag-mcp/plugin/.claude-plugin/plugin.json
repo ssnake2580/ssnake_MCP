@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "netdiag-mcp",
+  "displayName": "netdiag-mcp",
+  "description": "On-demand network diagnostics for Claude Code: DNS lookups (A/AAAA/MX/TXT/NS/CNAME/SOA/PTR/CAA, with an explicit resolver and DoT/DoH transports), DNSSEC validation via a validating resolver's AD bit, ping, traceroute, TCP port and HTTP checks, TLS certificate inspection (expiry, chain, SAN), and whois/ASN lookups. Read-only by construction: every tool observes the network and none of them change anything. No configuration and no environment variables are required. Four tools shell out to the system's dig, ping, mtr and whois binaries and report a clear error when one is absent; the TCP, HTTP and TLS checks are pure Python and need nothing installed.",
+  "author": {
+    "name": "AIKAWA Shigechika",
+    "url": "https://github.com/shigechika"
+  },
+  "homepage": "https://shigechika.github.io/netdiag-mcp/",
+  "repository": "https://github.com/shigechika/netdiag-mcp",
+  "license": "MIT",
+  "keywords": [
+    "dns",
+    "dnssec",
+    "networking",
+    "diagnostics",
+    "tls",
+    "whois"
+  ]
+}

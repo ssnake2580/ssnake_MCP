@@ -1,0 +1,739 @@
+{
+  "api_test": {
+    "description": "Test API endpoint with validation",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_status": {
+          "default": 200,
+          "description": "Expected HTTP status",
+          "type": "integer"
+        },
+        "headers": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "HTTP headers"
+        },
+        "method": {
+          "default": "GET",
+          "description": "HTTP method",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 30,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        },
+        "url": {
+          "description": "API endpoint URL",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  "arp_table": {
+    "description": "Show ARP table",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "arping_host": {
+    "description": "ARP ping a host",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "default": 4,
+          "description": "Number of packets",
+          "type": "integer"
+        },
+        "host": {
+          "description": "Target host",
+          "type": "string"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "type": "object"
+    }
+  },
+  "check_required_tools": {
+    "description": "Check required system tools",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "cpu_usage": {
+    "description": "Get CPU usage information",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "curl_request": {
+    "description": "Execute HTTP request using curl",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Request body"
+        },
+        "headers": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "HTTP headers"
+        },
+        "method": {
+          "default": "GET",
+          "description": "HTTP method",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 30,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        },
+        "url": {
+          "description": "Target URL",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  "dig_query": {
+    "description": "Perform DNS lookup using dig",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "description": "Domain to lookup",
+          "type": "string"
+        },
+        "record_type": {
+          "default": "A",
+          "description": "DNS record type",
+          "type": "string"
+        },
+        "server": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "DNS server"
+        }
+      },
+      "required": [
+        "domain"
+      ],
+      "type": "object"
+    }
+  },
+  "disk_usage": {
+    "description": "Get disk usage information",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "email_dns_check": {
+    "description": "Check MX, SPF, DMARC and optional DKIM DNS records of a domain",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "dkim_selector": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "DKIM selector"
+        },
+        "domain": {
+          "description": "Domain to check",
+          "type": "string"
+        }
+      },
+      "required": [
+        "domain"
+      ],
+      "type": "object"
+    }
+  },
+  "health": {
+    "description": "Health check endpoint",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "host_lookup": {
+    "description": "Perform DNS lookup using host",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "description": "Domain to lookup",
+          "type": "string"
+        },
+        "record_type": {
+          "default": "A",
+          "description": "DNS record type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "domain"
+      ],
+      "type": "object"
+    }
+  },
+  "httpie_request": {
+    "description": "Execute HTTP request using httpie",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Request data"
+        },
+        "headers": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "HTTP headers"
+        },
+        "method": {
+          "default": "GET",
+          "description": "HTTP method",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 30,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        },
+        "url": {
+          "description": "Target URL",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  "memory_usage": {
+    "description": "Get memory usage information",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "mtr_monitor": {
+    "description": "Monitor network path using mtr",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "default": 10,
+          "description": "Number of probes",
+          "type": "integer"
+        },
+        "target": {
+          "description": "Target host",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 30,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "netcat_test": {
+    "description": "Test port connectivity using netcat",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "description": "Target host",
+          "type": "string"
+        },
+        "port": {
+          "description": "Target port",
+          "type": "integer"
+        },
+        "timeout": {
+          "default": 10,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host",
+        "port"
+      ],
+      "type": "object"
+    }
+  },
+  "netstat_connections": {
+    "description": "Show network connections using netstat",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Protocol (tcp/udp)"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Connection state"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "nmap_scan": {
+    "description": "Scan network using nmap",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "ports": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Port range (e.g., '22,80,443')"
+        },
+        "scan_type": {
+          "default": "basic",
+          "description": "Scan type",
+          "type": "string"
+        },
+        "target": {
+          "description": "Target host or network",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 300,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "nslookup_query": {
+    "description": "Perform DNS lookup using nslookup",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "description": "Domain to lookup",
+          "type": "string"
+        },
+        "record_type": {
+          "default": "A",
+          "description": "DNS record type",
+          "type": "string"
+        },
+        "server": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "DNS server"
+        }
+      },
+      "required": [
+        "domain"
+      ],
+      "type": "object"
+    }
+  },
+  "ping_host": {
+    "description": "Ping a host to test connectivity",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "default": 4,
+          "description": "Number of ping packets",
+          "type": "integer"
+        },
+        "host": {
+          "description": "Target host",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 10,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "type": "object"
+    }
+  },
+  "port_scan": {
+    "description": "Scan ports on a target",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "ports": {
+          "description": "Port range (e.g., '1-1000')",
+          "type": "string"
+        },
+        "target": {
+          "description": "Target host",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 60,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "ports"
+      ],
+      "type": "object"
+    }
+  },
+  "process_list": {
+    "description": "List running processes",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 20,
+          "description": "Number of processes to show",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "reverse_dns_lookup": {
+    "description": "Reverse DNS (PTR) lookup with forward confirmation",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "ip": {
+          "description": "IPv4 or IPv6 address",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 5,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ip"
+      ],
+      "type": "object"
+    }
+  },
+  "service_discovery": {
+    "description": "Discover network services",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "ports": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Port range"
+        },
+        "target": {
+          "description": "Target host",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "service_enumeration": {
+    "description": "Enumerate services on a target",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "ports": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Port range"
+        },
+        "target": {
+          "description": "Target host",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "ss_connections": {
+    "description": "Show network connections using ss",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Protocol (tcp/udp)"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Connection state"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "system_status": {
+    "description": "Get system status",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "telnet_connect": {
+    "description": "Test port connectivity using telnet",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "description": "Target host",
+          "type": "string"
+        },
+        "port": {
+          "description": "Target port",
+          "type": "integer"
+        },
+        "timeout": {
+          "default": 10,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host",
+        "port"
+      ],
+      "type": "object"
+    }
+  },
+  "tls_certificate_check": {
+    "description": "Inspect the TLS certificate presented by a host",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "description": "Target host",
+          "type": "string"
+        },
+        "port": {
+          "default": 443,
+          "description": "TLS port",
+          "type": "integer"
+        },
+        "timeout": {
+          "default": 10,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "type": "object"
+    }
+  },
+  "traceroute_path": {
+    "description": "Perform traceroute to a target",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_hops": {
+          "default": 30,
+          "description": "Maximum number of hops",
+          "type": "integer"
+        },
+        "target": {
+          "description": "Target host",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 30,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "whois_lookup": {
+    "description": "WHOIS lookup for a domain or IP address",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "description": "Domain name or IP address",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 30,
+          "description": "Timeout in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  }
+}

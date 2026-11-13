@@ -1,0 +1,123 @@
+name: Protocol Module Request
+description: Request support for a new network protocol analysis module
+title: "[Module] Add support for [PROTOCOL_NAME]"
+labels: ["enhancement", "module", "protocol"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for requesting a new protocol module! This helps us prioritize which protocols to support next.
+
+  - type: input
+    id: protocol-name
+    attributes:
+      label: Protocol Name
+      description: What protocol would you like mcpcap to support?
+      placeholder: e.g., HTTP, FTP, SSH, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: protocol-description
+    attributes:
+      label: Protocol Description
+      description: Brief description of the protocol and its purpose
+      placeholder: What does this protocol do? What is it used for?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol-layer
+    attributes:
+      label: OSI Layer
+      description: Which OSI layer does this protocol primarily operate at?
+      options:
+        - Layer 2 - Data Link
+        - Layer 3 - Network
+        - Layer 4 - Transport
+        - Layer 5 - Session
+        - Layer 6 - Presentation
+        - Layer 7 - Application
+        - Multiple layers
+        - Unknown/Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-cases
+    attributes:
+      label: Use Cases
+      description: What specific analysis would you want to perform on this protocol?
+      placeholder: |
+        - Security analysis: ...
+        - Performance monitoring: ...
+        - Troubleshooting: ...
+        - Compliance: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: analysis-goals
+    attributes:
+      label: Analysis Goals
+      description: What specific information should the module extract or analyze?
+      placeholder: |
+        - Packet counts and sizes
+        - Connection patterns
+        - Error rates
+        - Specific protocol fields
+        - Security indicators
+    validations:
+      required: true
+
+  - type: input
+    id: rfc-standards
+    attributes:
+      label: RFC or Standards
+      description: Are there RFC documents or standards that define this protocol?
+      placeholder: e.g., RFC 793, IEEE 802.11, etc.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority Level
+      description: How important is this protocol support to your work?
+      options:
+        - Low - Nice to have
+        - Medium - Would be helpful
+        - High - Important for my use case
+        - Critical - Blocking my work
+    validations:
+      required: true
+
+  - type: textarea
+    id: sample-data
+    attributes:
+      label: Sample Data Availability
+      description: Do you have sample PCAP files with this protocol that could help with development?
+      placeholder: |
+        - Yes, I can provide sanitized samples
+        - Yes, but they contain sensitive data
+        - No, but I can generate some
+        - No sample data available
+    validations:
+      required: false
+
+  - type: textarea
+    id: existing-tools
+    attributes:
+      label: Existing Analysis Tools
+      description: Are there existing tools that analyze this protocol? How would mcpcap be different/better?
+      placeholder: What tools currently exist for analyzing this protocol?
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other information that would help with implementing this module
+    validations:
+      required: false

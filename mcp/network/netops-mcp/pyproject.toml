@@ -1,0 +1,147 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netops-mcp"
+version = "0.2.0"
+description = "A Model Context Protocol server for Network Operations and infrastructure diagnostic tools"
+requires-python = ">=3.11"
+authors = [
+    {name = "Alperen Adalar", email = "alp.adalar@gmail.com"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["netops", "mcp", "network", "diagnostic", "system", "administration", "monitoring", "infrastructure"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: System :: Networking :: Firewalls",
+]
+
+dependencies = [
+    "mcp>=2.3.0,<3.0.0",
+    "requests>=2.34.0,<3.0.0",
+    "pydantic>=2.14.0,<3.0.0",
+    "fastmcp>=4.1.2,<5.0.0",
+    "asgiref>=3.12.0",
+    "psutil>=7.2.0,<8.0.0",
+    "dnspython>=2.9.0,<3.0.0",
+    "python-nmap>=0.7.1,<1.0.0",
+    "httpx>=0.24.0,<1.0.0",
+    "rich>=15.0.0,<16.0.0",
+    "click>=8.5.0,<9.0.0",
+    "starlette>=1.9.0,<2.0.0",
+    "python-dotenv>=1.2.0,<2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+    "black>=26.0.0,<27.0.0",
+    "mypy>=2.0.0,<3.0.0",
+    "pytest-asyncio>=1.4,<2",
+    "ruff>=0.17.0,<1.0.0",
+    "types-requests>=2.31.0,<3.0.0",
+    "pytest-mock>=3.11.0,<4.0.0",
+    "pytest-cov>=7,<8",
+    "bandit>=1.9.0,<2.0.0",
+    "safety>=3.8.0,<4.0.0",
+    "coverage>=7.16.0,<8.0.0",
+]
+django = [
+    "django>=4.0.0,<6.0.0",
+    "djangorestframework>=3.14.0",
+    "pyjwt>=2.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/alpadalar/NetOpsMCP"
+Documentation = "https://github.com/alpadalar/NetOpsMCP#readme"
+Repository = "https://github.com/alpadalar/NetOpsMCP.git"
+Issues = "https://github.com/alpadalar/NetOpsMCP/issues"
+
+[project.scripts]
+netops-mcp = "netops_mcp.server:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--disable-warnings",
+    "--cov=src",
+    "--cov-report=html",
+    "--cov-report=term-missing"
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning:pydantic.*",
+    "ignore::FutureWarning",
+    "ignore::PendingDeprecationWarning"
+]
+
+[tool.mypy]
+# REL-08: bumped 3.9 -> 3.10 to match requires-python (>=3.10). Fixes the fatal
+# "Pattern matching is only supported in Python 3.10 and greater" parse error the
+# mcp/fastmcp SDK's match statements trigger under py39. mypy stays ADVISORY in CI
+# (continue-on-error) — the ~95 pre-existing strict errors are out of the frozen-
+# behavior release scope and are not addressed here.
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+
+# REL-08: mcp/fastmcp ship no py.typed / are match-statement heavy; skip following
+# their imports so advisory mypy focuses on this project's own code.
+[[tool.mypy.overrides]]
+module = ["mcp.*", "fastmcp.*"]
+follow_imports = "skip"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# REL-08 accept-and-document: these residuals are behavior-frozen and not worth a
+# risky reflow/restructure for a format-only release-quality pass.
+# E402 — deliberate `sys.path.insert(...)` before imports so tests import from src/.
+# E501 — long lines that black declined to reflow; in metrics.py reflowing the
+#        Prometheus export strings would risk the byte-exact contract (test_metrics.py).
+"tests/conftest.py" = ["E402", "E501"]
+"tests/test_basic.py" = ["E402"]
+"tests/test_tools.py" = ["E402", "E501"]
+"scripts/generate_api_key.py" = ["E402"]
+"src/netops_mcp/middleware/metrics.py" = ["E501"]
+"src/netops_mcp/middleware/auth.py" = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']

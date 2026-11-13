@@ -1,0 +1,17 @@
+{
+  "name": "netdiag-mcp",
+  "description": "netdiag-mcp server, packaged as a Claude Code plugin.",
+  "owner": {
+    "name": "AIKAWA Shigechika",
+    "url": "https://github.com/shigechika"
+  },
+  "plugins": [
+    {
+      "name": "netdiag-mcp",
+      "source": "./plugin",
+      "description": "On-demand network diagnostics for Claude Code: DNS lookups and DNSSEC validation, ping and traceroute, TCP port and HTTP checks, TLS certificate inspection, and whois/ASN lookups. Read-only by construction — it observes the network and never changes anything. Needs the dig, ping, mtr and whois binaries on the machine; the TCP, HTTP and TLS checks are pure Python and work without them.",
+      "category": "networking",
+      "homepage": "https://shigechika.github.io/netdiag-mcp/"
+    }
+  ]
+}

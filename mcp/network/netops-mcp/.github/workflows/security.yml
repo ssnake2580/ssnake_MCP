@@ -1,0 +1,97 @@
+name: Security
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security checks weekly on Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read          # checkout
+      security-events: write  # codeql-action/upload-sarif — publish Trivy SARIF
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+    
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+    
+    - name: Install uv
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+    
+    - name: Create virtual environment and install dependencies
+      # Install the LOCKED dependency tree (same command as lint.yml/test.yml)
+      # so bandit and pip-audit scan exactly what uv.lock ships rather than a
+      # fresh unpinned resolution -- the pip-audit advisory comment below
+      # refers to the locked tree. bandit comes from the locked dev extra;
+      # pip-audit is not a project dependency, so it is installed separately
+      # with a pinned version to keep scanner findings reproducible.
+      run: |
+        uv venv
+        source .venv/bin/activate
+        uv sync --locked --extra dev
+        uv pip install pip-audit==2.10.1
+    
+    - name: Run Bandit (security linter)
+      run: |
+        source .venv/bin/activate
+        bandit -r src/ -ll -f json -o bandit-report.json
+      continue-on-error: true
+    
+    - name: Upload Bandit report
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: bandit-security-report
+        path: bandit-report.json
+    
+    - name: Run pip-audit (dependency vulnerability check)
+      # ADVISORY BY DESIGN: this step reports transitive dependency
+      # vulnerabilities but does NOT gate CI. The locked dependency tree
+      # (fastmcp, starlette, cryptography, urllib3, werkzeug, ...) currently
+      # carries several upstream CVEs with no fixed release compatible with our
+      # pinned stack, so a hard gate would red every build for issues we cannot
+      # remediate here. The JSON report is uploaded as an artifact for triage.
+      # NOTE: --strict is intentionally omitted -- combined with the trailing
+      # `|| true` and continue-on-error it would be silently negated and only
+      # imply a gate that does not exist. Revisit and promote to a real gate
+      # (drop `|| true` and continue-on-error, add --strict) once the tree is
+      # clean.
+      run: |
+        source .venv/bin/activate
+        pip-audit --format json --output pip-audit-report.json || true
+      continue-on-error: true
+
+    - name: Upload pip-audit report
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: pip-audit-vulnerability-report
+        path: pip-audit-report.json
+
+    - name: Run Trivy vulnerability scanner (filesystem)
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v4
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+
