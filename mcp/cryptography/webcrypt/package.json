@@ -1,0 +1,167 @@
+{
+  "name": "webcrypt",
+  "version": "1.0.1",
+  "description": "Zero-dependency JavaScript AES-256-GCM encryption suite for text, files, WebRTC E2EE & AI Agent Tooling (MCP). Supports symmetric password derivation, RSA-4096 hybrid encryption, and post-quantum cryptography via pure Web Crypto API.",
+  "license": "MIT",
+  "author": "PuterVision",
+  "homepage": "https://putervision.github.io/webcrypt/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/putervision/webcrypt.git"
+  },
+  "mcpName": "io.github.putervision/webcrypt",
+  "bugs": {
+    "url": "https://github.com/putervision/webcrypt/issues"
+  },
+  "keywords": [
+    "encryption",
+    "aes-256-gcm",
+    "aes-gcm",
+    "rsa-oaep",
+    "hybrid-encryption",
+    "asymmetric-encryption",
+    "public-key-encryption",
+    "webrtc",
+    "webrtc-e2ee",
+    "insertable-streams",
+    "end-to-end-encryption",
+    "e2ee",
+    "file-encryption",
+    "text-encryption",
+    "secure-messaging",
+    "quantum-resistant",
+    "post-quantum",
+    "pqc",
+    "kyber",
+    "dilithium",
+    "sha-3",
+    "pbkdf2",
+    "web-crypto",
+    "zero-dependency",
+    "browser",
+    "nodejs",
+    "hmac",
+    "jwe",
+    "json-web-encryption",
+    "mcp",
+    "model-context-protocol",
+    "ai-agent",
+    "ai-agents",
+    "security-vault",
+    "state-memory",
+    "putervision"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "webcrypt": "bin/webcrypt.js",
+    "webcrypt-mcp": "bin/webcrypt-mcp.js"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "src",
+    "manifest.json",
+    "server.json",
+    "glama.json"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "browser": "./dist/index.js",
+      "module": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    },
+    "./webcrypt": {
+      "types": "./dist/WebCrypt.d.ts",
+      "import": "./dist/WebCrypt.js",
+      "browser": "./dist/WebCrypt.js",
+      "module": "./dist/WebCrypt.js",
+      "require": "./dist/WebCrypt.cjs",
+      "default": "./dist/WebCrypt.js"
+    },
+    "./webcrypt-asym": {
+      "types": "./dist/WebCryptAsym.d.ts",
+      "import": "./dist/WebCryptAsym.js",
+      "browser": "./dist/WebCryptAsym.js",
+      "module": "./dist/WebCryptAsym.js",
+      "require": "./dist/WebCryptAsym.cjs",
+      "default": "./dist/WebCryptAsym.js"
+    },
+    "./webcrypt-pqc": {
+      "types": "./dist/WebCryptPQC.d.ts",
+      "import": "./dist/WebCryptPQC.js",
+      "browser": "./dist/WebCryptPQC.js",
+      "module": "./dist/WebCryptPQC.js",
+      "require": "./dist/WebCryptPQC.cjs",
+      "default": "./dist/WebCryptPQC.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/server.d.ts",
+      "import": "./dist/mcp/server.js",
+      "browser": "./dist/mcp/server.js",
+      "module": "./dist/mcp/server.js",
+      "require": "./dist/mcp/server.cjs",
+      "default": "./dist/mcp/server.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "*": [
+        "dist/*.d.ts"
+      ],
+      "webcrypt": [
+        "dist/WebCrypt.d.ts"
+      ],
+      "webcrypt-asym": [
+        "dist/WebCryptAsym.d.ts"
+      ],
+      "webcrypt-pqc": [
+        "dist/WebCryptPQC.d.ts"
+      ],
+      "mcp": [
+        "dist/mcp/server.d.ts"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.js src/WebCrypt.js src/WebCryptAsym.js src/WebCryptPQC.js src/mcp/server.js --format esm,cjs --dts --clean --no-splitting",
+    "ci": "npm run lint && npm run test && npm run build",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "node --experimental-vm-modules node_modules/.bin/jest --coverage",
+    "test:matrix": "bash scripts/test-matrix.sh",
+    "format": "prettier --write \"**/*.{js,ts,json,md}\"",
+    "format:check": "prettier --check \"**/*.{js,ts,json,md}\"",
+    "lint": "npm run format:check",
+    "prepare": "if [ \"$NODE_ENV\" != \"development\" ]; then npm run build; fi",
+    "prepublishOnly": "npm run build && npm run format:check && npm test",
+    "publish": "npm publish --access public"
+  },
+  "prettier": {
+    "semi": true,
+    "trailingComma": "es5",
+    "singleQuote": false,
+    "printWidth": 100,
+    "tabWidth": 2,
+    "useTabs": false,
+    "arrowParens": "avoid"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2",
+    "prettier": "^3.7.4",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "brace-expansion": "^5.0.9"
+  }
+}

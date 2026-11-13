@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp-cryptography": {
+      "command": "mcp-cryptography",
+      "env": {}
+    }
+  }
+}

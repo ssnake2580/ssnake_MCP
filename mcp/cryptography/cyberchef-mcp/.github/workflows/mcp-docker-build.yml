@@ -1,0 +1,218 @@
+name: Build and Test MCP Server
+
+on:
+  push:
+    branches: [ "master", "release/**" ]
+    paths:
+      - 'src/node/**'
+      - 'src/core/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'Dockerfile.mcp'
+      - '.github/workflows/mcp-docker-build.yml'
+  pull_request:
+    branches: [ "master", "release/**" ]
+    paths:
+      - 'src/node/**'
+      - 'src/core/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'Dockerfile.mcp'
+      - '.github/workflows/mcp-docker-build.yml'
+
+jobs:
+  # arm64, on a NATIVE arm runner.
+  #
+  # This exists so the release workflow is never the first place arm64 is attempted. A
+  # multi-platform build that fails does so at tag time, after the merge, when the cheapest fix is
+  # a new tag -- and published tags are immutable. Proving it on every pull request costs one job
+  # and removes that entirely.
+  #
+  # Native (`ubuntu-24.04-arm`, free for public repositories) rather than QEMU, for two reasons:
+  # it is faster, and it runs the smoke tests on real hardware. The release build uses QEMU because
+  # its single job has to produce one manifest; here there is nothing to merge, so the better
+  # option is available.
+  #
+  # The verification that matters is not "it built": it is that npm resolved the ARM-specific
+  # native binding. `piscina` pulls `@napi-rs/nice`, whose platform binaries are optional
+  # dependencies -- so an install that silently skipped the arm64 one would still build a working
+  # image and fail only under load, in the worker pool, on someone else's machine.
+  # ON RUNNER LABELS: `ubuntu-24.04-arm` is a GitHub-hosted label, and Actions has no syntax for
+  # "hosted only" -- a self-hosted runner registered with the same label could claim this job, which
+  # runs pull-request code. Verified for this repository: the one self-hosted runner
+  # (`AB-i9-cyberchef-mcp`, the Antigravity reviewer) carries `self-hosted, Linux, X64, agy` and is
+  # x64, so it cannot match. Keep it that way -- never register a self-hosted runner with a
+  # GitHub-hosted label, here or on any repository sharing a runner group.
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Docker image (arm64, native)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.mcp
+          push: false
+          tags: cyberchef-mcp:arm64
+          load: true
+
+      - name: Test MCP Server on arm64 (List Tools)
+        run: |
+          set -euo pipefail
+          RESPONSE=$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+            | docker run -i --rm cyberchef-mcp:arm64 2>/dev/null)
+          COUNT=$(echo "$RESPONSE" | node -e \
+            'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).result.tools.length))')
+          echo "tools: $COUNT"
+          [ "$COUNT" -gt 0 ] || { echo "arm64 image returned no tools"; exit 1; }
+
+      - name: Execute an operation on arm64
+        run: |
+          set -euo pipefail
+          RESPONSE=$(echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cyberchef_bake","arguments":{"input":"Hello","recipe":[{"op":"To Base64"}]}}}' \
+            | docker run -i --rm cyberchef-mcp:arm64 2>/dev/null)
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q "SGVsbG8=" || { echo "arm64 bake produced the wrong result"; exit 1; }
+
+      - name: Verify npm resolved the arm64 native binding
+        run: |
+          set -euo pipefail
+          FOUND=$(docker run --rm --entrypoint /bin/sh cyberchef-mcp:arm64 -c \
+            'ls -d /app/node_modules/@napi-rs/nice-linux-arm64-gnu 2>/dev/null || true')
+          echo "binding: ${FOUND:-<none>}"
+          [ -n "$FOUND" ] || { echo "arm64 native binding missing -- npm resolved the wrong platform"; exit 1; }
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Configure git
+        run: git config --global init.defaultBranch master
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # =============================================================================
+      # Build Docker Image for Testing (No Attestations)
+      # =============================================================================
+      # Note: This workflow uses `load: true` to load the image into the local
+      # Docker daemon for testing. Attestations (provenance, SBOM) cannot be
+      # generated with `load: true` because the local image store doesn't support
+      # the manifest lists required for attestation attachment.
+      #
+      # Attestations are only generated in the mcp-release.yml workflow, which
+      # pushes to registries (GHCR and Docker Hub) where attestations are supported.
+      #
+      # Reference: https://docs.docker.com/build/ci/github-actions/attestations/
+      # =============================================================================
+      - name: Build Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.mcp
+          push: false
+          tags: cyberchef-mcp:latest
+          load: true  # Load into local Docker daemon for testing (attestations not supported)
+
+      - name: Test MCP Server (List Tools)
+        run: |
+          # Run the container detached but interactive
+          docker run -d -i --name test-mcp cyberchef-mcp:latest
+
+          # Send a listTools request and check for "cyberchef_bake" in the output.
+          #
+          # The exec'd process is a SECOND server inside the same container -- the detached one
+          # above is already running. Both default their recipe store to ./recipes.json, so the
+          # replica generation guard sees the file change underneath it and correctly fatals:
+          #
+          #   Recipe storage changed underneath this process: expected generation 0 but found 1.
+          #
+          # A race, so this passed for as long as the exec happened to win it. The guard's own
+          # advice is the fix: give the probe its own store.
+          RESPONSE=$(echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}' | docker exec -i -e CYBERCHEF_RECIPE_STORAGE=/tmp/probe-recipes.json test-mcp node src/node/mcp-server.mjs)
+
+          echo "Response: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q "cyberchef_bake"; then
+            echo "MCP Server is running and responding correctly."
+          else
+            echo "MCP Server failed to return expected tools."
+            exit 1
+          fi
+
+          # Clean up
+          docker stop test-mcp
+          docker rm test-mcp
+
+      - name: Verify non-root execution
+        run: |
+          # Check that the container runs as non-root user (UID 65532 - Chainguard 'nonroot')
+          # Note: Chainguard distroless has no shell/id command, so we use Node.js process.getuid()
+          USER_ID=$(docker run --rm --entrypoint node cyberchef-mcp:latest -e "console.log(process.getuid())")
+          echo "Container user ID: $USER_ID"
+          if [ "$USER_ID" = "65532" ]; then
+            echo "Container correctly runs as non-root user (UID 65532 'nonroot')"
+          else
+            echo "WARNING: Container is not running as expected user (got $USER_ID, expected 65532)"
+            exit 1
+          fi
+
+      # Reporting pass: CRITICAL+HIGH go to the Security tab. This step never fails the
+      # build - a SARIF producer that exits non-zero can skip its own upload, which hides
+      # the very findings it was meant to publish. Gating is the next step's job.
+      - name: Run Trivy vulnerability scanner (SARIF for code scanning)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'cyberchef-mcp:latest'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          vuln-type: 'os,library'
+          exit-code: '0'
+          trivyignores: '.trivyignore'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-build-scan'
+
+      # Build gate: CRITICAL **and HIGH**, printing the table so a failure is self-explanatory.
+      #
+      # This read `severity: 'CRITICAL'` with a `TODO(PR 7): restore 'CRITICAL,HIGH' once the
+      # dependency backlog is cleared to zero` from the v2.0.0 series, when that backlog was 272
+      # findings. It reached zero in v2.1.1 and has stayed there, so the narrowed gate spent eight
+      # releases outliving its own stated condition -- and a TODO whose precondition is met is just
+      # a gate somebody forgot to switch back on.
+      #
+      # Measured before restoring, against the published v3.1.0 image:
+      #
+      #     trivy image --severity CRITICAL,HIGH ghcr.io/doublegate/cyberchef-mcp_v3:3.1.0
+      #     -> 0 CRITICAL, 0 HIGH
+      #
+      # If this starts failing, the finding is real and `docs/security/` has the disposition
+      # process for it. Narrowing the gate again is not the fix.
+      - name: Run Trivy vulnerability scanner (build gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'cyberchef-mcp:latest'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          vuln-type: 'os,library'
+          exit-code: '1'
+          trivyignores: '.trivyignore'

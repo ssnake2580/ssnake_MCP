@@ -1,0 +1,186 @@
+name: "MCP Server CI"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - master
+    # The release train is long-lived: without this it accumulates dozens of
+    # commits with no CI at all, and a master->release merge is validated by nothing.
+    - 'release/**'
+    # These must include everything the gate's RESULT depends on, not just the product code.
+    # `tests/**` and `vitest.config.mjs` were missing, so a test-only commit could not trigger the
+    # job -- which meant the commit that FIXED the coverage thresholds was unable to demonstrate it,
+    # and, worse, a change that broke a test while touching nothing else would sail through.
+    paths:
+      - 'src/core/**'
+      - 'src/node/**'
+      - 'tests/**'
+      - 'vitest.config.mjs'
+      - 'Gruntfile.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # BOTH ENDS OF THE SUPPORTED RANGE -- which since v4.0.0 is one version.
+    #
+    # `package.json` declares `engines: >=26 <27`. The floor was `>=24` until v4.0.0, and before
+    # v2.8.1 every workflow tested 24 while the published image ran 26, so the runtime that
+    # actually ships was never tested and the floor was the only thing that was -- a gap a green
+    # pipeline hid completely. Testing both boundaries was the fix.
+    #
+    # Raising the floor to 26 is NOT a re-inversion of that bug: it narrows the CLAIM to match,
+    # rather than narrowing the testing while the claim stays wide. Both ends are still tested;
+    # there is now one end. Widen `engines` and this matrix widens with it.
+    #
+    # `fail-fast: false` so a failure on one version still reports the other -- when a Node version
+    # is the variable under test, "which ones broke" is the entire result.
+    strategy:
+      fail-fast: false
+      matrix:
+        # 26 = the declared floor AND what Dockerfile.mcp runs, since v4.0.0 raised the floor
+        # from 24. The matrix is kept rather than collapsed to a bare value: `engines` is
+        # `>=26 <27` today and the next Node LTS will widen it again, at which point the second
+        # entry goes back in here rather than someone having to remember this file exists.
+        node-version: ['26']
+
+    name: test (node ${{ matrix.node-version }})
+    steps:
+    - name: Configure git
+      run: git config --global init.defaultBranch master
+
+    - uses: actions/checkout@v7
+
+    - name: Set node version
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ matrix.node-version }}
+
+    - name: Install
+      run: |
+        npm install
+        npm run setheapsize
+
+    - name: Update browserslist database
+      run: npx update-browserslist-db@latest
+
+    # Patch node_modules for the removed `SlowBuffer`, as the other suites do.
+    #
+    # NOT "Node 22 compatibility", which is what this said and what it never was: SlowBuffer was
+    # REMOVED from Node, so the patch is needed on every version this project supports and will
+    # be needed on later ones too. Naming a version here implied the opposite -- that moving off
+    # 22 would retire it -- which is exactly the wrong thing to believe while debugging.
+    # because npm install might overwrite them or they might not be patched in the repo
+    - name: Patch Dependencies (SlowBuffer)
+      run: |
+        sed -i 's/new SlowBuffer/Buffer.alloc/g' node_modules/avsc/lib/types.js
+        sed -i 's/SlowBuffer/Buffer/g' node_modules/buffer-equal-constant-time/index.js
+
+    - name: Lint
+      run: npx grunt lint
+
+    # A prose checklist could not fail a build, and did not: v2.9.0 shipped with the Helm chart and
+    # the compose file still pointing at 2.8.1, which is the third consecutive release to get this
+    # wrong while AGENTS.md told the author not to.
+    - name: Version consistency
+      run: npm run check:versions
+
+    # `server.json` exists to be machine-read by the MCP registry, and until v3.4.0 nothing read
+    # it: it declared the 2025-07-09 schema while being written in the 2025-09-29 shape, and failed
+    # validation in six places. Runs offline against transcribed rules -- see the script header for
+    # why not a JSON Schema validator against the live URL.
+    - name: server.json validity
+      run: npm run check:server-json
+
+    # THE ORACLE, alongside the offline gate above.
+    #
+    # The transcribed checker verifies what its author believed the schema says. Only the registry's
+    # own tool can contradict them, and in v3.5.0 it did: `check-server-json.mjs` shipped in v3.4.0
+    # encoding the 2025-09-29 schema while 2025-12-11 was already current, and nothing in the tree
+    # could have noticed. `mcp-publisher validate` reports it in one line.
+    #
+    # This is the same arrangement `npm run conformance` has with the in-tree protocol tests, for
+    # the same reason -- and the reason it was not applied here sooner is that `server.json` did not
+    # look like the kind of file that has an oracle.
+    #
+    # It needs the network, so it cannot replace the offline gate; it is additive. `continue-on-
+    # error` is deliberately NOT set: a validation failure here is a `server.json` the registry
+    # would reject, which is worth failing a pull request for. A deprecation WARNING does not fail
+    # the tool, and is surfaced in the log rather than swallowed.
+    - name: server.json against the registry's own validator
+      run: |
+        set -o pipefail
+        curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+          | tar xz mcp-publisher
+        ./mcp-publisher validate 2>&1 | tee validation.txt
+        # The tool exits 0 on a deprecated schema. Treat that as a failure here, because shipping a
+        # deprecated declaration is exactly what this step exists to catch -- and it is how v3.4.0's
+        # gate came to be a version behind on the day it shipped.
+        if grep -q "Deprecated schema detected" validation.txt; then
+          echo "::error::server.json declares a deprecated schema. Update it AND the KNOWN_SCHEMA"
+          echo "::error::constant in scripts/check-server-json.mjs together, then re-check the"
+          echo "::error::transcribed rules against the new schema -- they are not always the same."
+          exit 1
+        fi
+
+    - name: Config Tests (Generate Configs)
+      run: npx grunt configTests
+
+    - name: Unit Tests
+      run: |
+        npm test
+        npm run testnodeconsumer
+
+    # Codecov Integration: Coverage Analytics + Test Analytics
+    - name: MCP Tests with Coverage
+      run: npm run test:coverage
+
+    # THE EXTERNAL ORACLE.
+    #
+    # Every test above this line was written in this repository, which makes them a check that the
+    # server does what its authors believe -- not that it does what the specification says. v3.0.0
+    # shipped "MCP 2026-07-28 conformance" on exactly that basis, four weeks after the official
+    # suite published scenarios for the SEPs it implemented, and the suite found a real defect on
+    # its first run (v3.1.0 findings log F-03).
+    #
+    # Runs both protocol eras against `conformance/expected-failures.yaml`, which fails the build
+    # when a baselined entry starts passing as well as when something new breaks -- a baseline that
+    # cannot go stale is the same property `check:versions` was built for.
+    #
+    # Node 26 only: this exercises the protocol, not the runtime, and running it on both matrix
+    # legs would double a two-minute job to prove the same thing twice.
+    - name: Conformance (official MCP suite, both eras)
+      if: matrix.node-version == '26'
+      run: npm run conformance
+
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v7
+      if: always()
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./coverage/lcov.info
+        flags: mcp-tests
+        name: codecov-mcp-coverage
+        fail_ci_if_error: false
+        verbose: true
+
+    - name: Upload Test Results to Codecov
+      uses: codecov/codecov-action@v7
+      if: always()
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        report_type: test_results
+        files: ./test-results/junit.xml
+        flags: mcp-tests
+        name: codecov-test-results
+        fail_ci_if_error: false
+
+    # NOTE: Web UI production build (npx grunt prod) removed in v1.7.1
+    # This fork focuses on the MCP server implementation. The web UI files
+    # (src/web/) and related build infrastructure were removed as they are
+    # not needed for MCP server functionality. The production build step
+    # required those deleted web UI files and would fail.

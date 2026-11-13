@@ -1,0 +1,394 @@
+name: Upstream Release Monitor
+
+on:
+  schedule:
+    # Run once per week: Sunday at 12:00 UTC (mid-day)
+    - cron: '0 12 * * 0'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Update ref-proj/CyberChef from upstream
+        id: update_ref
+        run: |
+          # Ensure ref-proj directory exists
+          mkdir -p ref-proj
+
+          # Clone or update upstream reference
+          if [ -d "ref-proj/CyberChef/.git" ]; then
+            echo "Updating existing ref-proj/CyberChef"
+            cd ref-proj/CyberChef
+            git fetch origin --tags
+            BEFORE_SHA=$(git rev-parse HEAD)
+            git pull origin master
+            AFTER_SHA=$(git rev-parse HEAD)
+            echo "before_sha=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+            echo "after_sha=$AFTER_SHA" >> "$GITHUB_OUTPUT"
+            cd ../..
+          else
+            echo "Cloning upstream to ref-proj/CyberChef"
+            cd ref-proj
+            git clone https://github.com/gchq/CyberChef.git
+            cd CyberChef
+            AFTER_SHA=$(git rev-parse HEAD)
+            echo "before_sha=initial" >> "$GITHUB_OUTPUT"
+            echo "after_sha=$AFTER_SHA" >> "$GITHUB_OUTPUT"
+            cd ../..
+          fi
+
+      - name: Get upstream version info
+        id: upstream
+        run: |
+          cd ref-proj/CyberChef
+          # Get latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown")
+          echo "latest=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest CyberChef release: $LATEST_TAG"
+
+          # CHECK OUT THAT TAG BEFORE ANY COMPARISON.
+          #
+          # The clone tracks `master`, so without this every file comparison below ran against
+          # UNRELEASED upstream work while the issue headline named a release tag -- two different
+          # refs printed as one. Issue #129 is what that produces: "New CyberChef release v11.4.0
+          # available" listing `ParsePGPKey.mjs` as a new operation, when this repository was
+          # already on v11.4.0 and `ParsePGPKey.mjs` is not in the v11.4.0 tag at all. A maintainer
+          # reading it would start a sync that has nothing to sync.
+          #
+          # Master's head is recorded first, so "master has moved since the release" stays
+          # measurable -- it is real information, just not the same claim as "a new release exists".
+          MASTER_SHA=$(git rev-parse HEAD)
+          echo "master_sha=$MASTER_SHA" >> "$GITHUB_OUTPUT"
+          if [ "$LATEST_TAG" != "unknown" ]; then
+            git checkout --detach "$LATEST_TAG" --quiet
+            TAG_SHA=$(git rev-parse HEAD)
+            echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+            if [ "$MASTER_SHA" != "$TAG_SHA" ]; then
+              AHEAD=$(git rev-list --count "$LATEST_TAG".."$MASTER_SHA" 2>/dev/null || echo "0")
+            else
+              AHEAD=0
+            fi
+            echo "master_ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+            echo "Comparing against tag $LATEST_TAG; master is $AHEAD commit(s) ahead of it"
+          else
+            echo "tag_sha=unknown" >> "$GITHUB_OUTPUT"
+            echo "master_ahead=0" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Get version from package.json AT THE TAG, which is the release's own version rather
+          # than whatever master currently declares.
+          UPSTREAM_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "unknown")
+          echo "version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Upstream package.json version: $UPSTREAM_VERSION"
+          cd ../..
+
+      - name: Get current version
+        id: current
+        run: |
+          # Extract mcpVersion from package.json
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current MCP version: $CURRENT_VERSION"
+
+          # Extract the UPSTREAM base version -- `cyberchefUpstreamVersion`, not `version`.
+          #
+          # This read `.version` until v3.9.0, which is this fork's own semver (3.8.0), so the
+          # comparison below was "v3.8.0" against "v11.4.0" and could NEVER be equal. The monitor
+          # was structurally incapable of reporting "up to date": it raised a release issue every
+          # single run, and the compare link it generated pointed at `v3.8.0...v11.4.0`, a ref that
+          # does not exist in gchq/CyberChef. The correct field has existed since v2.2.0.
+          CYBERCHEF_VERSION=$(node -p "require('./package.json').cyberchefUpstreamVersion")
+          echo "cyberchef_version=$CYBERCHEF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current CyberChef upstream base: $CYBERCHEF_VERSION"
+
+      - name: Compare operation files
+        id: compare_ops
+        run: |
+          # Count operations in both repos
+          MAIN_OPS=$(find src/core/operations -maxdepth 1 -name '*.mjs' 2>/dev/null | wc -l)
+          REF_OPS=$(find ref-proj/CyberChef/src/core/operations -maxdepth 1 -name '*.mjs' 2>/dev/null | wc -l)
+          echo "main_ops=$MAIN_OPS" >> "$GITHUB_OUTPUT"
+          echo "ref_ops=$REF_OPS" >> "$GITHUB_OUTPUT"
+          echo "Main operations: $MAIN_OPS"
+          echo "Ref operations: $REF_OPS"
+
+          # Find new operations (in ref but not in main)
+          NEW_OPS=$(comm -13 \
+            <(find src/core/operations -maxdepth 1 -name '*.mjs' -printf '%f\n' 2>/dev/null | sort) \
+            <(find ref-proj/CyberChef/src/core/operations -maxdepth 1 -name '*.mjs' -printf '%f\n' 2>/dev/null | sort) \
+            | wc -l)
+          echo "new_ops=$NEW_OPS" >> "$GITHUB_OUTPUT"
+          echo "New operations: $NEW_OPS"
+
+          # Find modified operations (different checksums)
+          MODIFIED_OPS=0
+          for op in src/core/operations/*.mjs; do
+            if [ -f "$op" ]; then
+              basename_op=$(basename "$op")
+              ref_op="ref-proj/CyberChef/src/core/operations/$basename_op"
+              if [ -f "$ref_op" ]; then
+                if ! cmp -s "$op" "$ref_op"; then
+                  MODIFIED_OPS=$((MODIFIED_OPS + 1))
+                fi
+              fi
+            fi
+          done
+          echo "modified_ops=$MODIFIED_OPS" >> "$GITHUB_OUTPUT"
+          echo "Modified operations: $MODIFIED_OPS"
+
+          # Determine if update needed
+          if [ "$NEW_OPS" -gt 0 ] || [ "$MODIFIED_OPS" -gt 0 ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compare versions
+        id: compare
+        env:
+          LATEST: ${{ steps.upstream.outputs.latest }}
+          CYBERCHEF_VERSION: ${{ steps.current.outputs.cyberchef_version }}
+        run: |
+          CURRENT="v${CYBERCHEF_VERSION}"
+          echo "Comparing: $CURRENT vs $LATEST"
+
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "new_version=true" >> "$GITHUB_OUTPUT"
+            echo "New version available: $LATEST (current: $CURRENT)"
+          else
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
+            echo "Already up-to-date"
+          fi
+
+      - name: Check for existing issue
+        if: steps.compare.outputs.new_version == 'true' || steps.compare_ops.outputs.needs_update == 'true'
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.upstream.outputs.latest }}
+        run: |
+          # Check if issue already exists for this version
+          ISSUE_COUNT=$(gh issue list \
+            --label "upstream-release" \
+            --state open \
+            --search "$LATEST" \
+            --json number \
+            --jq 'length')
+
+          echo "count=$ISSUE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $ISSUE_COUNT existing issues for this release"
+
+      - name: Generate operation change list
+        if: (steps.compare.outputs.new_version == 'true' || steps.compare_ops.outputs.needs_update == 'true') && steps.existing.outputs.count == '0'
+        id: op_changes
+        run: |
+          # List new operations
+          NEW_LIST=$(comm -13 \
+            <(find src/core/operations -maxdepth 1 -name '*.mjs' -printf '%f\n' 2>/dev/null | sort) \
+            <(find ref-proj/CyberChef/src/core/operations -maxdepth 1 -name '*.mjs' -printf '%f\n' 2>/dev/null | sort) \
+            | head -20)
+
+          # List modified operations
+          MODIFIED_LIST=""
+          COUNT=0
+          for op in src/core/operations/*.mjs; do
+            if [ -f "$op" ] && [ $COUNT -lt 20 ]; then
+              basename_op=$(basename "$op")
+              ref_op="ref-proj/CyberChef/src/core/operations/$basename_op"
+              if [ -f "$ref_op" ]; then
+                if ! cmp -s "$op" "$ref_op"; then
+                  MODIFIED_LIST="$MODIFIED_LIST$basename_op"$'\n'
+                  COUNT=$((COUNT + 1))
+                fi
+              fi
+            fi
+          done
+
+          # Save to file for multiline output
+          echo "$NEW_LIST" > /tmp/new_ops.txt
+          echo "$MODIFIED_LIST" > /tmp/modified_ops.txt
+
+      - name: Create issue for new release
+        if: (steps.compare.outputs.new_version == 'true' || steps.compare_ops.outputs.needs_update == 'true') && steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.upstream.outputs.latest }}
+          CYBERCHEF_VERSION: ${{ steps.current.outputs.cyberchef_version }}
+          MAIN_OPS: ${{ steps.compare_ops.outputs.main_ops }}
+          REF_OPS: ${{ steps.compare_ops.outputs.ref_ops }}
+          NEW_OPS: ${{ steps.compare_ops.outputs.new_ops }}
+          MODIFIED_OPS: ${{ steps.compare_ops.outputs.modified_ops }}
+          NEW_VERSION: ${{ steps.compare.outputs.new_version }}
+          MASTER_AHEAD: ${{ steps.upstream.outputs.master_ahead }}
+        run: |
+          TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+
+          # Read operation lists
+          NEW_OPS_LIST=$(< /tmp/new_ops.txt)
+          MODIFIED_OPS_LIST=$(< /tmp/modified_ops.txt)
+
+          # Two different claims, kept apart. "A release you are not on exists" and "master has
+          # moved since the release you ARE on" are both worth knowing and need different action;
+          # conflating them is what made #129 misleading.
+          if [ "$NEW_VERSION" = "true" ]; then
+            HEADLINE="## New Upstream Release Detected"
+            ISSUE_TITLE="New CyberChef release $LATEST available"
+          else
+            HEADLINE="## Upstream Drift Detected (same release)"
+            ISSUE_TITLE="Upstream drift against $LATEST -- operations differ from the tag"
+          fi
+
+          ISSUE_BODY="$HEADLINE
+
+          **Latest upstream release**: $LATEST
+          **This fork's upstream base**: v$CYBERCHEF_VERSION
+          **Compared against**: \`$LATEST\` (the release tag, not master)
+          **Master is ahead of that tag by**: $MASTER_AHEAD commit(s)
+          **Detected**: $TIMESTAMP
+
+          ### Operation Changes
+
+          Counted against the **$LATEST tag**. Work that exists only on upstream master is
+          deliberately excluded -- it is unreleased and is not something to sync.
+
+          - **Operations here**: $MAIN_OPS
+          - **Operations at $LATEST**: $REF_OPS
+          - **New Operations**: $NEW_OPS
+          - **Modified Operations**: $MODIFIED_OPS
+
+          #### New Operations (first 20)
+          \`\`\`
+          $NEW_OPS_LIST
+          \`\`\`
+
+          #### Modified Operations (first 20)
+          \`\`\`
+          $MODIFIED_OPS_LIST
+          \`\`\`
+
+          ### Next Steps
+
+          1. Review the [upstream release notes](https://github.com/gchq/CyberChef/releases/tag/$LATEST)
+          2. Check the [upstream commit log](https://github.com/gchq/CyberChef/compare/v$CYBERCHEF_VERSION...$LATEST) -- valid now that \`CYBERCHEF_VERSION\` is the upstream base rather than this fork's semver
+          3. Review operation changes above for breaking changes
+          4. To trigger automatic sync, add the \`upstream-sync-approved\` label
+          5. For manual sync or complex changes, see instructions below
+
+          ### Automatic Sync (Recommended)
+
+          The new selective sync workflow will:
+          - Only sync \`src/core/operations/\` files
+          - Preserve MCP-specific modifications
+          - Run comprehensive tests
+          - Create a PR for review
+
+          To trigger:
+          \`\`\`bash
+          gh issue edit <issue-number> --add-label upstream-sync-approved
+          \`\`\`
+
+          ### Manual Sync (If Needed)
+
+          If automatic sync is not suitable:
+          \`\`\`bash
+          # Update ref-proj (already done by monitor workflow)
+          cd ref-proj/CyberChef
+          git pull origin master
+          cd ../..
+
+          # Use the upstream-sync workflow manually
+          gh workflow run upstream-sync.yml
+          \`\`\`
+
+          ---
+          This issue was created automatically by the Upstream Release Monitor workflow."
+
+          gh issue create \
+            --title "$ISSUE_TITLE" \
+            --label "upstream-release,needs-review" \
+            --body "$ISSUE_BODY"
+
+      - name: Commit ref-proj updates
+        if: steps.compare_ops.outputs.needs_update == 'true'
+        env:
+          MASTER_SHA: ${{ steps.upstream.outputs.master_sha }}
+        run: |
+          # Put the reference clone BACK on master before committing it.
+          #
+          # The comparison step above checks out the release tag, which leaves the working tree
+          # detached. Without this, `git add ref-proj/CyberChef` below would commit a TAG checkout
+          # under a message that says "update ref-proj/CyberChef to latest upstream" -- and the next
+          # run's `git pull origin master` would start from a detached HEAD. Reviewer-found: the
+          # tag checkout was added to fix a comparison bug and quietly broke the persistence step
+          # three steps later.
+          if [ -n "${MASTER_SHA:-}" ] && [ -d "ref-proj/CyberChef/.git" ]; then
+            git -C ref-proj/CyberChef checkout --quiet master 2>/dev/null \
+              || git -C ref-proj/CyberChef checkout --quiet --detach "$MASTER_SHA"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ref-proj/CyberChef
+          git commit -m "chore(upstream): update ref-proj/CyberChef to latest upstream" || echo "No changes to commit"
+          git push origin master || echo "Nothing to push"
+
+      - name: Summary
+        if: always()
+        env:
+          LATEST: ${{ steps.upstream.outputs.latest }}
+          CYBERCHEF_VERSION: ${{ steps.current.outputs.cyberchef_version }}
+          MCP_VERSION: ${{ steps.current.outputs.version }}
+          NEW_VERSION: ${{ steps.compare.outputs.new_version }}
+          NEEDS_UPDATE: ${{ steps.compare_ops.outputs.needs_update }}
+          MAIN_OPS: ${{ steps.compare_ops.outputs.main_ops }}
+          REF_OPS: ${{ steps.compare_ops.outputs.ref_ops }}
+          NEW_OPS: ${{ steps.compare_ops.outputs.new_ops }}
+          MODIFIED_OPS: ${{ steps.compare_ops.outputs.modified_ops }}
+          EXISTING_COUNT: ${{ steps.existing.outputs.count }}
+        run: |
+          {
+            echo "### Upstream Monitor Summary"
+            echo ""
+            echo "- **Latest CyberChef release:** $LATEST"
+            echo "- **Upstream base here:** v$CYBERCHEF_VERSION"
+            echo "- **Compared against:** $LATEST (tag, not master)"
+            echo "- **MCP Version:** $MCP_VERSION"
+            echo ""
+            echo "#### Operation Comparison"
+            echo "- **Main Operations:** $MAIN_OPS"
+            echo "- **Ref Operations:** $REF_OPS"
+            echo "- **New Operations:** $NEW_OPS"
+            echo "- **Modified Operations:** $MODIFIED_OPS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$NEW_VERSION" == "true" ] || [ "$NEEDS_UPDATE" == "true" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Status:** Updates available" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${EXISTING_COUNT:-0}" == "0" ]; then
+              echo "- **Action:** Issue created" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- **Action:** Issue already exists" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            {
+              echo ""
+              echo "- **Status:** Up-to-date"
+              echo "- **Action:** None"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

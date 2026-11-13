@@ -1,0 +1,918 @@
+# CyberChef MCP Server
+
+This project provides a **Model Context Protocol (MCP)** server interface for **CyberChef**, the "Cyber Swiss Army Knife" created by [GCHQ](https://github.com/gchq/CyberChef).
+
+By running this server, you enable AI assistants (like Claude, Cursor AI, and others) to natively utilize CyberChef's extensive library of **504 data manipulation operations**—including encryption, encoding, compression, and forensic analysis—as executable tools.
+
+**Latest Release:** v4.2.0 | [Release Notes](docs/releases/v4.2.0.md) | [Tutorial](docs/guides/tutorial.md) | [Examples](examples/) | [Breaking Changes](docs/v2.0.0-breaking-changes.md) | [Security Policy](SECURITY.md)
+
+**Upstream base:** GCHQ CyberChef **v11.5.0** | **Licence:** GPL-3.0-or-later (from v2.0.0; v1.9.x and earlier remain Apache-2.0)
+
+![CyberChef MCP Banner](images/CyberChef-MCP_Banner-Logo.jpg)
+
+[![npm](https://img.shields.io/npm/v/cyberchef-mcp?logo=npm)](https://www.npmjs.com/package/cyberchef-mcp)
+[![MCP Enabled](https://img.shields.io/badge/MCP-Enabled-blue)](https://modelcontextprotocol.io/)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![Docker Version](https://img.shields.io/github/v/release/doublegate/CyberChef-MCP?logo=docker&label=docker)](https://github.com/doublegate/CyberChef-MCP/releases)
+[![Node.js Version](https://img.shields.io/badge/node-%3E%3D26%20%3C27-brightgreen)](https://nodejs.org/)
+[![Security Scan](https://github.com/doublegate/CyberChef-MCP/actions/workflows/security-scan.yml/badge.svg)](https://github.com/doublegate/CyberChef-MCP/actions/workflows/security-scan.yml)
+[![codecov](https://codecov.io/gh/doublegate/CyberChef-MCP/branch/master/graph/badge.svg)](https://codecov.io/gh/doublegate/CyberChef-MCP)
+[![CyberChef MCP Server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/doublegate/CyberChef-MCP/badges/score.svg)](https://glama.ai/mcp/servers/doublegate/CyberChef-MCP)
+
+## Project Context
+
+**CyberChef** is a simple, intuitive web app for carrying out all manner of "cyber" operations within a web browser. It was originally conceived and built by [GCHQ](https://github.com/gchq/CyberChef).
+
+This fork wraps the core CyberChef Node.js API into an MCP server, bridging the gap between natural language AI intent and deterministic data processing.
+
+### Fork Relationship
+
+This project maintains a selective sync relationship with the upstream GCHQ/CyberChef repository:
+- **Synced from upstream**: `src/core/**` (minus three generated paths) and six upstream-owned
+  files in `src/node/`. Mirrored verbatim — **never hand-edit them**; fork changes live as
+  re-applied patches.
+- **Web UI Components**: Removed (88 files, ~19,260 lines) — not needed for an MCP server
+- **MCP-Specific Code**: this fork's own (`src/node/mcp-server.mjs`, `src/node/lib/**`, `tests/mcp/`,
+  workflows)
+- **Sync is one-way**: pull only. As of v2.0.0 the combined work is GPL-3.0-or-later, so MCP-layer
+  changes cannot be contributed back to an Apache-2.0 upstream.
+
+Exact scope, the patch model, and what to do when a sync conflicts:
+**[Upstream Sync Guide](docs/guides/upstream-sync-guide.md)**.
+
+See [Upstream Sync Guide](docs/guides/upstream-sync-guide.md) for details on the synchronization process.
+
+![CyberChef MCP Blueprint](images/CyberChef-MCP_Blueprint.jpg)
+
+## Features
+
+### MCP Tools
+The server exposes CyberChef operations as MCP tools:
+
+*   **Runs on ARM, and 30% smaller** (v2.8.0): images are published for `linux/arm64` as well as `linux/amd64` — Apple Silicon, Graviton, Raspberry Pi 4/5 — and the image is down from 643 MB to **453 MB**. Also **`CYBERCHEF_OFFLINE=true`** for air-gapped hosts: 502 of the 504 operations never touched a network anyway, so this is a fail-closed switch for the two that do, checked against the *recipe* rather than the tool name. See the [edge deployment guide](docs/guides/edge-deployment.md) for architectures, sizing and air-gapped install, and the [release notes](docs/releases/v2.8.0.md) for how the size reduction was done and verified.
+*   **Observable** (v2.7.0): a dependency-free Prometheus endpoint at `/metrics` (20 metric families, **off by default** — unlike the health probes it reports which tools are used, how often and how large the inputs are, which is a reconnaissance surface), OpenTelemetry spans following the MCP semantic conventions, and `trace_id`/`span_id` on every log line. It adds **one** package: the OTel *API*, not the SDK — measured at 1 package / 2.6 MB / +9 ms against the SDK's 71 packages / 50 MB / +100 ms, which would have handed back more than half of v2.6.0's startup work on every stdio launch. You supply the SDK, so every OTLP backend works rather than a chosen few. Ships a [Grafana dashboard, alert rules and a runnable Prometheus stack](deploy/grafana/) — all executed against a live server rather than reviewed. Tool arguments are **never** recorded: the conventions mark them Opt-In, and for this server the arguments *are* the sensitive material.
+*   **OAuth 2.1 authentication on HTTP** (v2.5.0): the server acts as an OAuth 2.1 **Resource Server** — RFC 9728 Protected Resource Metadata, JWKS-based bearer validation, and RFC 8707 audience binding, which is the check that stops a token minted for another service being replayed here. Scope-based RBAC with three scopes (`cyberchef:read`, `cyberchef:write`, `cyberchef:network`), where the scope a tool needs is *derived from its annotations* rather than a table that goes stale. Audit logging for who called what. **Off unless `CYBERCHEF_AUTH_ISSUER` is set**, and deliberately not applied to stdio — the MCP specification says stdio SHOULD NOT use OAuth, because a bearer token protects nothing when the client already owns the process.
+*   **Multi-tenancy** (v2.5.0): the operation cache, recipe store, concurrency pool and audit trail are isolated per tenant, with the tenant read from a claim on an already-verified token (`CYBERCHEF_TENANT_CLAIM`) — never from a header the caller controls. Without it, any caller on a shared HTTP deployment could list, modify and delete any other caller's saved recipes, and `clear()` destroyed every tenant's at once. **Off unless configured**, and configuring it without `CYBERCHEF_AUTH_ISSUER` is a startup error rather than a silent downgrade.
+*   **Starts in ~185 ms** (v2.6.0): it used to take ~1.3 seconds, of which ~1.15 s was importing all 505 operation implementations before answering anything — paid on every launch, on stdio, which is how every editor starts the server. The 505-operation *barrel* is now loaded only by the three tools that need it (`cyberchef_search`, batch search, and saved-recipe execution). `tools/list` is built from metadata, and an ordinary operation call loads just the one operation it runs — verified: `cyberchef_bake` completes without the barrel being loaded at all. A background warm-up was tried, measured, and removed: module loading blocks the event loop, so it just moved the cost in front of the first request.
+*   **Deployable as a service** (v2.6.0): a [Helm chart and Compose file](deploy/) with liveness/readiness/startup probes and a drain that loses no requests during a rolling update. Liveness deliberately stays healthy while draining — a liveness failure there gets the pod killed mid-drain. The chart *refuses* to render configurations the server would reject at startup, so they fail at `helm template` rather than as a crashloop.
+*   **Bounded calls to the authorization server** (v2.6.0): JWKS discovery had no timeout (Node's `fetch` has none by default) and cached failures not at all, so an issuer outage turned every request into two outbound ones that could hang until the OS gave up. Now a 5 s deadline and a circuit breaker: 20 verifications against a down issuer went from 40 outbound attempts to 10.
+*   **Nineteen analysis tools that are not operations** (v2.4.0, expanded through v3.11.0): the original four are `cyberchef_xor_key_length` (repeating-key XOR length by index of coincidence), `cyberchef_cyclic_pattern` (De Bruijn patterns and overflow offsets, byte-compatible with pwntools' `cyclic`), `cyberchef_hash_identify` (hash format with the hashcat mode and John format name) and `cyberchef_rsa_attack` (Fermat, shared factors, Wiener and unpadded small-`e`). Twelve more arrived in v3.3.0 (classical ciphers, crib dragging, entropy scanning, hash cracking and statistics, JWT weaknesses, plaintext scoring, multi-key RSA, substitution and Vigenère breaking, timestamp identification, corpus diffing), then `cyberchef_ecdsa_recover` in v3.4.0 (private-key recovery from a reused ECDSA nonce) and `cyberchef_cert_chain` in v3.8.0 (orders an X.509 bundle, verifies every link cryptographically, and reports the chain's validity window as the intersection of its members', both ends). `cyberchef_pqc_identify` arrived in v3.11.0: it names the NIST post-quantum parameter set behind a key, signature or ciphertext — ML-KEM (FIPS 203), ML-DSA (FIPS 204) or SLH-DSA (FIPS 205) — from the OID when there is DER to read, and from byte length when there is not, in which case it reports every candidate and says so rather than picking one. See [Analysis Tools](docs/wiki/Analysis-Tools.md). An operation is a pure `run(input, args)` over one input and cannot express an analysis; `cyberchef_bake` cannot either, because a recipe is a pipeline, not a loop. Since **v4.1.0** they are reached through `cyberchef_analyse({tool, arguments})` on the default `index` surface, and remain listed outright on `curated` and `all` — nineteen of them had been 68% of the index, listed only because `cyberchef_describe_operation` refused them and pointed at `tools/list`, which made the listing their sole schema path. There is deliberately **no plugin loader** — `node:vm` is not a security boundary, and that was measured rather than assumed ([ADR 0002](docs/adr/0002-tool-registry-is-not-a-plugin-loader.md)).
+*   **Protocol revision 2026-07-28** (v2.3.0): served on both stdio and HTTP alongside the 2025 era, from one set of handlers. Existing clients are unaffected — a v1-SDK client still negotiates 2025-11-25 against the same registrations. On HTTP the two eras are routed per request by the SDK's own classifier, so 2025 traffic keeps the sessionful wiring while modern traffic is served per request.
+*   **Three transports** (v2.3.0): stdio, Streamable HTTP, and a **socket binding** over a Unix domain socket or loopback TCP (`CYBERCHEF_TRANSPORT=socket`), one pinned server instance per connection. It carries no authentication, so a non-loopback bind is refused unless explicitly allowed and the Unix socket is created `0600`. There is deliberately no WebSocket transport — MCP does not define one.
+*   **Every image operation works** (v2.3.0): 17 of them returned Node's shared buffer pool instead of the image — unreadable output, and the surplus was whatever the process had recently allocated. `Add Text To Image` had never worked in this fork at all, since v1.7.1. Both are fixed as fork patches.
+*   **Images and audio come back as images and audio** (v2.2.0): `Generate QR Code`, `Render Image` and the image set return an MCP `image` content block; `Play Media` returns an `audio` block. Before v2.2.0 the html-to-text conversion deleted the payload and these operations returned an empty string — they had never worked over MCP. Other binary stays byte-lossless latin1 text, or base64 with `CYBERCHEF_BINARY_OUTPUT=base64`.
+*   **Tool annotations on every tool** (v2.2.0): `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` and a readable `title`, so a client can skip the approval prompt for a pure operation. The exceptions were measured, not guessed — only `HTTP request` and `DNS over HTTPS` reach the network, and non-idempotence was determined by running each candidate twice and comparing.
+*   **Prompts and resources** (v2.2.0): five workflow prompts (`analyse-unknown-data`, `extract-iocs`, `deobfuscate-script`, `identify-hash`, `decode-chain`) for when you do not yet know which of 504 operations you need, and saved recipes exposed as readable resources at `recipe://<id>`.
+*   **`cyberchef_bake`**: The "Omni-tool". Executes a full CyberChef recipe (a chain of operations) on an input. Ideal for complex, multi-step transformations (e.g., "Decode Base64, then Gunzip, then prettify JSON").
+*   **All 505 operations, without paying for 504 schemas** (v2.1.0): `tools/list` is an **index** by default — 23 tools and 15,620 bytes, rather than 546 tools and 427,123 bytes. Every operation stays reachable: `cyberchef_categories` -> `cyberchef_list_operations` -> `cyberchef_describe_operation` walks down to any of them, `cyberchef_search` finds one by keyword, and `cyberchef_bake` runs any of them by name. The **19 analysis tools** are reachable the same way, through `cyberchef_describe_operation` and `cyberchef_analyse` — they were listed on every surface until v4.1.0, where nineteen of them were 68% of the index, because `describe_operation` used to refuse them and point at `tools/list`, making the listing their only schema path. `CYBERCHEF_TOOL_SURFACE=curated` (120 tools, 109,548 bytes) or `=all` (all 546, 427,123 bytes) if you would rather pre-load; both still list every analysis tool outright. See the [User Guide](docs/guides/user_guide.md#the-tool-surface--how-many-tools-you-see-and-why).
+    *   `cyberchef_to_base64` / `cyberchef_from_base64`
+    *   `cyberchef_aes_decrypt`
+    *   `cyberchef_sha2`
+    *   `cyberchef_yara_rules`
+    *   ...and hundreds more.
+*   **`cyberchef_search`**: A utility tool to help the AI discover available operations and their descriptions.
+*   **Recipe Management** (v1.6.0): 10 tools for saving, organizing, and reusing multi-operation workflows
+    *   `cyberchef_recipe_create` / `cyberchef_recipe_get` / `cyberchef_recipe_list`
+    *   `cyberchef_recipe_update` / `cyberchef_recipe_delete` / `cyberchef_recipe_execute`
+    *   `cyberchef_recipe_export` / `cyberchef_recipe_import`
+    *   `cyberchef_recipe_validate` / `cyberchef_recipe_test`
+*   **Advanced Features** (v1.7.0): 5 new tools for enterprise-grade capabilities
+    *   `cyberchef_batch` - Execute multiple operations in parallel or sequential mode
+    *   `cyberchef_telemetry_export` - Privacy-first usage analytics (opt-in)
+    *   `cyberchef_cache_stats` / `cyberchef_cache_clear` - Cache inspection and management
+    *   `cyberchef_quota_info` - Resource quota and usage tracking
+*   **Migration tooling — REMOVED in v4.0.0.** `cyberchef_migration_preview`,
+    `cyberchef_deprecation_stats` and the `cyberchef-migrate` binary existed to help callers reach
+    **v2.0.0**, nine minors earlier. They were advertised on every surface and cost 995 bytes of
+    every `tools/list`, while the only warning still emitted was `DEP007` — a **withdrawn** code
+    whose own text read "No action required". Your v1-format recipes need no migration: positional
+    arguments, bare string operations and named-object arguments all bake identically today.
+    *   **The `cyberchef_` prefix is permanent.** DEP001, DEP007 and DEP008 announced its removal in v1.8.0 and were **withdrawn** in v2.0.0: removing it saves 2.6% of the `tools/list` payload while colliding 19 tool names in MCP's flat namespace and breaking every existing integration. Keep using `cyberchef_to_base64`, `cyberchef_bake` and `cyberchef_search`. See [v2.0.0 Breaking Changes](docs/v2.0.0-breaking-changes.md#withdrawn-changes-dep001-dep007-dep008).
+*   **Worker Thread Pool** (v1.9.0): CPU-intensive operations offloaded to worker threads
+    *   `cyberchef_worker_stats` - Monitor worker pool utilization, active/completed tasks, and pool configuration
+    *   Enable with `CYBERCHEF_ENABLE_WORKERS=true` environment variable
+    *   Configurable pool size, idle timeout, and minimum input size for worker routing
+
+### Technical Highlights
+*   **Dockerized**: Runs as a self-contained Docker container on a Chainguard Wolfi Node.js base (v26.8.1 at time of writing), **pinned by digest** and bumped weekly by Dependabot. Measured against the published v3.1.0 image: **453 MB on disk, 141 MB as the gzipped release tarball**, running as UID 65532 (`nonroot`). The base is rebuilt daily and carries **no package manager** (`apk`, `wget` and `curl` are all absent) -- but it **does** include a BusyBox shell and `npm`, so treat a container compromise as having a shell available. This line previously claimed "no shell" and "726 MB on disk"; both were wrong, and the correction is recorded in [the v3.1.0 baseline](docs/internal/measurements/v3.1.0-baseline.md).
+*   **Dual-Registry Publishing**: Images published to both Docker Hub and GitHub Container Registry (GHCR) for maximum accessibility and Docker Scout health score optimization.
+*   **Supply Chain Attestations**: SBOM and provenance attestations attached to Docker Hub images for enhanced security transparency and compliance (SLSA Build Level 3).
+*   **Dual Transport** (v1.9.0; **per-session HTTP since v2.0.0**): Stdio (default) or Streamable HTTP via `CYBERCHEF_TRANSPORT=http`. Every HTTP client gets its own session and its own MCP server instance, with CORS, DNS-rebinding protection and a session cap. See the [HTTP Transport Guide](docs/guides/http-transport.md).
+*   **MCP Streaming with Progress** (v1.9.0): Operations send `notifications/progress` via the MCP SDK progress token mechanism for real-time status updates during long-running tasks.
+*   **Worker Thread Pool** (v1.9.0): Piscina-based worker threads offload CPU-intensive operations (AES, Blowfish, bcrypt, scrypt, PBKDF2, etc.) to prevent event loop blocking. Configurable pool size and routing thresholds.
+*   **Schema Validation**: All inputs are validated against schemas derived from CyberChef's internal type system using `zod`.
+*   **Modern Node.js**: Requires Node.js `>=26 <27` since v4.0.0, and the published image runs Node 26 -- floor and runtime are now the same version rather than two majors apart.
+*   **Recipe Management** (v1.6.0): Save and reuse multi-operation workflows with full CRUD operations, import/export in multiple formats (JSON/YAML/URL/CyberChef), recipe composition with nesting support, and curated library of 25+ production-ready recipes across 5 categories. See [Recipe Management Guide](docs/guides/recipe_management.md) for details.
+*   **Advanced Features** (v1.7.0): Enterprise-grade capabilities with batch processing (parallel/sequential execution of up to 100 operations), privacy-first telemetry collection (disabled by default, no input/output data captured), sliding window rate limiting for resource protection, enhanced caching with inspection tools, and resource quota tracking (concurrent operations, data sizes). All features are configurable via environment variables with secure defaults. See [Release Notes](docs/releases/v1.7.0.md) for details.
+*   **Enhanced Observability** (v1.5.0): Structured JSON logging with Pino for production monitoring, comprehensive error handling with actionable recovery suggestions, automatic retry logic with exponential backoff, request correlation with UUID tracking, circuit breaker pattern for cascading failure prevention, and streaming infrastructure for progressive results on large operations. See [Release Notes](docs/releases/v1.5.0.md) for details.
+*   **Performance Optimized** (v1.4.0): LRU cache for operation results (100MB default), automatic streaming for large inputs (10MB+ threshold), configurable resource limits (100MB max input, 30s timeout), memory monitoring, and comprehensive benchmark suite. See [Performance Tuning Guide](docs/architecture/performance-tuning.md) for configuration options.
+*   **Upstream Sync Automation** (v1.3.0; **rebuilt in v2.0.0**): Weekly monitoring of upstream releases, an atomic whole-tree mirror, fork changes carried as patches that fail the sync if they stop applying, comprehensive validation (1,246 MCP + 241 Node-API + 2,289 operation tests), and an emergency rollback. See the [Upstream Sync Guide](docs/guides/upstream-sync-guide.md).
+*   **Security Hardened** (v1.4.5+): Chainguard Wolfi base image with zero-CVE baseline, non-root execution (UID 65532), automated Trivy vulnerability scanning with build-fail thresholds, dual SBOM strategy (Docker Scout attestations + CycloneDX), read-only filesystem support, SLSA Build Level 3 provenance, and 7-day SLA for critical CVE patches. Fixed 11 of 12 code scanning vulnerabilities including critical cryptographic randomness weakness and 7 ReDoS vulnerabilities. See [Security Policy](SECURITY.md) and [Security Fixes Report](docs/security/SECURITY_FIX_REPORT.md) for details.
+*   **Production Ready**: Comprehensive CI/CD with CodeQL v4, automated testing, and dual-registry container publishing (Docker Hub + GHCR) with complete supply chain attestations.
+
+## Quick Start
+
+### Prerequisites
+*   **Node.js** `>=26 <27` for the npm install, or **Docker** for the container.
+
+### Installation Options
+
+**Option 1: npm (Recommended)**
+
+```bash
+npx cyberchef-mcp
+```
+
+No clone, no build, no Docker daemon. For an MCP client, point it at the same command:
+
+```json
+{
+  "mcpServers": {
+    "cyberchef": { "command": "npx", "args": ["-y", "cyberchef-mcp"] }
+  }
+}
+```
+
+Installing it permanently works too — `npm install -g cyberchef-mcp`, then run `cyberchef-mcp`.
+That is the only binary the package ships; `cyberchef-migrate` was removed in v4.0.0.
+
+**Option 2: Pull from Docker Hub**
+```bash
+# Docker Hub provides health scores and supply chain attestations
+docker pull parobek/cyberchef-mcp:latest
+docker tag parobek/cyberchef-mcp:latest cyberchef-mcp
+docker run -i --rm cyberchef-mcp
+```
+
+**Option 2b: Pull from GitHub Container Registry (Alternative)**
+```bash
+docker pull ghcr.io/doublegate/cyberchef-mcp_v4:latest
+docker tag ghcr.io/doublegate/cyberchef-mcp_v4:latest cyberchef-mcp
+docker run -i --rm cyberchef-mcp
+```
+
+**Option 3: Download Pre-built Image (Offline Installation)**
+
+For environments without direct GHCR access, download the pre-built Docker image tarball from the [latest release](https://github.com/doublegate/CyberChef-MCP/releases/latest):
+
+1.  **Download the tarball** (**141 MB** compressed; measured against the published v3.1.0 asset, not estimated):
+    ```bash
+    # Download from GitHub Releases
+    wget https://github.com/doublegate/CyberChef-MCP/releases/download/v4.2.0/cyberchef-mcp-v4.2.0-docker-image.tar.gz
+    ```
+
+2.  **Load the image into Docker:**
+
+    ```bash
+    docker load < cyberchef-mcp-v4.2.0-docker-image.tar.gz
+    ```
+
+3.  **Tag for easier usage:**
+
+    ```bash
+    docker tag parobek/cyberchef-mcp:latest cyberchef-mcp
+    ```
+
+4.  **Run the server:**
+    ```bash
+    docker run -i --rm cyberchef-mcp
+    ```
+
+**Option 4: Build from Source**
+1.  **Clone the Repository:**
+    ```bash
+    git clone https://github.com/doublegate/CyberChef-MCP.git
+    cd CyberChef-MCP
+    ```
+
+2.  **Build the Docker Image:**
+    ```bash
+    docker build -f Dockerfile.mcp -t cyberchef-mcp .
+    ```
+
+3.  **Run the Server (Interactive Mode):**
+    This command starts the server and listens on stdin. This is what your MCP client will run.
+    ```bash
+    docker run -i --rm cyberchef-mcp
+    ```
+
+4.  **Optional: Run with Enhanced Security (Read-Only Filesystem):**
+    For maximum security in production deployments:
+    ```bash
+    docker run -i --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=100m cyberchef-mcp
+    ```
+
+## Client Configuration
+
+### Cursor AI
+1.  Go to **Settings** > **Features** > **MCP**.
+2.  Add a new server:
+    *   **Name:** `CyberChef`
+    *   **Type:** `command`
+    *   **Command:** `docker`
+    *   **Args:** `run -i --rm cyberchef-mcp`
+
+### Claude Code (CLI)
+Add to your configuration file (typically `~/.config/claude/config.json`):
+```json
+{
+  "mcpServers": {
+    "cyberchef": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "cyberchef-mcp"]
+    }
+  }
+}
+```
+
+### Claude Desktop
+Add to your Claude Desktop configuration file:
+*   **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+*   **Windows:** `%APPDATA%/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "cyberchef": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "cyberchef-mcp"]
+    }
+  }
+}
+```
+
+After adding the configuration, restart Claude Desktop. The CyberChef tools will appear in the available tools panel.
+
+## Performance & Configuration
+
+Version 1.4.0 introduces comprehensive performance optimizations and configurable resource limits. All features can be tuned via environment variables for your deployment needs.
+
+### Performance Features
+
+**LRU Cache for Operation Results**
+- Automatically caches operation results to eliminate redundant computation
+- Configurable cache size (100MB default) and item count (1000 default)
+- Cache keys based on operation + input + arguments (SHA256 hash)
+
+**Automatic Streaming for Large Inputs**
+- Inputs exceeding 10MB automatically use chunked processing
+- Supports encoding, compression, and hashing operations
+- Memory-efficient handling of 100MB+ files
+- Transparent fallback for non-streaming operations
+
+**Resource Limits**
+- Maximum input size validation (100MB default)
+- Operation timeout enforcement (30 seconds default)
+- Prevents out-of-memory crashes and runaway operations
+
+**Memory Monitoring**
+- Periodic memory usage logging to stderr
+- Heap and RSS tracking for troubleshooting
+
+### Configuration Options
+
+Every setting can be given either in a `cyberchef.config.json` file or as an environment variable,
+with **environment variables taking precedence** over the file. Nothing is required: with no file,
+the server behaves exactly as it always has.
+
+```json
+{
+  "server":   { "maxInputSize": 10485760, "operationTimeout": 30000 },
+  "security": { "offline": true },
+  "tools":    { "surface": "curated" }
+}
+```
+
+A malformed file, an unknown section or an unknown setting stops the server with a message naming
+the mistake, rather than starting on defaults nobody chose. All 61 settings, their sections and
+their environment-variable equivalents are in the
+**[configuration guide](docs/guides/configuration.md)**.
+
+The same settings as environment variables:
+
+```bash
+# Logging (v1.5.0+)
+LOG_LEVEL=info                           # Logging level: debug, info, warn, error, fatal
+
+# Retry Logic (v1.5.0+)
+CYBERCHEF_MAX_RETRIES=3                  # Maximum retry attempts for transient failures
+CYBERCHEF_INITIAL_BACKOFF=1000           # Initial backoff delay in milliseconds
+CYBERCHEF_MAX_BACKOFF=10000              # Maximum backoff delay in milliseconds
+CYBERCHEF_BACKOFF_MULTIPLIER=2           # Backoff multiplier for exponential backoff
+
+# Streaming (v1.5.0+)
+CYBERCHEF_STREAM_CHUNK_SIZE=1048576      # Chunk size for streaming (1MB)
+CYBERCHEF_STREAM_PROGRESS_INTERVAL=10485760  # Progress reporting interval (10MB)
+
+# Recipe Management (v1.6.0+)
+CYBERCHEF_RECIPE_STORAGE=./recipes.json  # Storage file path
+CYBERCHEF_RECIPE_MAX_COUNT=10000         # Maximum number of recipes
+CYBERCHEF_RECIPE_MAX_OPERATIONS=100      # Max operations per recipe
+CYBERCHEF_RECIPE_MAX_DEPTH=5             # Max nesting depth
+
+# Batch Processing (v1.7.0+)
+CYBERCHEF_BATCH_MAX_SIZE=100             # Maximum operations per batch
+CYBERCHEF_BATCH_ENABLED=true             # Enable/disable batch processing
+
+# Telemetry & Analytics (v1.7.0+)
+CYBERCHEF_TELEMETRY_ENABLED=false        # Privacy-first: disabled by default
+
+# Rate Limiting (v1.7.0+)
+CYBERCHEF_RATE_LIMIT_ENABLED=false       # Disabled by default
+CYBERCHEF_RATE_LIMIT_REQUESTS=100        # Max requests per window
+CYBERCHEF_RATE_LIMIT_WINDOW=60000        # Time window in milliseconds
+
+# Cache Management (v1.7.0+)
+CYBERCHEF_CACHE_ENABLED=true             # Enable/disable caching
+
+# Resource Quotas (v1.7.0+)
+CYBERCHEF_MAX_CONCURRENT_OPS=10          # Maximum concurrent operations
+
+# (Removed in v4.0.0) V2_COMPATIBILITY_MODE and CYBERCHEF_SUPPRESS_DEPRECATIONS went with the
+# deprecation system they configured. Do not set them: the `compatibility` section is now an
+# unknown section, and `cyberchef.config.json` fails CLOSED on one -- the server refuses to start
+# with "unknown section \"compatibility\"". The env vars are simply ignored.
+
+# Transport (v1.9.0+; per-session HTTP since v2.0.0)
+CYBERCHEF_TRANSPORT=stdio                # Transport type: stdio or http
+CYBERCHEF_HTTP_PORT=3000                 # HTTP transport port
+CYBERCHEF_HTTP_HOST=127.0.0.1            # HTTP bind address (use 0.0.0.0 in a container)
+CYBERCHEF_ALLOWED_HOSTS=                 # Comma-separated Host allowlist. DNS-rebinding protection
+                                         # is ON by default (loopback names). Set this when binding
+                                         # a non-loopback address; `*` disables the check.
+CYBERCHEF_ALLOWED_ORIGINS=               # Comma-separated Origin allowlist; enables CORS. Required
+                                         # by browser MCP clients (e.g. MCP Inspector's web UI).
+CYBERCHEF_SESSION_TIMEOUT=1800000        # Idle HTTP session reap threshold (30 min)
+CYBERCHEF_HTTP_MAX_BODY=4194304          # Maximum accepted HTTP request body (4 MiB)
+CYBERCHEF_HTTP_PATH=/mcp                 # MCP endpoint path; any other path returns 404
+CYBERCHEF_MAX_SESSIONS=100               # Cap on concurrent HTTP sessions; initialize 503s beyond it
+
+# Worker Thread Pool (v1.9.0+)
+CYBERCHEF_WORKER_MIN_THREADS=1           # Minimum worker threads
+CYBERCHEF_WORKER_MAX_THREADS=4           # Maximum worker threads
+CYBERCHEF_WORKER_IDLE_TIMEOUT=30000      # Worker idle timeout in milliseconds
+CYBERCHEF_WORKER_MIN_INPUT_SIZE=1024     # Minimum input size for worker routing (bytes)
+
+# Performance (v1.4.0+)
+CYBERCHEF_MAX_INPUT_SIZE=104857600       # Maximum input size (100MB)
+CYBERCHEF_OPERATION_TIMEOUT=30000        # Operation timeout in milliseconds (30s)
+CYBERCHEF_STREAMING_THRESHOLD=10485760   # Streaming threshold (10MB)
+CYBERCHEF_ENABLE_STREAMING=true          # Enable streaming for large operations
+CYBERCHEF_ENABLE_WORKERS=false           # Enable worker thread pool (disabled by default)
+CYBERCHEF_CACHE_MAX_SIZE=104857600       # Cache maximum size (100MB)
+CYBERCHEF_CACHE_MAX_ITEMS=1000           # Cache maximum items
+```
+
+### Example Configurations
+
+**High-Throughput Server (Large Files)**
+```bash
+docker run -i --rm --memory=4g \
+  -e CYBERCHEF_MAX_INPUT_SIZE=524288000 \
+  -e CYBERCHEF_STREAMING_THRESHOLD=52428800 \
+  -e CYBERCHEF_CACHE_MAX_SIZE=524288000 \
+  -e CYBERCHEF_OPERATION_TIMEOUT=120000 \
+  ghcr.io/doublegate/cyberchef-mcp_v4:latest
+```
+
+**Low-Memory Environment**
+```bash
+docker run -i --rm --memory=512m \
+  -e CYBERCHEF_MAX_INPUT_SIZE=10485760 \
+  -e CYBERCHEF_STREAMING_THRESHOLD=5242880 \
+  -e CYBERCHEF_CACHE_MAX_SIZE=10485760 \
+  -e CYBERCHEF_CACHE_MAX_ITEMS=100 \
+  ghcr.io/doublegate/cyberchef-mcp_v4:latest
+```
+
+**Claude Desktop with Custom Limits**
+```json
+{
+  "mcpServers": {
+    "cyberchef": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "CYBERCHEF_MAX_INPUT_SIZE=209715200",
+        "-e", "CYBERCHEF_CACHE_MAX_SIZE=209715200",
+        "ghcr.io/doublegate/cyberchef-mcp_v4:latest"
+      ]
+    }
+  }
+}
+```
+
+**Debug Logging for Troubleshooting (v1.5.0+)**
+```bash
+docker run -i --rm \
+  -e LOG_LEVEL=debug \
+  -e CYBERCHEF_MAX_RETRIES=5 \
+  ghcr.io/doublegate/cyberchef-mcp_v4:latest
+```
+
+**Worker Thread Pool for CPU-Intensive Operations (v1.9.0+)**
+```bash
+docker run -i --rm \
+  -e CYBERCHEF_ENABLE_WORKERS=true \
+  -e CYBERCHEF_WORKER_MAX_THREADS=8 \
+  -e CYBERCHEF_WORKER_IDLE_TIMEOUT=60000 \
+  ghcr.io/doublegate/cyberchef-mcp_v4:latest
+```
+
+**HTTP Transport for Browser/Remote Clients (v1.9.0+)**
+```bash
+docker run --rm -p 3000:3000 \
+  -e CYBERCHEF_TRANSPORT=http \
+  -e CYBERCHEF_HTTP_PORT=3000 \
+  -e CYBERCHEF_HTTP_HOST=0.0.0.0 \
+  -e CYBERCHEF_ALLOWED_HOSTS=localhost:3000,127.0.0.1:3000 \
+  ghcr.io/doublegate/cyberchef-mcp_v4:latest
+```
+
+`CYBERCHEF_ALLOWED_HOSTS` is new in v2.0.0. **DNS-rebinding protection is on by default** — with
+nothing set the server answers only to `localhost`, `127.0.0.1` and `[::1]` — so binding a
+non-loopback address means naming the hosts you will reach it by, as the example above does.
+
+Loopback is not an exemption: DNS rebinding exists to reach loopback, by making the victim's
+browser resolve an attacker-controlled name to `127.0.0.1`. The browser then treats the request as
+same-origin, so no preflight is sent and `CYBERCHEF_ALLOWED_ORIGINS` never comes into it. See
+[the HTTP transport guide](docs/guides/http-transport.md#on-cyberchef_allowed_hosts) for the full
+walkthrough.
+
+**Multiple simultaneous clients work from v2.0.0.** Before it, the HTTP transport was a single
+process-wide instance, so the first client to connect succeeded and every one after it was refused
+with `Invalid Request: Server already initialized` ([#36](https://github.com/doublegate/CyberChef-MCP/issues/36)).
+Each client now gets its own session and its own MCP server instance. See the
+[HTTP Transport Guide](docs/guides/http-transport.md).
+
+For detailed performance tuning guidance, see the [Performance Tuning Guide](docs/architecture/performance-tuning.md).
+
+### Performance Benchmarks
+
+Run the benchmark suite to measure performance on your hardware:
+
+```bash
+# Install dependencies
+npm install
+
+# Generate required configuration
+npx grunt configTests
+
+# Run benchmarks
+npm run benchmark
+```
+
+The benchmark suite tests 20+ operations across multiple input sizes (1KB, 10KB, 100KB) in categories including:
+- Encoding operations (Base64, Hex)
+- Hashing operations (MD5, SHA256, SHA512)
+- Compression operations (Gzip)
+- Cryptographic operations (AES)
+- Text operations (Regex)
+- Analysis operations (Entropy, Frequency Distribution)
+
+## Security
+
+This project implements comprehensive security hardening with continuous improvements:
+
+### Latest Enhancements (v1.6.0)
+*   **Recipe Management System**: Save, organize, and reuse multi-operation workflows
+    *   **CRUD Operations**: Create, read, update, delete recipes with versioning
+    *   **Import/Export**: JSON, YAML, URL, and CyberChef format support
+    *   **Recipe Composition**: Nest recipes within recipes for complex workflows
+    *   **Recipe Library**: 25+ curated examples in 5 categories (Cryptography, Encoding, Data Extraction, Forensics, Networking)
+    *   **Validation Tools**: Pre-execution validation with complexity estimation
+    *   **Testing Tools**: Test recipes with sample inputs before deployment
+    *   **10 New MCP Tools**: Complete recipe lifecycle management
+    *   See [Recipe Management Guide](docs/guides/recipe_management.md) for complete usage documentation
+
+### Enhanced Observability (v1.5.0)
+*   **Enhanced Error Handling**: Comprehensive error reporting for production debugging
+    *   **8 Error Codes**: Standardized error classification (INVALID_INPUT, MISSING_ARGUMENT, OPERATION_FAILED, TIMEOUT, OUT_OF_MEMORY, UNSUPPORTED_OPERATION, CACHE_ERROR, STREAMING_ERROR)
+    *   **Rich Context**: Detailed debugging information (input size, operation name, request ID, timestamp)
+    *   **Recovery Suggestions**: Actionable recommendations for common issues
+    *   **Retryable Classification**: Automatic distinction between transient and permanent failures
+*   **Structured Logging with Pino**: Production-ready observability
+    *   **JSON Logs**: Machine-readable logs for monitoring tools (Datadog, Splunk, ELK)
+    *   **Request Correlation**: UUID-based request tracking across operations
+    *   **Performance Metrics**: Duration, throughput, cache hits, memory usage
+    *   **Configurable Levels**: debug, info, warn, error, fatal via LOG_LEVEL environment variable
+*   **Automatic Retry Logic**: Resilience for transient failures
+    *   **Exponential Backoff**: 1s → 2s → 4s with jitter to prevent thundering herd
+    *   **Configurable Retries**: Default 3 attempts, customizable via CYBERCHEF_MAX_RETRIES
+    *   **Smart Detection**: Automatically retries timeouts, memory issues, network errors
+    *   **Circuit Breaker**: Opens after 5 consecutive failures to prevent cascading issues
+*   **MCP Streaming Infrastructure**: Progressive results for large operations
+    *   **Chunked Processing**: Memory-efficient handling of 100MB+ inputs
+    *   **Progress Reporting**: Updates every 10MB for long-running operations
+    *   **14 Supported Operations**: Encoding (Base64, Hex), hashing (MD5, SHA family), text operations
+    *   **Configurable Thresholds**: Streaming chunk size and progress interval
+
+### Security Hardening (v1.4.6)
+*   **Chainguard Wolfi Base Image**: minimal, rebuilt daily, zero-CVE baseline
+    *   **Zero-CVE Baseline**: Daily security updates with 7-day SLA for critical patches
+    *   **70% Smaller Attack Surface**: Minimal OS footprint compared to traditional Alpine/Debian images
+    *   **Non-Root Execution**: Runs as UID 65532 (nonroot user), with no package manager in the image
+    *   **SLSA Build Level 3 Provenance**: Verifiable supply chain integrity
+    *   **Multi-stage Build**: `-dev` variant for compilation, the slim runtime variant for production
+*   **Read-Only Filesystem Support**: Production-ready immutable deployments
+    *   Supports `docker run --read-only` with tmpfs mount for /tmp
+    *   Compliance-ready for PCI-DSS, SOC 2, FedRAMP requirements
+    *   Example: `docker run -i --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=100m cyberchef-mcp`
+*   **Security Scan Fail Thresholds**: Automated vulnerability prevention
+    *   Trivy scanner configured with `exit-code: '1'` in CI/CD
+    *   Builds automatically fail on CRITICAL or HIGH vulnerabilities
+    *   Prevents vulnerable images from reaching production
+*   **Dual SBOM Strategy**: Comprehensive supply chain transparency
+    *   **Part 1**: Docker buildx attestations for automated registry scanning (Docker Scout)
+    *   **Part 2**: Trivy CycloneDX SBOM for offline compliance auditing
+    *   Both SBOMs attached as release assets for verification
+
+### Code Security (v1.4.1+)
+*   **11 of 12 Code Scanning Vulnerabilities Fixed**: Comprehensive security hardening completed
+    *   **CRITICAL**: Fixed insecure cryptographic randomness in GOST library - replaced `Math.random()` with `crypto.randomBytes()`
+    *   **HIGH**: Addressed 7 ReDoS (Regular Expression Denial of Service) findings across 6 operations
+        *   **Withdrawn — this protection is no longer present.** The fix worked by importing a
+            `SafeRegex.mjs` helper into the affected operations. Those operations live under
+            `src/core/operations/`, which `upstream-sync.yml` copies verbatim from upstream, so a
+            later sync removed every import. The module has been removed rather than left as
+            dead code claiming a protection it no longer provided.
+        *   See [the incident record](docs/security/2026-08-30-saferegex-reverted-by-upstream-sync.md)
+            for the verification and the general rule it establishes: a hand-edit inside
+            `src/core/**` is a fix with an expiry date set by the next sync.
+*   **All 1,933 Tests Passing**: Security fixes validated with comprehensive test suite
+*   See [Security Fixes Report](docs/security/SECURITY_FIX_REPORT.md) for complete details
+
+### Supply Chain Security (v1.4.5+)
+*   **Dual-Registry Publishing with Attestations**: Enhanced security transparency and compliance
+    *   **Docker Hub**: Primary distribution with Docker Scout health score monitoring
+    *   **GitHub Container Registry (GHCR)**: Secondary distribution for GitHub ecosystem integration
+    *   Both registries receive identical images with full attestation support
+*   **Docker Scout Attestations**: Build integrity and software transparency
+    *   **Provenance Attestation** (mode=max): Complete build process metadata (builder, materials, recipe) for SLSA Build Level 3 compliance
+    *   **SBOM Attestation**: Automatic Software Bill of Materials generation in SPDX-JSON format
+    *   Achieves optimal Docker Scout health score (grade A or B) on Docker Hub
+    *   15 points out of 100 in health score calculation - one of the highest-weighted policy categories
+*   **Dual SBOM Strategy**: Comprehensive software transparency
+    *   **Docker Attestation SBOM**: Attached to image manifest for registry-based validation and `docker sbom` command
+    *   **Trivy SBOM Artifact**: Standalone CycloneDX file for offline audits and compliance reporting
+    *   Both SBOMs include complete dependency tree with version information
+*   **Trivy Integration**: Container and dependency scanning on every build with fail-fast thresholds
+*   **GitHub Security Tab**: All findings automatically uploaded as SARIF
+*   **Verification**: Use `docker scout quickview` and `docker sbom` commands to inspect attestations locally
+
+### Container Security (v1.4.5+)
+*   **Chainguard Wolfi**: Zero-CVE baseline, rebuilt daily
+*   **Non-Root Execution**: Container runs as UID 65532 (`nonroot`)
+*   **Read-Only Filesystem**: Supports `--read-only` flag for immutable deployments
+*   **Minimal Attack Surface**: no package manager (`apk`, `wget` and `curl` are absent) and production dependencies only. **A BusyBox shell and `npm` ARE present** -- this line said "no shell" until v3.2.0, when measuring the published image showed otherwise. Size a container compromise accordingly.
+*   **Health Checks**: Built-in container health monitoring
+
+### Cryptographic Hardening (v1.2.5)
+*   **Argon2 OWASP Compliance**: Default parameters follow OWASP 2024-2025 recommendations
+    *   Type: Argon2id (hybrid side-channel + GPU resistance)
+    *   Memory: 19 MiB (OWASP minimum)
+    *   Iterations: 2 (OWASP recommended for 19 MiB)
+*   **Secure Random Number Generation**: All cryptographic operations use `crypto.randomBytes()` or `crypto.getRandomValues()`
+*   **CVE-2025-64756 Fixed**: Updated npm to resolve glob command injection vulnerability
+
+### Automated Security Scanning
+*   **CodeQL Analysis**: Continuous code scanning for security vulnerabilities
+*   **Weekly Scans**: Scheduled scans catch newly discovered vulnerabilities
+
+### Secure Deployment
+```bash
+# Recommended: Run with maximum security options
+docker run -i --rm \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  cyberchef-mcp
+
+# Note: the image already runs as non-root (UID 65532)
+# --read-only requires tmpfs mount for /tmp directory
+```
+
+For detailed information, see:
+*   [Security Policy](SECURITY.md) - Vulnerability reporting and security policies
+*   [Security Audit](docs/security/audit.md) - Comprehensive security assessment
+*   [Security Fixes Report](docs/security/SECURITY_FIX_REPORT.md) - Latest vulnerability fixes
+*   [Security Fixes Summary](docs/security/SECURITY_FIXES_SUMMARY.md) - Quick reference guide
+
+## Project Roadmap
+
+The original roadmap scoped **19 releases across 6 phases through August 2027**. It was overtaken:
+all six phases are complete and the project is at **v4.2.0**. The table below is kept because it
+records what each phase was *for*; [`docs/planning/ROADMAP.md`](docs/planning/ROADMAP.md) is the
+live source and has a row per shipped release.
+
+| Phase | Releases | Timeline | Focus | Status |
+|-------|----------|----------|-------|--------|
+| **Phase 1: Foundation** | v1.2.0 - v1.4.6 | Q4 2025 - Q1 2026 | Security hardening, upstream sync, performance | **Completed** |
+| **Phase 2: Enhancement** | v1.5.0 - v1.7.3 | Q2 2026 | Streaming, recipe management, batch processing | **Completed** |
+| **Phase 3: Maturity** | v1.8.0 - v2.0.0 | Q3 2026 | API stabilization, upstream catch-up, relicensing, v2.0.0 | **v2.0.0 Released** |
+| **Phase 4: Expansion** | v2.2.0 - v2.4.0 | Q4 2026 | Multi-modal (**v2.2.0 shipped**), protocol currency and transports (**v2.3.0 shipped**), the tool registry and its first four tools (**v2.4.0 shipped**) | Complete |
+| **Phase 5: Enterprise** | v2.5.0 - v2.7.0 | Q1 2027 | OAuth 2.1, RBAC, audit logging and multi-tenancy (**v2.5.0 shipped**), horizontal scaling and deployment (**v2.6.0 shipped**), metrics, tracing and dashboards (**v2.7.0 shipped**) | Complete |
+| **Phase 6: Evolution** | v2.8.0 - v3.0.0 | Q2-Q3 2027 | Edge deployment, AI-native features, v3.0.0 | **Completed** — and early: v3.0.0 shipped 2026-09 rather than Q3 2027 |
+| **Beyond the plan** | v3.1.0 - v4.2.0 | 2026-09 | Conformance against the official suite, magic re-ranking, the arm64 benchmark, PQC identification, retiring the v2 migration surface (v4.0.0), the tool-surface work in v4.1.0, and the dispatch consolidation in v4.2.0 | **Shipped**, none of it in the original six phases |
+
+**External project integration — what it actually produced.** The planning tree
+([External Project Integration](docs/planning/ext-proj-int/), 30 documents) scoped 80-120 new tools
+from 8 security projects. Measuring each against the 504 operations already present cut that hard:
+**four tools shipped in v2.4.0**, drawn on xortool, pwntools, RsaCtfTool, hashcat and John — and
+**nineteen now exist**, twelve added in v3.3.0 and one each in v3.4.0, v3.8.0 and v3.11.0. Four of
+the eight projects contributed nothing, because the capability was already here — `Magic` covers
+what Ciphey, Ares and katana's core do, and cryptii's encodings have 26 equivalents among the
+operations. The `cyberchef-recipes` preset corpus remains unbuilt. See
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for what was taken from where.
+
+See the [**Full Roadmap**](docs/planning/ROADMAP.md) for what shipped, and [**v4 planning**](docs/planning/v4/) for what is being watched for. A major version here exists because the protocol forced one, not because the number was next.
+
+## Documentation
+
+**New here? Start with the [Tutorial](docs/guides/tutorial.md)** — a guided first hour, from
+install to decoding a real sample. Then [`examples/`](examples/) for eight runnable scripts that
+CI executes on every change, so they cannot drift from the code.
+
+
+Detailed documentation is organized in the [`docs/`](docs/) directory:
+
+### User Guides
+*   [**User Guide**](docs/guides/user_guide.md): Detailed installation and client configuration
+*   [**Commands Reference**](docs/guides/commands.md): List of all available MCP tools and operations
+*   [**Recipe Management Guide**](docs/guides/recipe_management.md): Complete guide to saving, organizing, and reusing workflows
+*   [**Upstream Sync Guide**](docs/guides/upstream-sync-guide.md): Guide to selective upstream synchronization workflow
+*   [**Docker Hub Setup Guide**](docs/guides/DOCKER_HUB_SETUP.md): Quick start guide for Docker Hub publishing and attestations
+*   [**Docker Scout Attestations Guide**](docs/guides/docker-scout-attestations.md): Comprehensive guide to supply chain attestations and health scores
+
+### Development Guides
+*   [**Codecov Integration Guide**](docs/guides/codecov-integration.md): Coverage analytics, bundle analysis, and test analytics
+
+### Technical Documentation
+*   [**Architecture**](docs/architecture/architecture.md): Technical design of the MCP server
+*   [**Technical Implementation**](docs/architecture/technical_implementation.md): Implementation details
+*   [**Performance Tuning Guide**](docs/architecture/performance-tuning.md): Configuration guide for optimizing performance
+
+### Project Management
+*   [**Product Roadmap**](docs/planning/ROADMAP.md): v1.1.0 → v3.9.0 shipped, with what each release actually found rather than what it planned
+*   [**v4 planning**](docs/planning/v4/): one measured plan and nine thin charters — and the measurement that says **v4.0.0 is not scheduled**, because the MCP draft specification has accumulated no changes since 2026-07-28
+*   [**Tasks**](docs/planning/tasks.md): 500+ implementation tasks organized by release
+*   [**Development Phases**](docs/planning/phases/overview.md): Sprint breakdowns for each development phase
+*   [**Release Plans**](docs/planning/future-releases/): Individual release specifications (v1.2.0 - v3.0.0)
+*   [**Project Summary**](docs/internal/project_summary.md): Internal project overview
+
+### Strategic Planning
+*   [**Upstream Sync Strategy**](docs/planning/strategies/UPSTREAM-SYNC-STRATEGY.md): Automated CyberChef update monitoring
+*   [**Security Hardening Plan**](docs/planning/strategies/SECURITY-HARDENING-PLAN.md): Docker DHI, non-root, SBOM generation
+*   [**Multi-Modal Strategy**](docs/planning/strategies/MULTI-MODAL-STRATEGY.md): Image/binary/audio handling via MCP
+*   [**Plugin Architecture**](docs/planning/strategies/PLUGIN-ARCHITECTURE-DESIGN.md): Custom operations and sandboxed execution
+*   [**Enterprise Features**](docs/planning/strategies/ENTERPRISE-FEATURES-PLAN.md): OAuth 2.1, RBAC, audit logging
+
+### v2.0.0 Integration Planning
+*   [**External Project Integration**](docs/planning/ext-proj-int/): Comprehensive planning for v2.0.0+ integrations
+    *   [Overview](docs/planning/ext-proj-int/overview.md): Integration strategy and architecture (4 phases, 12 sprints, 80-120 new tools)
+    *   [Phase Plans](docs/planning/ext-proj-int/phases/): Foundation, JavaScript Native, Algorithm Ports, Advanced
+    *   [Sprint Plans](docs/planning/ext-proj-int/sprints/): 12 detailed sprint breakdowns with task lists
+    *   [Tool Integration Plans](docs/planning/ext-proj-int/tools/): Per-tool integration strategies (Ciphey, cryptii, xortool, RsaCtfTool, John, pwntools, katana, recipes)
+    *   [Technical Guides](docs/planning/ext-proj-int/technical/): Tool registration, algorithm porting, testing, dependencies
+
+### Reference Documentation
+*   [**Security Tool Reference**](docs/reference/): Technical documentation for 11 security tools and related projects
+    *   [ares](docs/reference/ares.md), [ciphey](docs/reference/ciphey.md): Auto-decode tools and algorithms
+    *   [cryptii](docs/reference/cryptii.md): Modular encoding/decoding system
+    *   [cyberchef-recipes](docs/reference/cyberchef-recipes.md), [cyberchef-server](docs/reference/cyberchef-server.md): Related CyberChef projects
+    *   [john-the-ripper](docs/reference/john-the-ripper.md): Password cracking and hash identification
+    *   [katana](docs/reference/katana.md), [pwntools](docs/reference/pwntools.md): CTF and binary exploitation tools
+    *   [rsactftool](docs/reference/rsactftool.md), [xortool](docs/reference/xortool.md): Cryptanalysis utilities
+
+### Security & Releases
+*   [**Security Policy**](SECURITY.md): Security policy and vulnerability reporting
+*   [**Security Audit**](docs/security/audit.md): Comprehensive security assessment
+*   [**Security Fixes Report**](docs/security/SECURITY_FIX_REPORT.md): Detailed report of 11 vulnerability fixes (ReDoS and cryptographic weaknesses)
+*   [**Security Fixes Summary**](docs/security/SECURITY_FIXES_SUMMARY.md): Quick reference for recent security improvements
+*   [**v2.0.0 Breaking Changes**](docs/v2.0.0-breaking-changes.md): Comprehensive migration guide for v2.0.0 with deprecation codes, examples, and FAQ
+*   [**Release Notes v4.2.0**](docs/releases/v4.2.0.md): One place to add a meta-tool for the eight of ten that are uniform — 24 dispatch branches down to 16 — and a release whose two central claims were both wrong: the gate it set out to build had existed since v3.7.0, and the two "identical" recipe branches that were not (`recipe_execute` guards input size, `recipe_export` was double-encoded by the table) kept theirs. Behaviour preservation proven byte-for-byte through a real client rather than asserted
+*   [**Release Notes v4.1.0**](docs/releases/v4.1.0.md): Registry tools get a navigation path and leave the default surface — the index falls from 41 tools / 44,968 bytes to 23 / 15,620 with nothing made unreachable, and the charter's headline claim turns out to be arithmetically impossible
+*   [**Release Notes v4.0.0**](docs/releases/v4.0.0.md): Retiring the v2 migration surface — the deprecation system, both migration tools and the `cyberchef-migrate` bin, advertised on every surface for a migration nine minors old
+*   [**Release Notes v3.11.0**](docs/releases/v3.11.0.md): Post-quantum identification (`cyberchef_pqc_identify`, all eighteen NIST parameter sets), and the thin coverage margin the previous release warned about being hit one release later
+*   [**Release Notes v3.10.0**](docs/releases/v3.10.0.md): `runServer()` ran on every test import, arming `process.exit(1)` in 23 files — and fixing it dropped coverage below the gate, because the bug had been executing itself
+*   [**Release Notes v3.9.0**](docs/releases/v3.9.0.md): The release with no charter, scoped from measurement instead: magic candidate re-ranking, one action version per workflow, and the surface figures measured through a real client
+*   [**Release Notes v3.8.0**](docs/releases/v3.8.0.md): Two carried-forward blockers that were never blocked — arm64 benchmarking on hardware CI was already using, and `cyberchef_cert_chain`
+*   [**Release Notes v3.7.0**](docs/releases/v3.7.0.md): A consistency gate that checked four of eleven files; its operation-count half now discovers its own targets
+*   [**Release Notes v3.6.0**](docs/releases/v3.6.0.md): The benchmark gate measured into existence — a noise floor and a detection curve from a deliberate tunable slowdown, rather than a plausible threshold
+*   [**Release Notes v3.5.0**](docs/releases/v3.5.0.md): Same-host benchmark comparison, and the MCP registry listing that had returned `count: 0` since the ownership proofs landed
+*   [**Release Notes v3.4.0**](docs/releases/v3.4.0.md): Three operations that had never worked, and `cyberchef_ecdsa_recover`
+*   [**Release Notes v3.3.0**](docs/releases/v3.3.0.md): Twelve analysis tools — classical ciphers, crib dragging, entropy scanning, hash cracking and statistics, JWT weaknesses, plaintext scoring, multi-key RSA, substitution and Vigenère breaking, timestamp identification, corpus diffing
+*   [**Release Notes v3.2.0**](docs/releases/v3.2.0.md): Every gate checked against its own claim — the benchmark workflow that said it could not fail, and two documents describing a shell-free base image that has a shell
+*   [**Release Notes v3.1.0**](docs/releases/v3.1.0.md): Cache hints at the 2026-era encode seam, and the conformance suite adopted as the oracle
+*   [**Release Notes v3.0.0**](docs/releases/v3.0.0.md): MCP 2026-07-28 conformance and the breaking cleanups it forced — scope filtering wired up, error codes aligned, and an npm publish guard that would have silently skipped this very release
+*   [**Release Notes v2.10.0**](docs/releases/v2.10.0.md): The unified configuration file, announced for v2.0.0 and first actually read here — 61 settings, env over file over default, failing closed on an unknown key
+*   [**Release Notes v2.9.0**](docs/releases/v2.9.0.md): Presented output resolved before the cache, so `JSON Beautify` stops returning unparseable JSON
+*   [**Release Notes v2.8.1**](docs/releases/v2.8.1.md): CI testing both ends of the supported Node range, rather than one end while the image shipped the other
+*   [**Release Notes v2.8.0**](docs/releases/v2.8.0.md): `linux/arm64` alongside `amd64`, and infrastructure scanning
+*   [**Release Notes v2.7.0**](docs/releases/v2.7.0.md): The image from 643 MB to 453 MB via `npm prune --omit=dev`, and OpenTelemetry spans on the API only
+*   [**Release Notes v2.6.0**](docs/releases/v2.6.0.md): Startup cut from ~1300 ms to ~185 ms by deferring an import of all 505 operations; health probes and a drain that loses no requests on a rolling update; a Helm chart and Compose file; a 5 s deadline and circuit breaker on calls to the authorization server. **Re-scoped:** the plan's Redis session store solved a problem MCP 2026-07-28 deleted — the protocol has no sessions. 1,246 MCP tests.
+*   [**Release Notes v2.5.0**](docs/releases/v2.5.0.md): Multi-tenancy completes the Enterprise Features milestone — the cache, recipe store, concurrency pool and audit trail isolated per tenant, with identity taken only from an already-verified token. Plus a rate limiter that had never limited anything since v1.7.0: it was keyed on a per-request UUID, so 1000 requests against a limit of 5 produced 0 denials and 1000 leaked map entries. 1,218 MCP tests.
+*   [**Release Notes v2.4.0**](docs/releases/v2.4.0.md): The tool registry and its first four tools — XOR key length by index of coincidence, De Bruijn patterns compatible with pwntools, hash identification with hashcat modes, and four RSA attacks. No plugin loader, with the `node:vm` measurement that rules one out. Three documents corrected that described work nobody had done.
+*   [**Release Notes v2.3.0**](docs/releases/v2.3.0.md): Protocol revision 2026-07-28 on stdio and HTTP, a socket transport, npm distribution unblocked, 17 image operations returning a pooled backing `ArrayBuffer` — unrelated bytes — instead of the image, `Add Text To Image` working for the first time, the coverage gate raised from 75/70/90/75 to 95/88/96/96, 1,023 MCP tests
+*   [**Release Notes v2.2.0**](docs/releases/v2.2.0.md): Images and audio as content blocks (`Generate QR Code` returned `""` and never worked), tool annotations on all 527 tools, prompts and resources, LM Hash off OpenSSL, unknown arguments rejected instead of silently defaulted, 955 MCP tests
+*   [**Release Notes v2.1.0**](docs/releases/v2.1.0.md): Tool-list hierarchy (~97% smaller `tools/list`), Zod 4 schema fix, all 10 flow-control operations working, AES and 62 other toggleString operations fixed, logs to stderr, 60s shutdown hang removed, tutorial + 8 runnable examples
+*   [**Release Notes v2.0.0**](docs/releases/v2.0.0.md): Upstream v11.4.0 (504 operations), GPL-3.0-or-later relicense, Node 24 floor, per-session HTTP transport (#36), 272 security findings closed, 757 MCP tests
+*   [**Open-alert disposition**](docs/security/2026-08-31-open-alert-sweep.md): Every Dependabot and code-scanning alert — fixed, suppressed with a justification, or dismissed with a reason
+*   [**Release Notes v1.9.0**](docs/releases/v1.9.0.md): MCP streaming, worker thread pool, HTTP transport, upstream v10.20.0, security updates, 689 tests
+*   [**Release Notes v1.8.0**](docs/releases/v1.8.0.md): Breaking changes preparation - deprecation warnings, migration preview tool, v2.0.0 compatibility mode
+*   [**Release Notes v1.7.3**](docs/releases/v1.7.3.md): Reference documentation and v2.0.0 integration planning - 42 new documentation files, comprehensive security tool reference
+*   [**Release Notes v1.7.2**](docs/releases/v1.7.2.md): CI improvements, test expansion, documentation updates - enhanced workflows, 150 new tests, corrected metrics
+*   [**Release Notes v1.7.1**](docs/releases/v1.7.1.md): Repository cleanup and workflow enhancements - removed 88 unused files, enhanced upstream sync
+*   [**Release Notes v1.7.0**](docs/releases/v1.7.0.md): Advanced features - batch processing, telemetry, rate limiting, cache enhancements, resource quotas
+*   [**Release Notes v1.6.2**](docs/releases/v1.6.2.md): Technical debt fixes - ESLint errors resolved, ENABLE_WORKERS default corrected
+*   [**Release Notes v1.6.1**](docs/releases/v1.6.1.md): Comprehensive test coverage (311 tests, 78.93% coverage) and Codecov integration
+*   [**Release Notes v1.6.0**](docs/releases/v1.6.0.md): Recipe management system with CRUD operations, import/export, and curated library
+*   [**Release Notes v1.5.0**](docs/releases/v1.5.0.md): Enhanced error handling, structured logging, automatic retry, streaming infrastructure
+*   [**Release Notes v1.4.6**](docs/releases/v1.4.6.md): Sprint 1 Security Hardening - Chainguard distroless migration, zero-CVE baseline, read-only filesystem support
+*   [**Release Notes v1.4.5**](docs/releases/v1.4.5.md): Supply chain attestations and documentation reorganization
+*   [**Release Notes v1.4.4**](docs/releases/v1.4.4.md): Docker Hub build fix and 12 security vulnerability fixes
+*   [**Release Notes v1.4.3**](docs/releases/v1.4.3.md): Dependency resolution and Node.js 22 compatibility
+*   [**Release Notes v1.4.2**](docs/releases/v1.4.2.md): CI/CD improvements and zero-warning workflows
+*   [**Release Notes v1.4.1**](docs/releases/v1.4.1.md): Security patch - 11 Code Scanning vulnerabilities fixed
+*   [**Release Notes v1.4.0**](docs/releases/v1.4.0.md): Performance optimization with caching, streaming, and resource limits
+*   [**Release Notes v1.3.0**](docs/releases/v1.3.0.md): Upstream sync automation with comprehensive testing
+*   [**Release Notes v1.2.6**](docs/releases/v1.2.6.md): nginx:alpine-slim optimization for web app
+*   [**Release Notes v1.2.5**](docs/releases/v1.2.5.md): Security patch with OWASP Argon2 hardening
+*   [**Release Notes v1.2.0**](docs/releases/v1.2.0.md): Security hardening release
+*   [**Release Notes v1.1.0**](docs/releases/v1.1.0.md): Security fixes and Node.js 22 compatibility
+*   [**Release Notes v1.0.0**](docs/releases/v1.0.0.md): Initial MCP server release
+
+## Development
+
+### Local Setup
+If you want to modify the server code without Docker:
+
+0.  **Use the pinned Node version.** `.nvmrc` pins **26** (matching `engines: >=26 <27` and every
+    CI workflow), so `nvm use` / `fnm use` selects it. Worth doing rather than assuming: through
+    v4.0.0 this file said `24` while the floor was already 26, so version managers quietly
+    selected a Node below the floor for an entire release.
+    ```bash
+    nvm use    # or: fnm use
+    node --version   # expect v26.x
+    ```
+1.  **Install Dependencies:**
+    ```bash
+    npm install
+    ```
+2.  **Generate Config:** (Required to build the internal operation lists)
+    ```bash
+    npx grunt configTests
+    ```
+3.  **Run Server:**
+    ```bash
+    npm run mcp
+    ```
+
+### CI/CD
+This project uses GitHub Actions to ensure stability and security:
+
+**Core Development Workflows:**
+*   **MCP Server CI** ([`core-ci.yml`](.github/workflows/core-ci.yml)): Tests the underlying CyberChef logic and configuration generation on Node.js 26
+*   **Docker Build** ([`mcp-docker-build.yml`](.github/workflows/mcp-docker-build.yml)): Builds, verifies, and security scans the `cyberchef-mcp` Docker image
+*   **Pull Request Checks** ([`pull_requests.yml`](.github/workflows/pull_requests.yml)): Automated testing and validation for pull requests
+*   **Performance Benchmarks** ([`performance-benchmarks.yml`](.github/workflows/performance-benchmarks.yml)): Automated performance regression testing on code changes (v1.4.0+)
+
+**Code Quality & Coverage:**
+*   **Codecov Integration**: Comprehensive code quality analytics with three distinct components
+    *   **Coverage Analytics**: Automated coverage tracking with V8 provider and status checks on pull requests
+        *   Project coverage threshold: 95% (`codecov.yml`)
+        *   Patch coverage threshold: 90% for new code
+        *   Multiple coverage formats: lcov, JSON, HTML, Cobertura
+        *   Component-level tracking: MCP Server, Core Operations, Node API
+    *   **Bundle Analysis**: Webpack bundle size tracking and visualization via @codecov/webpack-plugin
+        *   Automated bundle size change detection in pull requests
+        *   Historical bundle size trends and optimization insights
+        *   Dry-run mode for local development
+    *   **Test Analytics**: JUnit XML test result reporting and analysis
+        *   Test performance tracking over time
+        *   Flaky test detection
+        *   Test execution time monitoring
+    *   Configuration: `codecov.yml`, coverage flags, thresholds, PR commenting
+    *   See [Codecov Integration Guide](docs/guides/codecov-integration.md) for complete setup and usage documentation
+
+**Security & Release Workflows:**
+*   **Security Scan** ([`security-scan.yml`](.github/workflows/security-scan.yml)): Trivy vulnerability scanning, SBOM generation, weekly scheduled scans
+*   **CodeQL Analysis** ([`codeql.yml`](.github/workflows/codeql.yml)): Automated security scanning for code vulnerabilities (CodeQL v4)
+*   **Release** ([`mcp-release.yml`](.github/workflows/mcp-release.yml)): Publishes Docker image to GHCR with SBOM attachment on version tags (`v*`), automatically creates GitHub releases
+
+**Upstream Sync Automation (v1.3.0+):**
+*   **Upstream Monitor** ([`upstream-monitor.yml`](.github/workflows/upstream-monitor.yml)): Monitors GCHQ/CyberChef for new releases weekly (Sundays at noon UTC), creates GitHub issues for review
+*   **Upstream Sync** ([`upstream-sync.yml`](.github/workflows/upstream-sync.yml)): Selective file synchronization workflow - copies only `src/core/operations/*.mjs` files, prevents restoration of deleted web UI components, creates PR for review
+*   **Rollback** ([`rollback.yml`](.github/workflows/rollback.yml)): Emergency rollback mechanism with state comparison and ref-proj guidance
+
+All workflows use the latest CodeQL Action v4 for security scanning and SARIF upload.
+
+### Testing
+```bash
+# Run all tests (requires Node.js >=26 <27; 241 Node-API + 2,289 operation tests)
+npm test
+
+# Run MCP validation test suite (1,728 tests across 75 files, with Vitest)
+npm run test:mcp
+
+# Run MCP tests with coverage report
+npm run test:coverage
+
+# Run performance benchmarks (v1.4.0+)
+npm run benchmark
+
+# Test Node.js consumer compatibility
+npm run testnodeconsumer
+
+# Lint workflows (matches the CI gate)
+actionlint .github/workflows/*.yml
+
+# Lint code
+npm run lint
+```
+
+**Test Coverage:**
+The MCP server maintains comprehensive test coverage:
+- **1,728 MCP tests** across 75 suites, plus 241 Node-API tests, 2,289 operation tests and 9 runnable examples executed by CI
+- **Coverage thresholds** (`vitest.config.mjs`): 96% lines, 95% statements, 89% branches, 96% functions, with `src/node/lib/**` held separately at 99 lines / 99 statements / 94 branches / 100 functions
+- **Current coverage**: 96.44% lines, 95.50% statements, 96.84% functions, 89.88% branches (thresholds 96/89/96/95, lines/branches/functions/statements)
+- Note: individual suite names are not listed here because the list went stale three times;
+  `ls tests/mcp/*.test.mjs` is authoritative.
+
+## Contributing
+
+Contributions to the MCP adapter are welcome! We appreciate:
+
+*   **Bug Reports**: Open an issue with detailed steps to reproduce
+*   **Feature Requests**: Check [Roadmap](docs/planning/ROADMAP.md) first, then open an issue
+*   **Pull Requests**: See [Tasks](docs/planning/tasks.md) for areas needing work
+*   **Documentation**: Improvements to guides and examples are always welcome
+
+### Development Workflow
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes and test thoroughly
+4. Commit with conventional commit messages (`feat:`, `fix:`, `docs:`, etc.)
+5. Push to your fork and submit a pull request
+
+For contributions to the core CyberChef operations, please credit the original [GCHQ repository](https://github.com/gchq/CyberChef).
+
+## Repository Information
+
+*   **Original CyberChef**: [GCHQ/CyberChef](https://github.com/gchq/CyberChef)
+*   **MCP Fork**: [doublegate/CyberChef-MCP](https://github.com/doublegate/CyberChef-MCP)
+*   **Container Registries**:
+    *   **Docker Hub** (Primary): [parobek/cyberchef-mcp](https://hub.docker.com/r/parobek/cyberchef-mcp) - With Docker Scout health scores and attestations
+    *   **GHCR** (Secondary): [ghcr.io/doublegate/cyberchef-mcp_v4](https://github.com/doublegate/CyberChef-MCP/pkgs/container/cyberchef-mcp_v4) — v4.x. The package name carries the major, so each line keeps its own image and is not superseded in place: v3.x stays at [`cyberchef-mcp_v3`](https://github.com/doublegate/CyberChef-MCP/pkgs/container/cyberchef-mcp_v3), v2.x at [`cyberchef-mcp_v2`](https://github.com/doublegate/CyberChef-MCP/pkgs/container/cyberchef-mcp_v2).
+    *   **GHCR (v1, frozen)**: [ghcr.io/doublegate/cyberchef-mcp_v1](https://github.com/doublegate/CyberChef-MCP/pkgs/container/cyberchef-mcp_v1)
+        *   Remains pullable; receives security-only patches on the `v1.9.x` line until ~March 2027.
+        *   Apache-2.0, not GPL-3.0-or-later.
+        *   Still has the single process-wide HTTP transport that
+            [#36](https://github.com/doublegate/CyberChef-MCP/issues/36) reported, so **only one
+            HTTP client can connect at a time**. Fixed in v2.x, not backported.
+*   **npm Package**: [cyberchef-mcp](https://www.npmjs.com/package/cyberchef-mcp) — published from
+    CI on each version tag since v2.5.0. `npx cyberchef-mcp` runs the server without installing it;
+    `npm install -g cyberchef-mcp` installs the `cyberchef-mcp` bin. The package is the artefact the
+    MCP registry listing points at, which is why the release job waits for npm to serve it before
+    publishing that listing.
+*   **Glama Listing**: [doublegate/CyberChef-MCP](https://glama.ai/mcp/servers/doublegate/CyberChef-MCP)
+    — an independent third-party directory that **starts the server and introspects it** rather than
+    reading its README, and scores quality and maintenance from what it finds. Ownership is declared
+    in [`glama.json`](glama.json) at the repository root. The badges above and below render its
+    current scores live; they are deliberately not transcribed into this file, because a number
+    copied out of a service is a number that rots.
+*   **Issue Tracker**: [GitHub Issues](https://github.com/doublegate/CyberChef-MCP/issues)
+
+[![CyberChef MCP Server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/doublegate/CyberChef-MCP/badges/card.svg)](https://glama.ai/mcp/servers/doublegate/CyberChef-MCP)
+
+## Support
+
+If you find this project useful, consider supporting its development:
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/doublegate)
+[![Thanks.dev](https://img.shields.io/badge/Thanks.dev-Support-blue)](https://thanks.dev/doublegate)
+
+## Licensing
+
+**As of v2.0.0, CyberChef-MCP is licensed under [GPL-3.0-or-later](LICENSE).** Versions 1.9.x and
+earlier remain Apache-2.0 and are unaffected.
+
+Upstream CyberChef is released under the
+[Apache 2.0 Licence](https://www.apache.org/licenses/LICENSE-2.0) and is covered by
+[Crown Copyright](https://www.nationalarchives.gov.uk/information-management/re-using-public-sector-information/uk-government-licensing-framework/crown-copyright/).
+Files inherited from upstream keep their Apache-2.0 headers; the full text is preserved in
+[`LICENSE.Apache-2.0`](LICENSE.Apache-2.0). This is not a relicensing of GCHQ's code — it is the
+*combined work* that is GPLv3, which Apache-2.0's one-way compatibility with GPLv3 permits.
+
+The change was forced by v2.0.0 incorporating algorithms from GPL-licensed reference tools:
+**katana** is GPL-3.0-or-later (ruling out GPLv2) and **John the Ripper** is GPL-2.0-or-later, while
+Apache-2.0 is compatible with GPLv3 but *not* GPLv2. GPL-3.0-or-later is the only licence that
+admits all three. The reasoning is recorded in
+[ADR 0001](docs/adr/0001-relicense-to-gpl-3-0-or-later.md), and per-component attribution is in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+
+**What this means for you:** running CyberChef-MCP — including serving it over HTTP — carries no
+obligation, as GPLv3 has no network-use clause. Distributing a *derivative* of it does: that must
+also be GPLv3. If your policy precludes GPLv3, stay on the v1.9.x line, which remains Apache-2.0
+and receives security-only patches through its LTS window.

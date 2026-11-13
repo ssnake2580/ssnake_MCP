@@ -1,0 +1,102 @@
+{
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
+  "maintainers": ["bowenerchen"],
+  "name": "cipherhub-mcp",
+  "description": "Production-grade cryptography toolkit - 57 cryptographic operations, 55 exposed as MCP tools. Covers AES (CBC/GCM/CTR/XTS), ChaCha20-Poly1305, RSA, ECC, SM2/SM3/SM4/SM9, ZUC, ML-KEM, ML-DSA, hybrid KEX, X.509 certificates, and CMS/COSE/CBOR/ASN.1 structured messages. Interoperability verified with AWS KMS (70/70), Tencent Cloud KMS (39/39), and OpenSSL 3.6 (148/154).",
+  "type": "mcp_server",
+  "status": "stable",
+  "version": "1.13.2",
+  "tools": 55,
+  "prompts": 6,
+  "resources": 8,
+  "transport": ["http"],
+  "remote": {
+    "url": "https://tools.cipherhub.cloud/cipherhub/mcp",
+    "type": "streamable-http"
+  },
+  "keywords": [
+    "cryptography",
+    "aes",
+    "rsa",
+    "ecc",
+    "sm2",
+    "sm3",
+    "sm4",
+    "sm9",
+    "zuc",
+    "ml-kem",
+    "ml-dsa",
+    "post-quantum",
+    "hmac",
+    "hash",
+    "encryption",
+    "signature",
+    "key-exchange",
+    "x509",
+    "cms",
+    "cose",
+    "cbor",
+    "chinese-crypto",
+    "国密",
+    "kms",
+    "hsm",
+    "security"
+  ],
+  "categories": [
+    "security",
+    "cryptography",
+    "developer-tools"
+  ],
+  "features": {
+    "hash": {
+      "algorithms": ["SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SM3", "SHAKE128", "SHAKE256"]
+    },
+    "kdf": {
+      "algorithms": ["HKDF (RFC 5869)", "SM3-KDF (GB/T 32918)", "PBKDF2-SM3 (RFC 8018)"]
+    },
+    "symmetric": {
+      "algorithms": ["AES-128", "AES-256", "SM4", "ChaCha20-Poly1305", "ZUC-128"],
+      "modes": ["CBC", "GCM", "CTR", "XTS"]
+    },
+    "asymmetric": {
+      "algorithms": ["RSA-2048", "RSA-3072", "RSA-4096", "ECC-SECP256R1", "ECC-SECP384R1", "ECC-SECP521R1", "X25519", "Ed25519"]
+    },
+    "chinese-standards": {
+      "algorithms": ["SM2", "SM3", "SM4", "ZUC-128", "SM9 (GM/T 0044 identity-based)"]
+    },
+    "post-quantum": {
+      "algorithms": ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"],
+      "hybrid": ["X25519+ML-KEM-768"]
+    },
+    "certificates": {
+      "operations": ["X.509 parse (international + GM SM2 paths)", "CA chain verify"]
+    },
+    "structured-messages": {
+      "formats": ["CMS SignedData (RFC 5652 §5)", "CMS EnvelopedData (RFC 5652 §6, RFC 5083)", "COSE_Sign1 (RFC 9052/9053)", "CBOR (RFC 8949)", "ASN.1/DER (X.690)"]
+    },
+    "interoperability": {
+      "aws-kms": "70/70 passed",
+      "tencent-kms": "39/39 passed",
+      "openssl-3.6": "148/154 passed (6 skipped, 0 failed)"
+    }
+  },
+  "repository": {
+    "url": "https://github.com/bowenerchen/CipherHUB-MCP-Server",
+    "type": "git"
+  },
+  "homepage": "https://tools.cipherhub.cloud",
+  "author": {
+    "name": "Yang X. CHEN",
+    "url": "https://cipherhub.cloud"
+  },
+  "license": "MIT",
+  "links": {
+    "web-ui": "https://tools.cipherhub.cloud",
+    "server-card": "https://tools.cipherhub.cloud/cipherhub/mcp/server-card",
+    "ai-catalog": "https://cipherhub.cloud/.well-known/ai-catalog.json",
+    "agent-skills": "https://cipherhub.cloud/.well-known/agent-skills/index.json",
+    "openapi": "https://tools.cipherhub.cloud/.well-known/openapi.yaml",
+    "llms-txt": "https://tools.cipherhub.cloud/llms.txt",
+    "blog": "https://cipherhub.cloud"
+  }
+}

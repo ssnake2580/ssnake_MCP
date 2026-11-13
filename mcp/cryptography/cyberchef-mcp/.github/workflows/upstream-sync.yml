@@ -1,0 +1,615 @@
+name: Upstream Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Target CyberChef version (e.g., v10.19.5) - leave empty for latest'
+        required: false
+        type: string
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    # Only run if manually triggered OR if issue labeled with 'upstream-sync-approved'
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'upstream-sync-approved')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'npm'
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure ref-proj exists and is updated
+        id: update_ref
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          # Ensure ref-proj directory exists
+          mkdir -p ref-proj
+
+          # Clone or update upstream reference
+          if [ -d "ref-proj/CyberChef/.git" ]; then
+            echo "Updating existing ref-proj/CyberChef"
+            cd ref-proj/CyberChef
+            git fetch origin --tags
+            BEFORE_SHA=$(git rev-parse HEAD)
+
+            if [ -n "$TARGET_VERSION" ]; then
+              # Checkout specific version
+              git checkout "$TARGET_VERSION"
+              echo "Checked out $TARGET_VERSION"
+            else
+              # Pull latest master
+              git pull origin master
+            fi
+
+            AFTER_SHA=$(git rev-parse HEAD)
+            echo "before_sha=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+            echo "after_sha=$AFTER_SHA" >> "$GITHUB_OUTPUT"
+            cd ../..
+          else
+            echo "Cloning upstream to ref-proj/CyberChef"
+            cd ref-proj
+            git clone https://github.com/gchq/CyberChef.git
+            cd CyberChef
+
+            if [ -n "$TARGET_VERSION" ]; then
+              git checkout "$TARGET_VERSION"
+            fi
+
+            AFTER_SHA=$(git rev-parse HEAD)
+            echo "before_sha=initial" >> "$GITHUB_OUTPUT"
+            echo "after_sha=$AFTER_SHA" >> "$GITHUB_OUTPUT"
+            cd ../..
+          fi
+
+          # Get version info
+          cd ref-proj/CyberChef
+          UPSTREAM_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown")
+          UPSTREAM_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "unknown")
+          echo "tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+          cd ../..
+
+      - name: Create sync branch
+        env:
+          TARGET: ${{ steps.update_ref.outputs.tag }}
+        run: |
+          BRANCH_NAME="upstream-sync-${TARGET}"
+          git checkout -b "$BRANCH_NAME"
+          echo "branch=$BRANCH_NAME" >> "$GITHUB_ENV"
+
+      # Tree-wide change detection. The previous version compared only the flat basenames of
+      # src/core/operations/*.mjs, which is structurally incapable of a 10.x -> 11.x jump: that
+      # release also changes src/core/lib/, src/core/config/, the config generators and the
+      # upstream-owned files in src/node/. Measured against v11.4.0 from a v10.19.4 base:
+      # 449 files identical, 112 differing, 61 added upstream, 1 removed upstream.
+      #
+      # The removed one is instructive. Upstream deleted src/core/lib/ImageManipulation.mjs and
+      # refactored BlurImage/SharpenImage to use jimp directly. A sync that copies operations but
+      # not lib/ leaves an orphan; one that copies lib/ but not operations breaks the build. The
+      # tree has to move atomically, which is the whole reason for widening.
+      - name: Identify upstream changes
+        id: changes
+        run: |
+          set -eu
+          SRC="ref-proj/CyberChef"
+          [ -d "$SRC/src/core" ] || { echo "::error::reference checkout missing $SRC/src/core"; exit 1; }
+
+          # Generated artefacts. Both trees gitignore exactly these five paths, verified identical
+          # between our .gitignore and upstream's, so they are excluded rather than synced.
+          cat > /tmp/sync-excludes.txt <<'EXCLUDES'
+          src/core/config/modules/
+          src/core/config/OperationConfig.json
+          src/core/operations/index.mjs
+          src/core/lib/HTMLEntities.mjs
+          src/node/config/OperationConfig.json
+          src/node/index.mjs
+          EXCLUDES
+
+          is_excluded() {
+            while IFS= read -r ex; do
+              [ -n "$ex" ] || continue
+              case "$1" in "$ex"*) return 0 ;; esac
+            done < /tmp/sync-excludes.txt
+            return 1
+          }
+
+          added=0; modified=0; removed=0
+          # File names match what the report and PR-body steps below already read. Renaming the
+          # detection step's outputs without renaming its SEVEN consumers is exactly the kind of
+          # silent breakage this widening is meant to eliminate.
+          : > /tmp/new_ops.txt; : > /tmp/modified_ops.txt; : > /tmp/deleted_ops.txt
+
+          # src/core/** plus the six upstream-owned files in src/node/. Everything else in
+          # src/node/ is fork-owned (mcp-server, transports, streaming, recipe-*, worker*,
+          # errors, logger, retry, deprecation) and is never touched by a sync.
+          UPSTREAM_NODE="api.mjs apiUtils.mjs File.mjs NodeDish.mjs NodeRecipe.mjs repl.mjs"
+
+          while IFS= read -r rel; do
+            is_excluded "$rel" && continue
+            if [ ! -f "$rel" ]; then
+              echo "$rel" >> /tmp/new_ops.txt; added=$((added+1))
+            elif ! cmp -s "$SRC/$rel" "$rel"; then
+              echo "$rel" >> /tmp/modified_ops.txt; modified=$((modified+1))
+            fi
+          done <<EOF
+          $(cd "$SRC" && find src/core -type f | sort)
+          $(for f in $UPSTREAM_NODE; do [ -f "$SRC/src/node/$f" ] && echo "src/node/$f"; done)
+          EOF
+
+          # Removal scan covers the six upstream-owned src/node files as well as src/core. The
+          # mirror's `rsync --delete` handles src/core deletions itself, but those six are copied
+          # individually -- so if upstream drops one, nothing notices and a stale file lingers.
+          while IFS= read -r rel; do
+            is_excluded "$rel" && continue
+            [ -f "$SRC/$rel" ] || { echo "$rel" >> /tmp/deleted_ops.txt; removed=$((removed+1)); }
+          done <<EOF
+          $(find src/core -type f | sort)
+          $(for f in $UPSTREAM_NODE; do [ -f "src/node/$f" ] && echo "src/node/$f"; done)
+          EOF
+
+          {
+            echo "new_count=$added"
+            echo "modified_count=$modified"
+            echo "deleted_count=$removed"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$added" -gt 0 ] || [ "$modified" -gt 0 ] || [ "$removed" -gt 0 ]; then
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "added=$added modified=$modified removed=$removed"
+
+      - name: Mirror upstream files
+        if: steps.changes.outputs.needs_sync == 'true'
+        id: sync
+        run: |
+          set -eu
+          SRC="ref-proj/CyberChef"
+
+          # rsync rather than a copy loop: it handles additions, modifications and DELETIONS in
+          # one atomic pass. Deletions are what the old per-file loop could not express, and a
+          # partially-applied tree is the failure mode that orphans a library or breaks a build.
+          rsync -a --delete \
+            --exclude='config/modules/' \
+            --exclude='config/OperationConfig.json' \
+            --exclude='operations/index.mjs' \
+            "$SRC/src/core/" src/core/
+
+          for f in api.mjs apiUtils.mjs File.mjs NodeDish.mjs NodeRecipe.mjs repl.mjs; do
+            if [ -f "$SRC/src/node/$f" ]; then
+              cp "$SRC/src/node/$f" "src/node/$f"
+            elif [ -f "src/node/$f" ]; then
+              # Upstream removed it. Deleting is the point of mirroring rather than copying.
+              rm -f "src/node/$f"
+            fi
+          done
+
+          # `synced_files` is read by the sync report and the job summary. It used to come from
+          # the per-file copy loop, so the mirror has to supply it explicitly.
+          synced=$(( $(wc -l < /tmp/new_ops.txt) + $(wc -l < /tmp/modified_ops.txt) ))
+          echo "synced_files=$synced" >> "$GITHUB_OUTPUT"
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "mirrored src/core/** and the six upstream-owned src/node files"
+
+      # Re-apply this fork's deliberate changes to upstream-owned files. See patches/fork/README.md.
+      #
+      # FAILING HERE IS CORRECT. A patch that no longer applies means upstream changed the code it
+      # touches, and a human must decide whether the fix is still needed. The alternative -- fuzzing
+      # a patch through, or skipping it -- is exactly how a ReDoS mitigation silently vanished from
+      # this repository for four releases without a single test going red.
+      - name: Re-apply fork patches
+        if: steps.changes.outputs.needs_sync == 'true'
+        run: |
+          set -eu
+          applied=0
+          if [ ! -d patches/fork ]; then
+            echo "::error::patches/fork is missing; refusing to sync without the fork patch set"
+            exit 1
+          fi
+          for p in patches/fork/*.patch; do
+            [ -e "$p" ] || continue
+            echo "applying $p"
+            if ! patch -p1 --forward --no-backup-if-mismatch < "$p"; then
+              echo "::error::fork patch failed to apply: $p"
+              echo "::error::Upstream changed the code this patch touches. Do NOT force it through."
+              echo "::error::Read patches/fork/README.md -> 'When a patch fails during a sync'."
+              exit 1
+            fi
+            applied=$((applied + 1))
+          done
+          echo "applied $applied fork patch(es)"
+          if [ "$applied" -eq 0 ]; then
+            echo "::warning::no fork patches were applied -- expected at least one"
+          fi
+
+      # Allowlist, not a denylist. The previous version enumerated forbidden paths (src/web/,
+      # tests/browser/, nightwatch.json, ...), which only catches the specific mistakes someone
+      # thought of. Now anything outside the sync's declared scope fails the run, so a future
+      # widening of the mirror cannot quietly pull in a directory nobody considered.
+      - name: Verify the sync stayed in scope
+        if: steps.changes.outputs.needs_sync == 'true'
+        run: |
+          set -eu
+          UNEXPECTED=""
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            case "$file" in
+              src/core/*) ;;
+              src/node/api.mjs|src/node/apiUtils.mjs|src/node/File.mjs) ;;
+              src/node/NodeDish.mjs|src/node/NodeRecipe.mjs|src/node/repl.mjs) ;;
+              tests/mcp/baseline.json) ;;
+              *) UNEXPECTED="$UNEXPECTED$file
+          " ;;
+            esac
+          done <<EOF
+          $(git diff --name-only HEAD)
+          EOF
+
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::sync touched files outside its declared scope:"
+            printf '%s' "$UNEXPECTED" | sed 's/^/  /'
+            echo "::error::Either the mirror is too broad, or these paths belong in the allowlist."
+            exit 1
+          fi
+
+          # The web app was removed from this fork in v1.7.1 and must never return via a sync.
+          for forbidden in src/web tests/browser nightwatch.json postcss.config.js .devcontainer; do
+            if git diff --name-only HEAD | grep -q "^$forbidden"; then
+              echo "::error::sync reintroduced $forbidden, which this fork does not carry"
+              exit 1
+            fi
+          done
+          echo "sync stayed within scope"
+
+
+      - name: Install dependencies
+        if: steps.changes.outputs.needs_sync == 'true'
+        run: npm install
+
+      - name: Apply SlowBuffer compatibility patches
+        if: steps.changes.outputs.needs_sync == 'true'
+        run: |
+          # Apply SlowBuffer patches (removed from Node; needed on every supported version)
+          if [ -f "node_modules/avsc/lib/types.js" ]; then
+            sed -i 's/new SlowBuffer/Buffer.alloc/g' node_modules/avsc/lib/types.js
+            echo "Applied avsc patch"
+          fi
+
+          if [ -f "node_modules/buffer-equal-constant-time/index.js" ]; then
+            sed -i 's/SlowBuffer/Buffer/g' node_modules/buffer-equal-constant-time/index.js
+            echo "Applied buffer-equal-constant-time patch"
+          fi
+
+      - name: Regenerate OperationConfig
+        if: steps.changes.outputs.needs_sync == 'true'
+        run: |
+          npx grunt configTests
+          echo "OperationConfig.json regenerated"
+
+          # Show stats
+          OPERATION_COUNT=$(node -p "Object.keys(require('./src/core/config/OperationConfig.json')).length")
+          echo "Total operations: $OPERATION_COUNT"
+          echo "operation_count=$OPERATION_COUNT" >> "$GITHUB_ENV"
+
+      # HARD FAIL, unlike the test step below, and deliberately so.
+      #
+      # Everything else here records pass/fail into an output and lets the sync PR be opened for a
+      # human to review. That is right for a broken test -- a reviewer can see it. It is wrong for
+      # concealed metadata, because the review IS a diff review and a Unicode TAG-block sequence
+      # renders as nothing in a diff: the reviewer cannot see the thing they would have to catch.
+      #
+      # `src/core/**` is mirrored from upstream verbatim, so this is the one point between an
+      # upstream commit and text a model reads as instruction where a machine can look.
+      - name: Tool metadata integrity (blocking)
+        if: steps.changes.outputs.needs_sync == 'true'
+        run: npx vitest run tests/mcp/metadata-integrity.test.mjs
+
+      - name: Run tests
+        if: steps.changes.outputs.needs_sync == 'true'
+        id: tests
+        run: |
+          # Run core tests
+          if npm test; then
+            echo "core_passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "core_passed=false" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Core tests failed"
+          fi
+
+          # Run MCP validation tests
+          if npm run test:mcp; then
+            echo "mcp_passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mcp_passed=false" >> "$GITHUB_OUTPUT"
+            echo "WARNING: MCP tests failed"
+          fi
+
+      - name: Run lint
+        if: steps.changes.outputs.needs_sync == 'true'
+        id: lint
+        run: |
+          if npm run lint; then
+            echo "lint_passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "lint_passed=false" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Lint failed"
+          fi
+
+      - name: Update baseline
+        if: steps.changes.outputs.needs_sync == 'true' && steps.tests.outputs.mcp_passed == 'true'
+        run: |
+          # Regenerate baseline with new tool inventory
+          node --input-type=module << 'EOF'
+          import OperationConfig from './src/core/config/OperationConfig.json' with { type: 'json' };
+          import { writeFileSync } from 'fs';
+
+          function sanitizeToolName(name) {
+              if (!name) return null;
+              const sanitized = 'cyberchef_' + name.toLowerCase()
+                  .replace(/[^a-z0-9_]/g, '_')
+                  .replace(/_+/g, '_')
+                  .replace(/^_|_$/g, '');
+              if (sanitized === 'cyberchef_') return null;
+              return sanitized;
+          }
+
+          // No `version` field. This snapshot records the TOOL INVENTORY, and nothing reads a
+          // version from it -- carrying one only created a second place the product version had to
+          // be bumped, silently disagreeing with package.json whenever it was not.
+          //
+          // tool_count is 504 operations + 2 meta-tools = 506, NOT the 524 that `tools/list`
+          // returns. The difference is the 18 fork-owned subsystem tools (recipe management,
+          // batch, telemetry, cache, quota, worker stats, deprecation stats, migration preview).
+          // They are deliberately excluded: this baseline is a DRIFT GUARD FOR THE UPSTREAM SYNC,
+          // so including tools we add ourselves would make it fire on our own releases -- noise on
+          // exactly the axis it exists to keep quiet.
+          const baseline = {
+              timestamp: new Date().toISOString(),
+              tool_count: Object.keys(OperationConfig).length + 2,
+              tools: {
+                  cyberchef_bake: { type: 'meta', description: 'Execute a CyberChef recipe' },
+                  cyberchef_search: { type: 'meta', description: 'Search for available CyberChef operations' }
+              }
+          };
+
+          Object.keys(OperationConfig).forEach(opName => {
+              const op = OperationConfig[opName];
+              const toolName = sanitizeToolName(opName);
+              if (toolName) {
+                  baseline.tools[toolName] = {
+                      operation: opName,
+                      description: op.description || '',
+                      args_count: op.args ? op.args.length : 0,
+                      arg_types: op.args ? op.args.map(a => a.type) : []
+                  };
+              }
+          });
+
+          writeFileSync('./tests/mcp/baseline.json', JSON.stringify(baseline, null, 2), 'utf-8');
+          console.log('Baseline updated:', baseline.tool_count, 'tools');
+          EOF
+
+      - name: Generate sync report
+        if: steps.changes.outputs.needs_sync == 'true'
+        run: |
+          # Generate detailed sync report
+          cat > /tmp/sync_report.md << 'EOF'
+          ## Sync Report
+
+          ### Files Changed
+          - New operations: ${{ steps.changes.outputs.new_count }}
+          - Modified operations: ${{ steps.changes.outputs.modified_count }}
+          - Deleted operations: ${{ steps.changes.outputs.deleted_count }}
+          - Total synced files: ${{ steps.sync.outputs.synced_files }}
+
+          ### New Operations
+          ```
+          EOF
+          # shellcheck disable=SC2129  # These redirects interleave heredocs with `cat` of
+          # generated files to assemble one report. Collapsing them into a single
+          # `{ ... } >> file` would mean restructuring heredoc blocks for a style point, with no
+          # behaviour change and real risk of altering the report. Left as-is deliberately.
+          cat /tmp/new_ops.txt >> /tmp/sync_report.md
+          cat >> /tmp/sync_report.md << 'EOF'
+          ```
+
+          ### Modified Operations
+          ```
+          EOF
+          cat /tmp/modified_ops.txt >> /tmp/sync_report.md
+          cat >> /tmp/sync_report.md << 'EOF'
+          ```
+
+          ### Deleted Operations (Kept in MCP)
+          ```
+          EOF
+          cat /tmp/deleted_ops.txt >> /tmp/sync_report.md
+          echo '```' >> /tmp/sync_report.md
+
+      - name: Commit changes
+        if: steps.changes.outputs.needs_sync == 'true'
+        env:
+          TARGET: ${{ steps.update_ref.outputs.tag }}
+          NEW_COUNT: ${{ steps.changes.outputs.new_count }}
+          MODIFIED_COUNT: ${{ steps.changes.outputs.modified_count }}
+          DELETED_COUNT: ${{ steps.changes.outputs.deleted_count }}
+        run: |
+          # The full mirrored scope, not just operations/. Staging only operations/ would
+          # commit an inconsistent tree -- new operations without the lib/ code they import,
+          # and without upstream's deletions.
+          git add -A src/core/
+          for f in api.mjs apiUtils.mjs File.mjs NodeDish.mjs NodeRecipe.mjs repl.mjs; do
+            git add "src/node/$f" 2>/dev/null || true
+          done
+          # OperationConfig.json is deliberately NOT staged. It is generated by
+          # `npx grunt configTests` from the operations this sync just mirrored, so committing it
+          # adds a derived 1.7MB artefact whose diff nobody can review and which goes stale the
+          # moment an operation changes. It was previously force-added here, which is how a
+          # gitignored path ended up tracked. Every CI job, the Dockerfile and the documented
+          # local setup regenerate it.
+          git add tests/mcp/baseline.json
+
+          COMMIT_MSG="chore(upstream): selective sync from CyberChef $TARGET
+
+          * Synced $NEW_COUNT new operations
+          * Updated $MODIFIED_COUNT modified operations
+          * Noted $DELETED_COUNT deleted operations (kept in MCP)
+          * Regenerated OperationConfig.json ($operation_count operations)
+          * Updated baseline.json
+          * Applied SlowBuffer compatibility patches
+
+          Sync method: Selective file copying (preserves MCP modifications)
+
+          Generated with upstream-sync workflow"
+
+          git commit -m "$COMMIT_MSG" || echo "No changes to commit"
+
+      - name: Push branch
+        if: steps.changes.outputs.needs_sync == 'true'
+        env:
+          BRANCH: ${{ env.branch }}
+        run: |
+          git push origin "$BRANCH" --force
+
+      - name: Create Pull Request
+        if: steps.changes.outputs.needs_sync == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.update_ref.outputs.tag }}
+          NEW_COUNT: ${{ steps.changes.outputs.new_count }}
+          MODIFIED_COUNT: ${{ steps.changes.outputs.modified_count }}
+          DELETED_COUNT: ${{ steps.changes.outputs.deleted_count }}
+          CORE_TEST: ${{ steps.tests.outputs.core_passed }}
+          MCP_TEST: ${{ steps.tests.outputs.mcp_passed }}
+          LINT: ${{ steps.lint.outputs.lint_passed }}
+        run: |
+          # Read sync report
+          SYNC_REPORT=$(cat /tmp/sync_report.md)
+
+          # Determine test status
+          if [ "$CORE_TEST" == "true" ] && [ "$MCP_TEST" == "true" ] && [ "$LINT" == "true" ]; then
+            TEST_STATUS="✅ All tests and linting passed"
+          else
+            TEST_STATUS="⚠️ **WARNING:** Some checks failed\n"
+            [ "$CORE_TEST" != "true" ] && TEST_STATUS="${TEST_STATUS}- Core tests: FAILED\n"
+            [ "$MCP_TEST" != "true" ] && TEST_STATUS="${TEST_STATUS}- MCP tests: FAILED\n"
+            [ "$LINT" != "true" ] && TEST_STATUS="${TEST_STATUS}- Lint: FAILED\n"
+          fi
+
+          PR_BODY="## Upstream Sync: $TARGET
+
+          This PR synchronizes operations with upstream CyberChef release $TARGET using **selective file syncing**.
+
+          ### Sync Method
+
+          ✅ **Selective File Sync** (NOT full merge)
+          - Only syncs \`src/core/operations/\` files
+          - Preserves MCP-specific modifications
+          - Excludes \`src/web/\`, \`tests/browser/\`, and other removed files
+          - Maintains package.json, Gruntfile.js, and MCP workflows
+
+          ### Changes Summary
+
+          - **New Operations**: $NEW_COUNT
+          - **Modified Operations**: $MODIFIED_COUNT
+          - **Deleted Operations**: $DELETED_COUNT (kept in MCP)
+          - **Total Operations**: $operation_count
+
+          $SYNC_REPORT
+
+          ### Test Results
+
+          $TEST_STATUS
+
+          ### Verification Checklist
+
+          - [x] Only operation files synced
+          - [x] No excluded files (src/web/, tests/browser/, etc.)
+          - [x] MCP-specific files preserved
+          - [x] OperationConfig.json regenerated
+          - [x] Baseline.json updated
+          - [ ] Review upstream changelog for breaking changes
+          - [ ] Manual testing of new/modified operations
+          - [ ] Update CHANGELOG.md if needed
+          - [ ] Update version in package.json if needed
+
+          ### Rollback
+
+          If issues are found, use the rollback workflow:
+          \`\`\`bash
+          gh workflow run rollback.yml -f reason=\"Issues with $TARGET sync\"
+          \`\`\`
+
+          ---
+          Generated automatically by upstream-sync workflow (selective sync mode)"
+
+          gh pr create \
+            --title "chore(upstream): selective sync with CyberChef $TARGET" \
+            --label "upstream-sync,automated" \
+            --body "$PR_BODY" || echo "PR already exists"
+
+      - name: No changes needed
+        if: steps.changes.outputs.needs_sync != 'true'
+        run: |
+          echo "No synchronization needed - all operations are up-to-date"
+          {
+            echo "### Sync Status: Up-to-date"
+            echo ""
+            echo "All operation files match upstream."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        if: always()
+        env:
+          TARGET: ${{ steps.update_ref.outputs.tag }}
+          BRANCH: ${{ env.branch }}
+          NEEDS_SYNC: ${{ steps.changes.outputs.needs_sync }}
+          NEW_COUNT: ${{ steps.changes.outputs.new_count }}
+          MODIFIED_COUNT: ${{ steps.changes.outputs.modified_count }}
+          SYNCED_FILES: ${{ steps.sync.outputs.synced_files }}
+        run: |
+          {
+            echo "### Upstream Sync Summary"
+            echo ""
+            echo "- **Target Version:** $TARGET"
+            echo "- **Sync Method:** Selective file copying"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$NEEDS_SYNC" == "true" ]; then
+            {
+              echo "#### Changes"
+              echo "- New operations: $NEW_COUNT"
+              echo "- Modified operations: $MODIFIED_COUNT"
+              echo "- Files synced: $SYNCED_FILES"
+              echo ""
+              echo "- **Branch:** $BRANCH"
+              echo "- **Result:** Pull request created"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Result:** No changes needed" >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.bowenerchen/cipherhub",
+  "title": "CipherHUB Cryptography Toolkit",
+  "description": "Production cryptography toolkit: hashing, encryption, signatures, PQC, X.509, CMS and COSE.",
+  "version": "1.13.2",
+  "websiteUrl": "https://tools.cipherhub.cloud",
+  "repository": {
+    "url": "https://github.com/bowenerchen/CipherHUB-MCP-Server",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://tools.cipherhub.cloud/cipherhub/mcp"
+    }
+  ]
+}

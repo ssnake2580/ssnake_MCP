@@ -1,0 +1,9 @@
+{
+  "name": "cipherhub-crypto",
+  "description": "Cryptography toolkit skill over the hosted CipherHUB MCP service — hashing, HMAC, symmetric and public-key crypto, SM2/SM9, ML-KEM/ML-DSA, certificates, CMS and COSE, CBOR and ASN.1",
+  "author": {
+    "name": "Yang X. CHEN"
+  },
+  "homepage": "https://cipherhub.cloud",
+  "repository": "https://github.com/bowenerchen/CipherHUB-MCP-Server"
+}

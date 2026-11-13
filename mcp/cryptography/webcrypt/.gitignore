@@ -1,0 +1,20 @@
+/node_modules
+/coverage
+/.vscode
+/dist
+.state-graph-mcp
+
+# vision-memory-mcp local database
+.vision-memory-mcp/
+.env
+.state-memory-mcp
+
+/plans
+
+.env*.local
+.idea/
+*.log
+*.tgz
+*.tsbuildinfo
+.DS_Store
+npm-debug.log*

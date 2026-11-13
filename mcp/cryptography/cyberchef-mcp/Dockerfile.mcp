@@ -1,0 +1,235 @@
+# =============================================================================
+# CyberChef MCP Server - Hardened Docker Image
+# =============================================================================
+# Security Features:
+# - Distroless Chainguard base image (zero CVEs, minimal attack surface)
+# - Multi-stage build (dev for building, distroless for runtime)
+# - Non-root user execution (UID 65532 'nonroot')
+# - Read-only filesystem compatible
+# - No shell, package manager, or unnecessary tools in runtime
+# - Wolfi-based OS with daily security updates
+# - SLSA Build Level 3 provenance
+#
+# Base Image: Chainguard Node.js (cgr.dev/chainguard/node)
+# - Zero known CVEs (as of build time)
+# - 70% smaller layer data vs traditional images
+# - 7-day SLA for critical CVE patches
+# - FIPS-validated cryptography available
+#
+# Alternative: Docker Hardened Images (DHI) for Node.js 22 are available via
+# Docker Hub subscription for enterprise deployments requiring Docker-native
+# hardening. See: https://docs.docker.com/dhi/about/what/
+#
+# References:
+# - Chainguard Images: https://edu.chainguard.dev/chainguard/chainguard-images/
+# - Node.js Migration: https://edu.chainguard.dev/chainguard/migration/migrating-node/
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1: Build Stage (using -dev variant with shell and build tools)
+# -----------------------------------------------------------------------------
+# Pinned by digest, not by the floating tag. Two independent reasons, both load-bearing:
+#
+#   * Reproducibility. Chainguard's public catalog publishes only `latest` and `latest-dev`, so a
+#     version tag is not available and the digest is the only stable handle. Chainguard does not
+#     delete images, so an old digest keeps pulling, and pinning is what Chainguard themselves
+#     recommend for public-tier users.
+#   * Version drift. `latest` silently follows Node MAJORS. Once it moves to Node 27 an unpinned
+#     build would violate `engines: ">=24 <27"` with no diff to show for it.
+#
+# The staleness risk that normally argues for a floating tag is covered by the `docker` ecosystem
+# in `.github/dependabot.yml`, which bumps these weekly.
+#
+# The `:tag@sha256:` form is deliberate over a bare `@sha256:` -- it records which tag the digest
+# came from, which is otherwise unrecoverable from the file.
+# cgr.dev/chainguard/node:latest-dev -- Node v26.12.1, digest resolved 2026-10-26
+FROM cgr.dev/chainguard/node:latest-dev@sha256:56fb738564e8423e1d3268cfb300200f306cfb2eecc38867a453713c7aa0ff0e AS builder
+
+# Run as root for build operations (Chainguard -dev includes root user)
+USER root
+
+WORKDIR /app
+
+# Copy package files first for better layer caching
+COPY package.json package-lock.json ./
+
+# Install dependencies without running postinstall (which needs Gruntfile)
+# Using --ignore-scripts to prevent arbitrary code execution during install
+RUN npm ci --ignore-scripts
+
+# Copy all source files
+COPY . .
+
+# Apply patches for the removed `SlowBuffer` (not a "Node 22" concern -- it is removed on every
+# version this project supports, so the patch outlives any particular one)
+# These packages use the deprecated SlowBuffer which was removed/changed in newer Node versions
+RUN sed -i 's/new SlowBuffer/Buffer.alloc/g' node_modules/avsc/lib/types.js && \
+    sed -i 's/SlowBuffer/Buffer/g' node_modules/buffer-equal-constant-time/index.js
+
+# Run postinstall scripts (fixes imports etc. defined in package.json)
+RUN npm run postinstall
+
+# Generate CyberChef configuration and Node index
+RUN npx grunt configTests
+
+# Drop everything the server does not need at run time.
+#
+# TWO STEPS, and the order matters: build artefacts first, then a real dependency prune. Both must
+# come AFTER `npm run postinstall` and `npx grunt configTests` above, which need the dev toolchain
+# and whose OUTPUT (the generated config and operation index) survives the prune.
+RUN rm -rf \
+    .git \
+    .github \
+    tests \
+    docs \
+    *.md \
+    Gruntfile.js \
+    babel.config.js \
+    eslint.config.mjs \
+    nightwatch.conf.cjs \
+    webpack.config.js \
+    .eslintrc.json \
+    .babelrc 2>/dev/null || true
+
+# THE dependency prune. This replaces a hardcoded list of nine package globs that tried to remove
+# dev packages from a tree of 1190 -- and could not possibly keep pace with it.
+#
+# Measured on the v2.7.0 image before changing anything:
+#
+#     installed tree            1310 paths
+#     production-only            425 paths      -> 885 dev-only paths in the RUNTIME image
+#
+# including typescript (24 MB), @rolldown (19 MB), @octokit (18 MB),
+# @codecov/bundler-plugin-core (14 MB), @babel (14 MB) and lightningcss (10 MB). None of it is
+# reachable from the server; all of it was attack surface and a standing Trivy finding.
+#
+#     before   node_modules 589 MB, 1190 packages
+#     after    node_modules 345 MB,  432 packages        -244 MB, -41%
+#
+# `--ignore-scripts` for the same reason the install above uses it: a prune runs lifecycle scripts
+# for the packages it keeps, and nothing in a build stage should execute package code.
+#
+# This was called for in the v2.0.0 plan ("replace that list with npm prune --omit=dev") and never
+# landed; the list stayed, and the tree grew around it.
+RUN npm prune --omit=dev --ignore-scripts
+
+# -----------------------------------------------------------------------------
+# Stage 2: Runtime Stage (distroless, minimal attack surface)
+# -----------------------------------------------------------------------------
+# cgr.dev/chainguard/node:latest -- Node v26.12.1, digest resolved 2026-10-26.
+# Digest-pinned for the same two reasons as the builder stage above.
+FROM cgr.dev/chainguard/node:latest@sha256:939413e9b81609d6d7188037f76faf627566de86fa786f9a25baf6764a51b618
+
+# Security: Add metadata labels
+# Registry metadata. These are what a package page shows, so they are the first thing anyone reads
+# about this image -- and all three of the values below were wrong before v2.1.0:
+#   * the operation count said 463; upstream v11.4.0 has 504
+#   * the documentation URL pointed at docs/user_guide.md, which does not exist -- the file is
+#     docs/guides/user_guide.md, so the label linked to a 404
+#   * nothing described the tool surface, which is the single most surprising thing about the
+#     server: `tools/list` returns ~24 tools, not 524
+LABEL org.opencontainers.image.title="CyberChef MCP Server" \
+      org.opencontainers.image.description="MCP server exposing all 504 GCHQ CyberChef operations as AI tools. tools/list is a compact index (~24 tools); every operation is reachable via cyberchef_bake." \
+      org.opencontainers.image.vendor="DoubleGate" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.source="https://github.com/doublegate/CyberChef-MCP" \
+      org.opencontainers.image.url="https://github.com/doublegate/CyberChef-MCP" \
+      org.opencontainers.image.documentation="https://github.com/doublegate/CyberChef-MCP/blob/master/docs/guides/user_guide.md"
+
+# The MCP registry's ownership proof for an OCI package: it reads this annotation off the image
+# and requires it to equal `name` in server.json. Without it a registry publish is rejected, which
+# is why the server was absent from the registry until v3.4.0 -- measured, not assumed:
+# `registry.modelcontextprotocol.io/v0/servers?search=cyberchef` returned zero.
+#
+# Kept separate from the OCI block above because it is not an OCI predefined annotation and does
+# not mean the same kind of thing. `npm run check:server-json` asserts it against server.json and
+# package.json's `mcpName`, since three copies of one identifier is three chances to drift.
+LABEL io.modelcontextprotocol.server.name="io.github.doublegate/cyberchef-mcp"
+
+WORKDIR /app
+
+# Copy built application from builder stage
+# Chainguard's nonroot user (UID 65532) owns the files
+COPY --from=builder --chown=65532:65532 /app /app
+
+# Security: run as the unprivileged `nonroot` user, stated explicitly.
+#
+# The Chainguard runtime image already defaults to UID 65532, so this changes nothing at run
+# time -- but the builder stage above declares `USER root`, and a Dockerfile whose LAST `USER`
+# directive is `root` is indistinguishable from a genuinely root-running image to any reader or
+# scanner that does not model stage boundaries. Trivy DS-0002 flagged exactly that. Depending on
+# a base image's default for something this important was the weaker choice regardless.
+USER 65532:65532
+
+# Streamable HTTP transport (opt-in; stdio remains the default).
+#
+# Documentation only -- EXPOSE publishes nothing by itself, and the server does not listen at all
+# unless CYBERCHEF_TRANSPORT=http. It is here so `docker inspect` and registry UIs report the port
+# a reader would otherwise have to find in the source.
+#
+#   docker run --rm -i -p 3000:3000 \
+#     -e CYBERCHEF_TRANSPORT=http \
+#     -e CYBERCHEF_HTTP_HOST=0.0.0.0 \
+#     ghcr.io/doublegate/cyberchef-mcp_v2:latest
+#
+# CYBERCHEF_HTTP_HOST defaults to 127.0.0.1, which inside a container means "unreachable from the
+# host" -- 0.0.0.0 is required for a published port. When binding 0.0.0.0, set
+# CYBERCHEF_ALLOWED_HOSTS to the names clients use (e.g. "localhost:3000,127.0.0.1:3000") to turn
+# on DNS-rebinding protection; without it a browser page can be made to reach the server through a
+# rebound name.
+EXPOSE 3000
+
+# Security: Set TMPDIR to use /tmp (writable via tmpfs in read-only mode)
+ENV TMPDIR=/tmp
+
+# NO `--openssl-legacy-provider` HERE, DELIBERATELY. v2.1.0 set it, believing it fixed
+# `Generate all hashes`. It did not, and could not: this image has **no legacy provider module to
+# load**. A filesystem walk of the published v2.1.0 image finds no `*legacy*.so`, and Node prints
+#
+#     Unable to load legacy provider.
+#
+# on every start while `crypto.createHash("md4")` still throws `error:0308010C`. So the flag bought
+# a startup warning and nothing else, and three documents described a mitigation the shipped
+# artefact never carried -- the same shape as the SafeRegex incident.
+#
+# The dependency is removed instead of satisfied: `LM Hash` (the single operation that needed it)
+# now computes DES with node-forge in pure JavaScript. See patches/fork/06. Nothing in the suite
+# requires the legacy provider any more -- verified by running all 2,289 operation tests on a host
+# that also lacks it.
+
+# Health check for container orchestration
+# Note: MCP servers use stdio, so we check if node is responsive
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD node -e "process.exit(0)" || exit 1
+
+# =============================================================================
+# Read-Only Filesystem Usage (Security Hardening)
+# =============================================================================
+# This image is compatible with Docker's read-only filesystem mode for enhanced
+# security. To run with a read-only root filesystem:
+#
+#   docker run -i --rm --read-only \
+#     --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+#     ghcr.io/doublegate/cyberchef-mcp_v1:latest
+#
+# The tmpfs mount provides writable space for:
+# - Temporary files from compression operations (Gzip, Bzip2, etc.)
+# - Node.js runtime temporary files
+# - Operation intermediate results
+#
+# tmpfs flags:
+# - rw: Read-write (required for temp files)
+# - noexec: Prevent execution of files in /tmp (security)
+# - nosuid: Ignore setuid/setgid bits (security)
+# - size=100m: Limit tmpfs to 100MB (adjust based on operation needs)
+#
+# Benefits of read-only mode:
+# - Prevents container compromise from modifying system files
+# - Ensures container immutability
+# - Meets compliance requirements (PCI-DSS, SOC 2, FedRAMP)
+# - Reduces attack surface for container escape vulnerabilities
+# =============================================================================
+
+# Run the MCP server
+# Note: Chainguard distroless has "node" as ENTRYPOINT, so CMD is just the script path
+CMD ["src/node/mcp-server.mjs"]

@@ -1,0 +1,125 @@
+{
+  "name": "cipherhub",
+  "description": "Production-grade cryptography toolkit exposing 57 cryptographic operations through REST API and Web UI, 55 of them as MCP tools. Covers classical algorithms (AES CBC/GCM/CTR/XTS, ChaCha20-Poly1305, RSA, ECC, SHA-2, SHAKE), Chinese national standards (SM2, SM3, SM4, ZUC, SM9 identity-based cryptography), post-quantum cryptography (ML-KEM FIPS 203, ML-DSA FIPS 204, X25519+ML-KEM-768 hybrid KEX), X.509 certificate handling, and structured crypto messages (CMS, COSE, CBOR, ASN.1/DER). Interoperability verified against AWS KMS (70/70), Tencent Cloud KMS (39/39), and OpenSSL 3.6 (148/154).",
+  "version": "1.13.2",
+  "transport": {
+    "type": "streamable-http",
+    "url": "https://tools.cipherhub.cloud/cipherhub/mcp"
+  },
+  "capabilities": {
+    "tools": true,
+    "resources": true,
+    "prompts": true
+  },
+  "tools": {
+    "count": 55,
+    "categories": [
+      "hash",
+      "kdf",
+      "symmetric",
+      "rsa",
+      "ecc",
+      "sm2",
+      "sm9",
+      "pqc",
+      "x509",
+      "structured-data",
+      "cose",
+      "cms",
+      "utility"
+    ]
+  },
+  "prompts": {
+    "count": 6,
+    "items": [
+      "pqc_migration_assessment",
+      "algorithm_recommendation",
+      "e2e_encryption_flow",
+      "sign_verify_workflow",
+      "verify_key_pair",
+      "hybrid_kex_demo"
+    ]
+  },
+  "resources": [
+    {
+      "uri": "cipherhub://algorithms",
+      "name": "Supported Algorithms",
+      "description": "Complete catalog of all cryptographic algorithms supported by CipherHUB"
+    },
+    {
+      "uri": "cipherhub://tool-categories",
+      "name": "Tool Categories",
+      "description": "Mapping of all 55 MCP tools organized by category"
+    },
+    {
+      "uri": "cipherhub://mcp-usage-guide",
+      "name": "MCP Usage Guide",
+      "description": "Complete guide for AI agents using CipherHUB MCP tools"
+    },
+    {
+      "uri": "cipherhub://interop/aws-kms",
+      "name": "AWS KMS Interoperability Report",
+      "description": "CipherHUB vs AWS KMS interoperability verification (70/70 passed)"
+    },
+    {
+      "uri": "cipherhub://interop/tencent-kms",
+      "name": "Tencent Cloud KMS Interoperability Report",
+      "description": "CipherHUB vs Tencent Cloud KMS interoperability verification (39/39 passed)"
+    },
+    {
+      "uri": "cipherhub://interop/openssl36",
+      "name": "OpenSSL 3.6 Interoperability Report",
+      "description": "CipherHUB vs OpenSSL 3.6 interoperability verification (148/154 passed, 6 skipped, 0 failed)"
+    },
+    {
+      "uri": "cipherhub://benchmark-report",
+      "name": "Benchmark Report",
+      "description": "Performance benchmark data for all CipherHUB operations"
+    },
+    {
+      "uri": "cipherhub://channel-implementation",
+      "name": "SDK Channel Implementation Guide",
+      "description": "Complete Python reference implementation of the CipherHUB encrypted REST channel protocol"
+    }
+  ],
+  "author": {
+    "name": "Yang X. CHEN",
+    "url": "https://cipherhub.cloud"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bowenerchen/CipherHUB-MCP-Server"
+  },
+  "license": "MIT",
+  "keywords": [
+    "cryptography",
+    "mcp",
+    "aes",
+    "rsa",
+    "ecc",
+    "sm2",
+    "sm3",
+    "sm4",
+    "sm9",
+    "zuc",
+    "ml-kem",
+    "ml-dsa",
+    "post-quantum",
+    "x509",
+    "cms",
+    "cose",
+    "cbor",
+    "kms",
+    "hsm",
+    "security"
+  ],
+  "links": {
+    "web-ui": "https://tools.cipherhub.cloud",
+    "server-card": "https://tools.cipherhub.cloud/cipherhub/mcp/server-card",
+    "ai-catalog": "https://cipherhub.cloud/.well-known/ai-catalog.json",
+    "agent-skills": "https://cipherhub.cloud/.well-known/agent-skills/index.json",
+    "openapi": "https://tools.cipherhub.cloud/.well-known/openapi.yaml",
+    "llms-txt": "https://tools.cipherhub.cloud/llms.txt",
+    "blog": "https://cipherhub.cloud"
+  }
+}

@@ -1,0 +1,42 @@
+name: "CodeQL Analysis"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, 'release/**' ]
+  pull_request:
+    branches: [ master, 'release/**' ]
+    types: [synchronize, opened, reopened]
+  schedule:
+    - cron: '22 17 * * 5'
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript' ]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+        # One narrow query filter, documented in the file with the measurements behind it.
+        # src/core/** is still analysed; only js/incomplete-sanitization is excluded.
+        config-file: ./.github/codeql/codeql-config.yml
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:${{matrix.language}}"

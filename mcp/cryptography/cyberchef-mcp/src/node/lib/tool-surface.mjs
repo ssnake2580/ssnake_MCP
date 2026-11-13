@@ -1,0 +1,234 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Choosing which CyberChef operations appear as their own tool.
+ *
+ * THE PROBLEM THIS SOLVES
+ * ----------------------
+ * `tools/list` is sent to the model on every request, before the user has typed anything. With all
+ * 504 operations exposed it is roughly **86,000 tokens** -- measured, not estimated, on the
+ * serialised payload. For comparison, published guidance puts model tool-selection quality as
+ * degrading past about fifty tool definitions, and this server offers ten times that.
+ *
+ * That cost was HIDDEN until v2.1.0. Every `inputSchema` was an empty envelope, because
+ * `zod-to-json-schema` fails silently against Zod 4, so the payload measured ~52,000 tokens while
+ * describing nothing. Fixing the schemas made the tools usable and the true price visible at once.
+ *
+ * WHY CURATING COSTS NO CAPABILITY
+ * --------------------------------
+ * `cyberchef_bake` invokes ANY of the 504 operations by name, and `cyberchef_search` finds the
+ * name. So a smaller default surface removes nothing a caller can do -- it only stops pre-loading
+ * schemas for operations this session will never touch. That pairing is what makes the trade
+ * one-sided, and it is why the curated set below is small without being limiting.
+ *
+ * THE DEFAULT IS "index" -- see lib/tool-catalog.mjs for how the hierarchy works
+ * ------------------------------------------------------------------------------
+ * Measured on this server: `all` is 524 tools and ~86,000 tokens; `curated` is 99 tools and
+ * ~16,600 tokens. An 81% reduction, for no loss of reach.
+ *
+ * This IS a visible change: a client that hard-codes a tool name outside the curated set -- say
+ * `cyberchef_to_morse_code` -- will no longer find it in `tools/list`. Two ways back, both one
+ * line: set `CYBERCHEF_TOOL_SURFACE=all` to restore every tool, or call the operation through
+ * `cyberchef_bake`, which never stopped working. It is called out in the release notes rather
+ * than left to be discovered.
+ *
+ * @author DoubleGate
+ * @license GPL-3.0-or-later
+ */
+
+/**
+ * Operations exposed as individual tools in `curated` mode.
+ *
+ * Chosen for what an analyst or an agent actually reaches for first: the encodings and hashes that
+ * appear in nearly every workflow, the compression and crypto primitives, the extractors, and the
+ * detection operations that answer "what IS this?". Everything else stays one `cyberchef_bake`
+ * call away.
+ *
+ * Names are CyberChef operation names, matched exactly against OperationConfig.
+ */
+export const CURATED_OPERATIONS = [
+    // Detection and triage -- the first move on unknown data.
+    "Magic", "Detect File Type", "Entropy", "Frequency distribution",
+
+    // Encodings, both directions.
+    "To Base64", "From Base64", "To Hex", "From Hex", "To Decimal", "From Decimal",
+    "To Binary", "From Binary", "URL Encode", "URL Decode", "To Charcode", "From Charcode",
+    "To Base32", "From Base32", "To Base58", "From Base58", "To Base85", "From Base85",
+    "To Quoted Printable", "From Quoted Printable", "Escape Unicode Characters",
+
+    // Hashing and checksums.
+    "MD5", "SHA1", "SHA2", "SHA3", "Generate all hashes", "CRC-32 Checksum", "HMAC",
+    "Bcrypt", "Bcrypt Compare",
+
+    // Symmetric crypto and key derivation.
+    "AES Encrypt", "AES Decrypt", "DES Encrypt", "DES Decrypt",
+    "Triple DES Encrypt", "Triple DES Decrypt",
+    "Derive PBKDF2 key", "Derive EVP key", "XOR", "XOR Brute Force",
+
+    // Tokens and certificates.
+    "JWT Decode", "JWT Sign", "JWT Verify", "Parse X.509 certificate",
+
+    // Compression.
+    "Gzip", "Gunzip", "Zlib Deflate", "Zlib Inflate", "Raw Deflate", "Raw Inflate",
+    "Unzip", "Zip",
+
+    // Text, structure and extraction.
+    "Regular expression", "Find / Replace", "Extract URLs", "Extract IP addresses",
+    "Extract email addresses", "Extract domains", "Extract file paths", "Strings",
+    "JSON Beautify", "JSON Minify", "XML Beautify", "CSV to JSON", "JSON to CSV",
+    "Remove null bytes", "Take bytes", "Drop bytes",
+
+    // Classic ciphers people genuinely ask for by name.
+    "ROT13", "Atbash Cipher", "Vigenère Decode", "Vigenère Encode",
+
+    // Dates and numbers.
+    "From UNIX Timestamp", "To UNIX Timestamp", "Parse DateTime",
+    "Parse URI", "Parse User Agent"
+];
+
+/**
+ * Operations exposed as a tool in EVERY mode, including `index`.
+ *
+ * Exactly one, and the argument for it is specific rather than a matter of taste.
+ *
+ * `Magic` is the entry point to this whole server: given an unknown blob, brute-forcing candidate
+ * decodings is the correct first move, and it is what a model reaches for before it knows enough
+ * to navigate anywhere. Requiring `cyberchef_categories` -> `cyberchef_list_operations` ->
+ * `cyberchef_describe_operation` to reach the tool you need *in order to find out what you are
+ * looking at* inverts the cost: three round trips for the one operation whose entire purpose is to
+ * answer the first question.
+ *
+ * It is also cheap, though no longer "nearly free" -- a claim this comment made until v2.9.0 gave
+ * Magic's four arguments curated descriptions. Measured rather than estimated:
+ *
+ *     cyberchef_magic   1,354 B of a 20,289 B index   6.7%
+ *
+ * That buys a caller the two facts it cannot guess: what `crib` does, which is the most effective
+ * way to cut candidates when any of the plaintext is known, and what a sensible `depth` is. Paid
+ * on every `tools/list`, and judged worth it for the operation most likely to be called first --
+ * but it is a real cost, and the next entry added here should be measured the same way.
+ *
+ * The bar for adding a second entry here is high: it must be something a caller needs BEFORE it
+ * knows what it is dealing with. `Detect File Type` and `Entropy` are close, and are deliberately
+ * left out -- Magic already reports entropy and file-type candidates in its results, and both stay
+ * one `cyberchef_bake` call away.
+ */
+const ALWAYS_EXPOSED = new Set(["Magic"]);
+
+/** Membership lookup for the curated list, built once. */
+const CURATED_SET = new Set(CURATED_OPERATIONS);
+
+/**
+ * Read the configured surface mode.
+ *
+ * @returns {"index"|"curated"|"all"} The mode. Defaults to "index", and an unrecognised value
+ *   falls back to it rather than erroring -- a typo in an environment variable should not stop the
+ *   server from starting, and the startup log states which surface is actually in force.
+ */
+export function surfaceMode() {
+    // CYBERCHEF_EXPOSE_ALL_OPS was honoured here in both directions from v2.1.0 to v3.11.0,
+    // because the v2.0.0 planning documents named it as the way to expose every operation. It is
+    // REMOVED in v4.0.0: it was documented as a historical alias for three years, it is the kind
+    // of setting that is set once and forgotten, and a silent alias for the single most expensive
+    // configuration change this server has is worth being explicit about. Use
+    // CYBERCHEF_TOOL_SURFACE=all.
+    const mode = process.env.CYBERCHEF_TOOL_SURFACE;
+    return ["all", "curated", "index"].includes(mode) ? mode : "index";
+}
+
+/**
+ * The explicit allowlist, if one is configured.
+ *
+ * Takes precedence over the mode: someone who has named the operations they want has been more
+ * specific than someone who picked a preset, and silently unioning the two would give them tools
+ * they did not ask for.
+ *
+ * @returns {Set<string>|null} Operation names, or null when unset.
+ */
+export function configuredAllowlist() {
+    const raw = process.env.CYBERCHEF_TOOL_ALLOWLIST;
+    if (!raw) return null;
+    const names = raw.split(",").map(n => n.trim()).filter(Boolean);
+    return names.length ? new Set(names) : null;
+}
+
+/**
+ * Should this operation be exposed as its own tool?
+ *
+ * @param {string} opName - The CyberChef operation name.
+ * @returns {boolean} Whether to generate a tool for it.
+ */
+export function isExposed(opName) {
+    const allowlist = configuredAllowlist();
+    if (allowlist) return allowlist.has(opName);
+
+    const mode = surfaceMode();
+    if (mode === "all") return true;
+    if (ALWAYS_EXPOSED.has(opName)) return true;
+    if (mode === "index") return false;   // navigation tools only; nothing else is pre-loaded
+    return CURATED_SET.has(opName);
+}
+
+/**
+ * A warning for anyone still setting the variable v4.0.0 removed, or `null`.
+ *
+ * WHY THIS EXISTS. `CYBERCHEF_EXPOSE_ALL_OPS=true` used to mean "expose all 544 tools" and now
+ * means nothing, so a deployment that set it once and forgot drops from 544 tools to 41 with no
+ * explanation anywhere. That is the most visible behaviour change in this release, and silence is
+ * the worst way to deliver it: the caller sees a tool count collapse and has no thread to pull.
+ * Reviewer-found -- the removal was right, announcing it was missing.
+ *
+ * It REPORTS rather than restores. Honouring the variable again would undo the removal, and
+ * guessing what the operator meant is exactly what the silent alias did wrong.
+ *
+ * @returns {?string} The warning, or null when the variable is not set.
+ */
+export function removedAliasWarning() {
+    const legacy = process.env.CYBERCHEF_EXPOSE_ALL_OPS;
+    if (legacy === undefined) return null;
+    // The VALUE is caller-controlled, and it is going into a log line. Bounded and stripped of
+    // control characters -- including the newlines and escapes that let an attacker-supplied
+    // string forge a second log record -- because "it is only an environment variable" is the
+    // assumption behind every log-injection finding. Reviewer-found.
+    //
+    // Only the shape matters to the reader anyway: the useful facts are that the variable is set
+    // and which surface is actually in force, not the 4 KB somebody put in it.
+    const shown = String(legacy).replace(/[^\x20-\x7e]/g, "?").slice(0, 40);
+    const elided = String(legacy).length > 40 ? "... (truncated)" : "";
+    return `CYBERCHEF_EXPOSE_ALL_OPS=${shown}${elided} is set and is IGNORED: it was removed in ` +
+        `v4.0.0. The tool surface is "${surfaceMode()}" -- set ` +
+        "CYBERCHEF_TOOL_SURFACE=all|curated|index to choose one explicitly.";
+}
+
+/**
+ * A one-line summary of the active surface, for the startup log.
+ *
+ * Logged rather than left implicit because "why can the model not see this tool" is otherwise a
+ * confusing question to debug from the client side.
+ *
+ * @param {number} exposed - How many operation tools were generated.
+ * @param {number} total - How many operations exist.
+ * @returns {string} Human-readable description.
+ */
+export function describeSurface(exposed, total) {
+    if (configuredAllowlist()) {
+        return `tool surface: allowlist (${exposed}/${total} operations, CYBERCHEF_TOOL_ALLOWLIST)`;
+    }
+    const mode = surfaceMode();
+    if (mode === "index") {
+        return `tool surface: index (${exposed}/${total} operations pre-loaded; browse with ` +
+            "cyberchef_categories -> cyberchef_list_operations -> cyberchef_describe_operation, " +
+            "run anything with cyberchef_bake. CYBERCHEF_TOOL_SURFACE=curated|all to pre-load)";
+    }
+    if (mode === "curated") {
+        return `tool surface: curated (${exposed}/${total} operations; the rest remain reachable ` +
+            "via cyberchef_bake -- set CYBERCHEF_TOOL_SURFACE=all to expose every one as a tool)";
+    }
+    // BYTES, not tokens. This line read "~86k tokens per tools/list" from the release that
+    // introduced the index until v3.8.0, and was wrong in both dimensions: no tokenizer has
+    // ever been in this repository, so the figure was bytes/4 wearing a token label -- and
+    // the payload has since grown to 426,706 bytes (~107k under that same convention), so
+    // even the disguised number had drifted by a fifth. Re-measure with
+    // `npm run measure:surfaces` rather than editing this by eye.
+    return `tool surface: all (${exposed}/${total} operations; ~416 KB per tools/list)`;
+}

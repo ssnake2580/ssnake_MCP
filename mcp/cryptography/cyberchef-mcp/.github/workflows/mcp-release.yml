@@ -1,0 +1,494 @@
+name: "Publish MCP Server Image"
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+    - 'v*'
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  DOCKERHUB_REGISTRY: docker.io
+  # The GHCR package name is MAJOR-VERSIONED and is derived from the tag, in the
+  # "Resolve the GHCR package name" step below -- it is not fixed here.
+  #
+  # `_v1` is FROZEN from v2.0.0: its existing tags stay pullable, and the v1.9.x maintenance
+  # branch keeps publishing security-only patches there until ~Mar 2027, under Apache-2.0. v2.x
+  # publishes to `_v2`, which is GPL-3.0-or-later. Hard-coding `_v1` here would have pushed the
+  # relicensed, breaking-change v2.0.0 image into the package promising the opposite of both.
+  # Docker Hub image name (assumes username/repo format - update with your Docker Hub namespace)
+  # Example: if your Docker Hub username is 'myusername', this becomes 'myusername/cyberchef-mcp'
+  DOCKERHUB_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/cyberchef-mcp
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    # BOUNDED after v3.9.0 hung twice at "Build and push", 33 minutes each with no image pushed,
+    # against a 378-second median across v3.4.0-v3.8.0. With no timeout the job would burn the 6h
+    # default before anyone learned anything. 45 minutes is ~7x the median: generous for a bad day,
+    # decisive for a hang.
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      packages: write
+      security-events: write
+      attestations: write  # Required for attestation generation
+      id-token: write      # Required for OIDC token generation (attestation signing)
+
+    steps:
+      - name: Configure git
+        run: git config --global init.defaultBranch master
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # QEMU, for the arm64 leg of the multi-platform build below.
+      #
+      # Measured before choosing this over a native-runner matrix: the arm64 image builds in
+      # **4m46s** under emulation, against ~4m30s native for amd64. That was a surprise -- the
+      # expectation was 30-60 minutes -- and the reason is the dependency prune in Dockerfile.mcp:
+      # the production tree is pure JavaScript and WebAssembly, so almost nothing is COMPILED under
+      # emulation. Nearly all the time is npm's I/O, which QEMU barely taxes.
+      #
+      # At that cost the matrix is not worth its complexity. A matrix would mean building each
+      # architecture on its own runner, pushing by digest, and merging a manifest list -- three
+      # jobs and a digest hand-off, in place of one job that already builds, scans, releases and
+      # publishes to npm in sequence. Rewriting a working release path to save ~5 minutes on a
+      # tag-triggered workflow is a poor trade.
+      #
+      # Revisit if the build slows materially: the matrix is the right answer at 30 minutes, and
+      # the deciding number is in this comment so a future reader can re-measure rather than guess.
+      - name: Set up QEMU for multi-platform builds
+        # PINNED TO v3 DELIBERATELY. v4 hangs this multi-arch build. Measured, not suspected:
+        #
+        #   setup-qemu-action@v3   build  378s   success   (v3.8.0)
+        #   setup-qemu-action@v4   build 1979s   HUNG      (v3.9.0, twice, no image pushed)
+        #   setup-qemu-action@v3   build  399s   success   (v3.9.0, same commit content)
+        #
+        # Same Dockerfile, same lockfile, same runner pool; the only difference between hanging
+        # indefinitely and finishing in 6.5 minutes is this action's major version.
+        #
+        # THE TRAP, worth stating because it cost two wasted runs: the v4 STEP ITSELF SUCCEEDS, in
+        # 8 seconds. Installing binfmt handlers works; whether the resulting emulation works is not
+        # something the step measures. A green setup step and a working emulator are different
+        # claims, and the first was read as evidence of the second.
+        #
+        # Three other hypotheses were tested and eliminated first: the v3.9.0 Dockerfile builds
+        # clean locally for amd64 (all ten stages, exit 0), and both pinned Chainguard digests are
+        # proper OCI indexes carrying linux/amd64 AND linux/arm64.
+        #
+        # The cost of staying on v3 is a deprecation warning -- "Node.js 20 is deprecated ... forced
+        # to run on Node.js 24" -- which is noise, against a release pipeline that does not work.
+        # Re-evaluate when docker/setup-qemu-action ships a v4 patch that fixes it; `.github/
+        # dependabot.yml` ignores >=4 with this reasoning so it cannot return silently on a Sunday.
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # =============================================================================
+      # Authentication: Log in to both GHCR and Docker Hub
+      # =============================================================================
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.DOCKERHUB_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # =============================================================================
+      # Metadata Extraction: Generate tags and labels for both registries
+      # =============================================================================
+      # =============================================================================
+      # GHCR package name: cyberchef-mcp_v<MAJOR>, derived from the tag being built
+      # =============================================================================
+      - name: Resolve the GHCR package name
+        id: ghcr-name
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          # workflow_dispatch has no tag, so fall back to the version the tree declares.
+          if [[ "$ref" =~ ^v([0-9]+)\. ]]; then
+            major="${BASH_REMATCH[1]}"
+          else
+            major="$(node -p "require('./package.json').version.split('.')[0]")"
+            echo "::notice::no v<major> tag on '$ref'; using package.json version major $major"
+          fi
+          case "$major" in
+            ''|*[!0-9]*) echo "::error::could not resolve a numeric major from '$ref'"; exit 1 ;;
+          esac
+          echo "name=${GITHUB_REPOSITORY_OWNER}/cyberchef-mcp_v${major}" >> "$GITHUB_OUTPUT"
+          echo "Publishing to GHCR package cyberchef-mcp_v${major}"
+
+      - name: Extract metadata for GHCR
+        id: meta-ghcr
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.GHCR_REGISTRY }}/${{ steps.ghcr-name.outputs.name }}
+          tags: |
+            type=semver,pattern={{major}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}}
+            type=sha
+
+      - name: Extract metadata for Docker Hub
+        id: meta-dockerhub
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{major}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # =============================================================================
+      # Build and Push: Single build, multi-registry push with attestations
+      # =============================================================================
+      # CRITICAL: Supply chain attestations for Docker Scout health score compliance
+      # Docker Hub health scores require BOTH provenance and SBOM attestations.
+      # These attestations account for 15 points out of 100 in the health score.
+      # Missing attestations can drop the score from A to C grade.
+      #
+      # Dual SBOM Strategy:
+      # 1. Docker attestation SBOM (below): Attached to image manifest for
+      #    Docker Scout health scores, `docker sbom` command, and registry verification
+      # 2. Trivy SBOM artifact (separate step): Downloadable CycloneDX file
+      #    for offline audits, compliance reports, and third-party tools
+      #
+      # References:
+      # - Docker Scout Policies: https://docs.docker.com/scout/policy/
+      # - Health Scores: https://docs.docker.com/scout/policy/scores/
+      # - GitHub Actions Attestations: https://docs.docker.com/build/ci/github-actions/attestations/
+      # =============================================================================
+      - name: Build and push Docker image to both registries
+        uses: docker/build-push-action@v7
+        # Plain progress so a hang is DIAGNOSABLE. With the default (auto/tty) mode the output is
+        # rewritten in place and a cancelled step flushes nothing -- both v3.9.0 hangs produced zero
+        # buildx lines, so there was no way to tell which stage or which platform was stuck.
+        env:
+          BUILDKIT_PROGRESS: plain
+        with:
+          context: .
+          file: Dockerfile.mcp
+          push: true
+          tags: |
+            ${{ steps.meta-ghcr.outputs.tags }}
+            ${{ steps.meta-dockerhub.outputs.tags }}
+          labels: ${{ steps.meta-ghcr.outputs.labels }}
+          # amd64 and arm64. arm64 covers Apple Silicon, AWS Graviton and Raspberry Pi 4/5, and
+          # was the single most-requested platform this image did not have.
+          #
+          # NOT linux/arm/v7, which the v2.8.0 plan asked for: the base image does not exist for it.
+          # `cgr.dev/chainguard/node` publishes linux/amd64 and linux/arm64 and nothing else, so a
+          # Raspberry Pi 3 cannot be served without changing base image entirely. Reported here
+          # rather than dropped silently.
+          platforms: linux/amd64,linux/arm64
+          # Supply chain attestations (CRITICAL for Docker Hub health score)
+          provenance: mode=max  # Max-level provenance for SLSA Build Level 3 compliance
+          sbom: true            # Generate and attach SBOM attestation (in-toto SPDX format)
+          # Note: Attestations are automatically pushed with the image to both registries
+
+      # =============================================================================
+      # Export: Create tarball for offline distribution
+      # =============================================================================
+      # Note: We pull from Docker Hub since that's the primary distribution channel.
+      #
+      # `--platform` is EXPLICIT now that the tag is a multi-platform manifest. Without it `docker
+      # pull` silently resolves to the runner's own architecture, and the release asset would be
+      # amd64 because the runner happens to be amd64 -- correct today, and a silent surprise the
+      # first time this workflow runs anywhere else. Saying it out loud makes the asset's contents
+      # a decision rather than an accident of scheduling.
+      #
+      # One tarball, amd64, deliberately: it exists for air-gapped installs, and a two-architecture
+      # archive would double a 200 MB asset for an audience that knows which machine it is feeding.
+      # arm64 users pull from the registry, where the manifest resolves for them automatically.
+      - name: Pull Docker image from Docker Hub for export
+        run: |
+          docker pull --platform linux/amd64 "$DOCKERHUB_REGISTRY/$DOCKERHUB_IMAGE_NAME:latest"
+
+      - name: Export Docker image as tarball
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          docker save "$DOCKERHUB_REGISTRY/$DOCKERHUB_IMAGE_NAME:latest" | gzip > "cyberchef-mcp-${TAG_NAME}-docker-image.tar.gz"
+          ls -lh cyberchef-mcp-*.tar.gz
+
+      # Prove the manifest carries BOTH architectures before the release is published.
+      #
+      # A multi-platform build that silently degrades to one platform still produces a working
+      # image, a green workflow and a published release -- the failure is invisible until an arm64
+      # user pulls it and gets "no matching manifest". This fails the release instead.
+      - name: Verify the published manifest is multi-platform
+        run: |
+          set -euo pipefail
+          PLATFORMS=$(docker buildx imagetools inspect \
+            "$DOCKERHUB_REGISTRY/$DOCKERHUB_IMAGE_NAME:latest" \
+            --format '{{range .Manifest.Manifests}}{{if ne .Platform.Architecture "unknown"}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}{{end}}')
+          echo "manifest platforms: $PLATFORMS"
+          for want in linux/amd64 linux/arm64; do
+            case "$PLATFORMS" in
+              *"$want"*) echo "  ok   $want" ;;
+              *) echo "  MISSING $want"; exit 1 ;;
+            esac
+          done
+
+      # =============================================================================
+      # Security: Generate SBOM and Vulnerability Scans
+      # =============================================================================
+      # Generate Software Bill of Materials (SBOM) - Part 2 of Dual Strategy
+      # This Trivy-generated SBOM complements the Docker attestation SBOM above
+      # Purpose: Provides CycloneDX format for:
+      # - Offline security audits (no registry access required)
+      # - Third-party SBOM analysis tools (Dependency-Track, Grype, etc.)
+      # - Compliance documentation (SOC 2, ISO 27001, NIST SSDF)
+      # - Manual verification and archival
+      - name: Generate SBOM with Trivy (CycloneDX artifact)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: '${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}:latest'
+          format: 'cyclonedx'
+          output: 'sbom.cyclonedx.json'
+          vuln-type: 'os,library'
+
+      # Security: Run vulnerability scan on release image (scanning Docker Hub image)
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: '${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}:latest'
+          format: 'sarif'
+          output: 'trivy-release-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          vuln-type: 'os,library'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: 'trivy-release-results.sarif'
+          category: 'trivy-release-scan'
+
+      # Create GitHub Release if it doesn't exist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          # A GitHub Release only makes sense for a TAG.
+          #
+          # This workflow also has a `workflow_dispatch` trigger, and a manual run happens on a
+          # BRANCH -- so `github.ref_name` is `master`, not `v2.1.0`. Without this guard the step
+          # would run `gh release create master --verify-tag`, which fails because no tag named
+          # `master` exists, and on a repository where one did it would publish a release named
+          # after a branch. The image push above is still useful on a manual run; this part is not.
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::notice::ref_type is '$REF_TYPE', not 'tag' -- skipping release creation."
+            exit 0
+          fi
+
+          # Check if release exists, create if not.
+          #
+          # The notes come from docs/releases/<tag>.md when that file exists. They used to be the
+          # single line "See CHANGELOG.md for details." -- which is not a link GitHub resolves on a
+          # release page, and which threw away notes the repository had already written: v2.0.0 and
+          # v2.1.0 both shipped with a one-line body while a 200-line release document sat in the
+          # tree. Prior releases had 154-449 line bodies, so this was a silent regression in the
+          # release ceremony rather than a deliberate choice.
+          #
+          # Falling back rather than failing: a hotfix tag cut without a release document should
+          # still publish, and the fallback now points at a URL that actually resolves.
+          NOTES_FILE="docs/releases/${TAG_NAME}.md"
+          if ! gh release view "$TAG_NAME" &>/dev/null; then
+            echo "Creating release for $TAG_NAME"
+            if [ -f "$NOTES_FILE" ]; then
+              echo "Using release notes from $NOTES_FILE"
+
+              # Rewrite RELATIVE links to absolute, pinned to this tag.
+              #
+              # A release body is rendered on the Releases page, not inside the tree, so a
+              # `[text](../security/foo.md)` link 404s for every reader of the release -- which is
+              # the audience the file exists for. v2.0.0 shipped with 8 such links and v2.1.0 with
+              # 3, all broken, and v2.1.1's were caught only because a reviewer happened to look.
+              #
+              # Fixed here rather than per-file so a future note cannot reintroduce it: the author
+              # writes the link that works in the repository, and the publish step makes it work on
+              # the release page too. Pinned to the TAG, not to master, so the link keeps pointing
+              # at the code the release describes even after the file moves or changes.
+              #
+              # Only `](../x)` and `](./x)` are touched. A bare `](x.md)` is left alone: it is
+              # ambiguous with an anchor or an external shortlink, and guessing wrong would break a
+              # link that currently works.
+              #
+              # A script rather than an inline heredoc, for two reasons the first attempt found the
+              # hard way: the path must be RESOLVED rather than pattern-stripped (`../guides/x`
+              # from `docs/releases/` is `docs/guides/x`, not `guides/x`), and a quoted heredoc
+              # inside a YAML block scalar keeps its indentation, so the terminator never matched
+              # and `bash -n` failed with "unexpected end of file". As a script it is also tested.
+              RENDERED_NOTES="$(mktemp)"
+              python3 scripts/absolutise-release-links.py \
+                "$NOTES_FILE" "$GITHUB_REPOSITORY" "$TAG_NAME" "$RENDERED_NOTES"
+
+              gh release create "$TAG_NAME" \
+                --title "Release $TAG_NAME" \
+                --notes-file "$RENDERED_NOTES" \
+                --verify-tag
+            else
+              echo "::warning::$NOTES_FILE not found; publishing with a link to the changelog"
+              gh release create "$TAG_NAME" \
+                --title "Release $TAG_NAME" \
+                --notes "Release notes: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/master/CHANGELOG.md)" \
+                --verify-tag
+            fi
+          else
+            echo "Release $TAG_NAME already exists"
+          fi
+
+      # =============================================================================
+      # Docker Hub description: synced from the repository, so it cannot drift
+      # =============================================================================
+      # It is NOT generated from the README -- Docker Hub has no such mechanism -- so before this
+      # step it was edited by hand and went stale silently: it advertised v1.4.6 while 1.9.0 was
+      # current, claimed Node 22 for an image running Node 25, said "463 operations" when there
+      # were 504, and carried ~101 relative links that resolve to nothing off GitHub.
+      #
+      # docs/registry/dockerhub-description.md is the source, and every link in it is absolute.
+      - name: Sync the Docker Hub description
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_IMAGE_NAME: ${{ env.DOCKERHUB_IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          DESC_FILE="docs/registry/dockerhub-description.md"
+          if [ ! -f "$DESC_FILE" ]; then
+            echo "::warning::$DESC_FILE not found; leaving the Docker Hub description as it is"
+            exit 0
+          fi
+
+          # A JWT from username+token. The description endpoint does not accept the token directly.
+          #
+          # `|| true` on the pipeline is load-bearing under `set -euo pipefail`: without it a
+          # transient network failure in `curl` fails the whole job, which is the opposite of this
+          # step's intent. The emptiness check below is what decides whether to continue, so a
+          # failed curl and a rejected login take the same path -- a warning, not a broken release.
+          jwt="$(curl -sS --max-time 30 -X POST https://hub.docker.com/v2/users/login \
+                   -H 'Content-Type: application/json' \
+                   -d "$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
+                          '{username:$u,password:$p}')" 2>/dev/null | jq -r '.token // empty' || true)"
+          if [ -z "$jwt" ]; then
+            echo "::warning::could not authenticate to Docker Hub; skipping the description sync"
+            exit 0
+          fi
+
+          # Same reasoning as the login above: a failed PATCH must warn, not fail the release. An
+          # empty `code` (curl itself died) falls through to the warning branch.
+          code="$(jq -n --rawfile full "$DESC_FILE" \
+                    --arg short "MCP server exposing all 504 GCHQ CyberChef operations as AI tools" \
+                    '{full_description:$full, description:$short}' \
+                  | curl -sS --max-time 60 -o /dev/null -w '%{http_code}' \
+                      -X PATCH "https://hub.docker.com/v2/repositories/${DOCKERHUB_IMAGE_NAME}/" \
+                      -H "Authorization: JWT ${jwt}" \
+                      -H 'Content-Type: application/json' --data @- || true)"
+          if [ "$code" = "200" ]; then
+            echo "Docker Hub description updated from $DESC_FILE"
+          else
+            # Not fatal: the image is already published, and a stale description must not fail a
+            # release that otherwise succeeded.
+            echo "::warning::Docker Hub description update returned HTTP $code"
+          fi
+
+      - name: Attach tarball to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG_NAME" "cyberchef-mcp-${TAG_NAME}-docker-image.tar.gz" --clobber
+
+      - name: Attach SBOM to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG_NAME" sbom.cyclonedx.json --clobber
+
+      # ---- npm, for every tag EXCEPT the v1.9.x maintenance line ----
+      #
+      # The v1.9.x line publishes to GHCR `_v1` but CANNOT be published to npm: its `postinstall`
+      # runs five grunt tasks that patch node_modules, which cannot survive being installed from a
+      # tarball (see docs/internal/v2.5.0-findings-log.md F-12). Guarding on the tag rather than
+      # trusting that v1 tags never reach this workflow.
+      #
+      # EXCLUDE v1, do not allow-list v2. This condition read
+      # `startsWith(github.ref_name, 'v2.')` until v3.0.0, which expressed the intent above as an
+      # allowlist of the then-current major -- so it also excluded every major after it. A `v3.0.0`
+      # tag would have published the image to GHCR `_v3` correctly (that step resolves any numeric
+      # major) and then silently skipped npm entirely, with no failure and no warning, because a
+      # skipped `if:` is a green step.
+      #
+      # A dated fuse like this is unobservable until the one tag that trips it, which is why it is
+      # written as the exclusion it always meant and cannot re-arm at v4.
+      #
+      # `ref_type == 'tag'` is the other half. `workflow_dispatch` runs on a BRANCH, so
+      # `github.ref_name` is `master` -- which is not a v1 tag and therefore passed the exclusion
+      # above. The publish step would then compute VERSION=master, disagree with package.json and
+      # fail the run, turning every manual dispatch red for a step that had nothing to publish.
+      # The release-creation step at line 253 already guards this way; these now match it.
+      - name: Set up Node for npm publish
+        if: "github.ref_type == 'tag' && !startsWith(github.ref_name, 'v1.')"
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies for packaging
+        if: "github.ref_type == 'tag' && !startsWith(github.ref_name, 'v1.')"
+        # Not --ignore-scripts: `prepack` runs `grunt configTests`, which needs the postinstall
+        # dependency patching to have happened, and the generated OperationConfig.json and
+        # index.mjs are shipped in the tarball.
+        run: npm ci
+
+      - name: Publish to npm
+        if: "github.ref_type == 'tag' && !startsWith(github.ref_name, 'v1.')"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # The secrets context is NOT available in a step-level `if:` -- referencing it there
+          # fails the workflow at parse time -- so the "is it configured" guard lives here.
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::warning::NPM_TOKEN is not set; skipping npm publish."
+            exit 0
+          fi
+
+          VERSION="${TAG_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          PKG_NAME="$(node -p "require('./package.json').name")"
+
+          # A tag and a package.json that disagree would publish a version nobody tagged.
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $TAG_NAME implies $VERSION but package.json says $PKG_VERSION."
+            exit 1
+          fi
+
+          # Idempotent: a re-run of a release must not fail because the version already exists.
+          # `npm view` exits non-zero for an unpublished version, which is the ordinary case here.
+          if npm view "${PKG_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG_NAME}@${VERSION} is already published; nothing to do."
+            exit 0
+          fi
+
+          npm publish --provenance --access public
+          echo "Published ${PKG_NAME}@${VERSION}"

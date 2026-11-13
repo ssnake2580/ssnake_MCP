@@ -1,0 +1,586 @@
+name: Performance Benchmarks
+
+# The path filter includes THIS FILE, and that was missing until v3.8.0. Without it, a change to
+# the benchmark workflow does not trigger the benchmark workflow -- so the one kind of edit whose
+# correctness this workflow is the only judge of was the one kind it never ran on. It was found by
+# adding a job here and noticing the PR had no benchmark check to look at.
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/node/mcp-server.mjs'
+      - 'src/node/index.mjs'
+      - 'src/core/**'
+      - 'benchmarks/**'
+      - '.github/workflows/performance-benchmarks.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'src/node/mcp-server.mjs'
+      - 'src/node/index.mjs'
+      - 'src/core/**'
+      - 'benchmarks/**'
+      - '.github/workflows/performance-benchmarks.yml'
+  workflow_dispatch:
+
+# Default for every job: read only. The write scope needed to post a comment is granted to the
+# `report` job alone, and ONLY that job -- see the note on its `permissions:` block.
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Run Performance Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Configure git
+        run: git config --global init.defaultBranch master
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Full history: the same-host comparison below benchmarks the MERGE BASE as well as the
+          # head, and depth 1 cannot reach it.
+          fetch-depth: 0
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@v7
+        with:
+          # 26 -- the version the published image actually runs, because a benchmark must
+          # measure the runtime that ships.
+          #
+          # This was the last '22' in the repository. The v2.0.0 plan called for moving all seven
+          # workflows to 24 and this one was missed, so every benchmark run since has printed
+          #
+          #   npm warn EBADENGINE package: 'cyberchef-mcp@2.8.0'
+          #   npm warn EBADENGINE required: { node: '>=24 <27' }, current: { node: 'v22.23.2' }
+          #
+          # which is worse than a warning: the numbers posted to every pull request were measured
+          # on a runtime this project does not support, against a V8 two majors behind the one it
+          # ships. A performance benchmark run on the wrong engine is not a benchmark.
+          node-version: '26'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Update browserslist database
+        run: npx update-browserslist-db@latest
+
+      - name: Generate OperationConfig
+        run: npx grunt configTests
+
+      - name: Run benchmarks
+        run: |
+          # `set -o pipefail` is NOT redundant here. GitHub's default shell for `run:` is
+          # `bash -e {0}` -- confirmed from this repository's own run logs -- and pipefail is
+          # added only when a step explicitly sets `shell: bash`. Without this line, `tee`
+          # would mask a failing `npm run benchmark` and the job would go green on a failure.
+          set -o pipefail
+          # NO_COLOR/FORCE_COLOR: the output goes into a markdown code block, where ANSI
+          # escapes render as literal `\x1b[32m` noise rather than colour.
+          NO_COLOR=1 FORCE_COLOR=0 npm run benchmark 2>&1 | tee benchmark-output.txt
+
+      # THE GATE. Until v3.2.0 this workflow said in its own PR comment that it "cannot fail
+      # on a regression", and it was right: the harness printed a table and discarded the
+      # numbers, so v2.6.0's cold-start work and v2.8.0's image-size work were unprotected --
+      # a regression posted a number to a pull request and nothing stopped it merging.
+      #
+      # Compares median throughput per task against `benchmarks/baseline.json` at the tolerance
+      # recorded there, which was measured rather than chosen. It also fails when a baselined
+      # task is MISSING from the run, because renaming or deleting a benchmark otherwise shrinks
+      # what is protected without anyone noticing.
+      #
+      # Deliberately after the reporting artifact is produced above, and `if: always()` on that
+      # upload, so a regression still posts its numbers to the PR rather than failing silently.
+      - name: Check for regressions against the committed baseline
+        run: |
+          set -o pipefail
+          # `node` directly, NOT `npm run benchmark:json > file`. npm's own banner --
+          # "> cyberchef-mcp@3.2.0 benchmark:json" -- landed in the redirect on this runner and the
+          # JSON failed to parse, on this gate's very first real CI run. It read as a benchmark
+          # failure and was a defect in the gate's wiring.
+          #
+          # The banner goes to STDERR locally and reached STDOUT here, which is the actual lesson:
+          # the stream depends on the environment, so a gate that pipes through `npm run` has a
+          # dependency it cannot see. Calling the script directly removes it rather than papering
+          # over it with `--silent`.
+          node benchmarks/operation-benchmarks.mjs --json > benchmark-results.json
+          node benchmarks/check-regression.mjs benchmark-results.json
+
+      # THE SAME-HOST COMPARISON, and since v3.6.0 a GATE.
+      #
+      # The gate above compares this run against a STORED baseline, and across GitHub's runner pool
+      # that comparison is dominated by which host the job landed on. Measured across four runs in
+      # v3.4.0: the median delta against one stored baseline ranged from -2.3% to +101.4%, and on
+      # the worst runs individual tasks moved -42% and +29% at the same time.
+      #
+      # v3.4.0 proposed fixing that by normalising against a calibration task. v3.5.0 tested the
+      # proposal on those four runs before building it and it does not work -- dividing out each
+      # run's median leaves a residual of -44%, because the hosts differ in profile rather than by
+      # a scale factor.
+      #
+      # So this removes the host from the comparison instead of estimating it: benchmark the merge
+      # base and the head in ONE job on ONE runner. Whatever that host is, both sides got it.
+      #
+      # v3.5.0 shipped it reporting-only because the tolerance it justifies had not been measured.
+      # v3.6.0 measured both halves -- a -7.6% worst-case noise floor over four runs on unchanged
+      # code, and a detection curve from a deliberate tunable slowdown -- and it now fails at 25%
+      # per task. What that does and does not catch is stated in benchmarks/compare-runs.mjs and
+      # printed in its own output on every run.
+      - name: Benchmark the merge base on this same runner
+        id: base_bench
+        # `always()`, because the regression gate above fails the job on a suspected regression --
+        # and that is exactly the moment this comparison earns its keep: it is the evidence that
+        # separates a real regression from a slow host. Running it only on success would withhold
+        # the number in the only case anyone needs it.
+        if: always() && github.event_name == 'pull_request'
+        env:
+          # Through the environment, NOT interpolated into the script body. `${{ }}` is substituted
+          # into the shell SOURCE before bash parses it, so a ref containing shell metacharacters
+          # would be executed rather than passed to git -- and git branch names legally contain
+          # characters bash treats as syntax. `base_ref` is the target branch and so is not
+          # attacker-controlled the way `head_ref` is, which makes this defence in depth; the safe
+          # form costs one line and the unsafe form is what gets copied into the workflow where the
+          # ref IS attacker-controlled.
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -o pipefail
+          BASE_SHA="$(git merge-base "origin/$BASE_REF" HEAD)"
+          echo "merge base: $BASE_SHA"
+
+          # A worktree rather than a second clone: same object store, no network, and the head
+          # checkout is left untouched.
+          git worktree add --detach ../base "$BASE_SHA"
+
+          # node_modules is REUSED, and only when it is provably valid for both sides: if the two
+          # commits would install different trees, benchmarking the base against the head's
+          # dependencies measures neither commit.
+          #
+          # The comparison is on the resolved dependency TREE, not on the files. The first version
+          # of this guard diffed `package.json` and `package-lock.json` wholesale, and CI skipped
+          # the comparison on the very first pull request that used it -- correctly by its own rule,
+          # and the rule was wrong. A RELEASE PR bumps the version, so those files always differ on
+          # exactly the pull requests where this is most wanted, while not a single dependency has
+          # changed. `deps-identical.mjs` ignores the root package entry, which is where the version
+          # lives, and hashes the rest.
+          #
+          # Exit 2 is "could not tell" (a malformed lockfile) and is treated as "do not compare",
+          # because a parse failure says nothing about the dependencies.
+          set +e
+          node "$GITHUB_WORKSPACE/benchmarks/deps-identical.mjs" ../base .
+          DEPS_STATUS=$?
+          set -e
+          if [ "$DEPS_STATUS" -ne 0 ]; then
+            echo "skipped=dependencies-differ" >> "$GITHUB_OUTPUT"
+            echo "::notice::The merge base and the head would install different dependency trees"
+            echo "::notice::(or the lockfile could not be read), so the same-host comparison is"
+            echo "::notice::skipped: reusing one node_modules would measure neither commit."
+            exit 0
+          fi
+          ln -s "$PWD/node_modules" ../base/node_modules
+
+          cd ../base
+          npx grunt configTests
+          node benchmarks/operation-benchmarks.mjs --json > "$GITHUB_WORKSPACE/base-results.json"
+          echo "skipped=" >> "$GITHUB_OUTPUT"
+
+      # `tee` keeps the report even when the comparison fails, and `set -o pipefail` makes the
+      # step's exit status the COMPARISON's rather than tee's -- without it a regression would be
+      # printed and the job would go green, which is the exact defect this whole line of work
+      # replaced.
+      - name: Compare head against the merge base
+        if: always() && github.event_name == 'pull_request' && steps.base_bench.outputs.skipped == ''
+        run: |
+          set -o pipefail
+          node benchmarks/compare-runs.mjs base-results.json benchmark-results.json \
+            | tee same-host-comparison.txt
+
+      - name: Upload the same-host comparison
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: same-host-comparison
+          path: same-host-comparison.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Hand the output to the reporting job as an artifact. `if: always()` so a FAILING
+      # benchmark still gets reported -- the output of a failure is the most useful comment
+      # this workflow can post, and it was previously discarded.
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-output
+          path: benchmark-output.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+  # arm64, on real hardware, for the first time.
+  #
+  # "arm64 performance is still unmeasured" has been on this project's carried-forward list since
+  # v3.3.0, with the stated blocker "real numbers need arm64 HARDWARE". That blocker was already
+  # gone: `mcp-docker-build.yml` has a `build-arm64` job on `ubuntu-24.04-arm`, a GitHub-hosted
+  # runner free for public repositories, succeeding on every run. The note was carried five times
+  # without being checked against the workflow beside it.
+  #
+  # ON THE RUNNER LABEL: `ubuntu-24.04-arm` is GitHub-hosted, and Actions has no syntax for
+  # "hosted only" -- a self-hosted runner registered with the same label could claim this job, which
+  # runs pull-request code. Verified for this repository: the one self-hosted runner
+  # (`AB-i9-cyberchef-mcp`) carries `self-hosted, Linux, X64, agy` and is x64, so it cannot match.
+  # The same reasoning and the same warning as `mcp-docker-build.yml`; keep it that way.
+  #
+  # REPORTS, DOES NOT GATE -- and that phrase is worth pinning down, because a reviewer read it as
+  # "cannot fail the workflow" and by that reading it was false. What it means: this job applies NO
+  # performance threshold. It does not compare against `benchmarks/baseline.json`, it does not
+  # compare against the amd64 job, and no number it produces can fail the build. There is no arm64
+  # noise floor yet, and this project has set three thresholds from a first plausible measurement
+  # and moved two of them within days; the numbers accumulate first.
+  #
+  # It CAN still fail -- on the architecture assertion below, or on infrastructure (`npm ci`) --
+  # and `continue-on-error` is deliberately NOT set. The suggestion to add it was declined: it
+  # would silence the architecture tripwire, which exists precisely to be loud, and would hide an
+  # install failure that means the numbers are missing rather than fine. Silencing a security check
+  # to make a sentence true is the wrong direction; the sentence was made precise instead.
+  #
+  # It also does not compare arm64 against amd64: those are different machines, and the whole
+  # v3.4.0-v3.6.0 line of work was about not doing that.
+  benchmark-arm64:
+    name: Benchmark on arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      # FIRST, BEFORE ANY REPOSITORY CODE RUNS. This assertion was originally the fifth step, after
+      # `npm ci` and `npx grunt` -- both of which execute code from the pull request (lifecycle
+      # scripts, the Gruntfile). A guard that fires after the thing it guards against has already
+      # run is decoration. Reviewer-found; it now runs before even the checkout.
+      #
+      # WHAT IT ESTABLISHES, precisely, because the earlier comment overstated this. It proves the
+      # job is executing on aarch64. It does NOT prove the runner is GitHub-hosted -- a self-hosted
+      # arm64 runner would pass it, and Actions offers no syntax for "hosted only". The actual
+      # controls are: this repository's only self-hosted runner is x64 (labels `self-hosted, Linux,
+      # X64, agy`, verified against the API), and `pull_request` -- not `pull_request_target` --
+      # gives fork code no secrets and a read-only token. This check is the cheap tripwire for the
+      # case where the first of those changes without anyone updating this workflow.
+      - name: Refuse to run anywhere but arm64
+        run: |
+          if [ "$(uname -m)" != "aarch64" ]; then
+            echo "::error::This job is not running on arm64 ($(uname -m)). A runner registered with"
+            echo "::error::the ubuntu-24.04-arm label claimed it -- see the note above."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate OperationConfig
+        run: npx grunt configTests
+
+      - name: Report the machine this measured
+        run: |
+          # arm64 /proc/cpuinfo carries NO `model name` field -- that is an x86 convention. The
+          # first version of this step assumed it did, and its `|| echo unknown` fallback could not
+          # fire, because grep matching nothing still leaves `xargs` exiting 0: the field came back
+          # EMPTY on the job's first real run. An empty field is worse than "unknown", because it
+          # reads as a machine with no model rather than as a question this step failed to answer.
+          # The implementer/part pair is the closest thing arm64 offers to an identity.
+          model="$(grep -m1 -E 'model name|^Model' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          if [ -z "$model" ]; then
+            impl="$(grep -m1 'CPU implementer' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            part="$(grep -m1 'CPU part' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            if [ -n "$impl" ] || [ -n "$part" ]; then
+              model="implementer ${impl:-?} part ${part:-?} (no model name field)"
+            else
+              model="unknown"
+            fi
+          fi
+          {
+            echo "arch:   $(uname -m)"
+            echo "kernel: $(uname -r)"
+            echo "cpus:   $(nproc)"
+            echo "model:  $model"
+            echo "memory: $(awk '/MemTotal/ {printf "%.1f GB", $2/1048576}' /proc/meminfo)"
+            echo "node:   $(node --version)"
+          } | tee arm64-machine.txt
+          # A benchmark whose machine is unrecorded is a number nobody can reuse. This project
+          # learned that from a baseline that claimed to be from a developer machine when it was
+          # captured on a runner. The arm64 assertion itself is the FIRST step of this job, not
+          # here -- see the note there.
+
+      - name: Run benchmarks
+        run: |
+          set -o pipefail
+          NO_COLOR=1 FORCE_COLOR=0 npm run benchmark 2>&1 | tee arm64-benchmark.txt
+
+      - name: Upload the arm64 results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: arm64-benchmark
+          path: |
+            arm64-benchmark.txt
+            arm64-machine.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+  # Separate job, and the separation is the point. The job above installs the PR's dependencies
+  # (`npm ci`, with lifecycle scripts) and executes the PR's own code. Holding a write-scoped
+  # token in that job would put it within reach of anything that code or its dependency tree
+  # does -- flagged by CodeRabbit and by zizmor as `excessive-permissions` (CWE-732).
+  #
+  # This job never checks out the repository and never runs project code. It downloads one text
+  # file and posts it. That is the only place `pull-requests: write` exists.
+  report:
+    name: Report benchmark results
+    needs: [benchmark, benchmark-arm64]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      # Posting a comment on a pull request. PRs are issues, but GitHub scopes PR comments to
+      # `pull-requests`, not `issues` -- see the permissions table in the Actions docs.
+      pull-requests: write
+    steps:
+      - name: Download benchmark output
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-output
+        continue-on-error: true
+
+      # The same-host comparison, which is the number a reviewer actually needs: the gate above
+      # compares against a stored baseline and is dominated by which host the job landed on.
+      # `continue-on-error` because it is absent by design on a push, and when the dependency
+      # lockfile changed.
+      - name: Download the same-host comparison
+        uses: actions/download-artifact@v8
+        with:
+          name: same-host-comparison
+        continue-on-error: true
+
+      # arm64 numbers, so the long-carried "unmeasured" note has somewhere to be read. Optional in
+      # the same way: a failed arm64 job must not cost the amd64 report.
+      - name: Download the arm64 results
+        uses: actions/download-artifact@v8
+        with:
+          name: arm64-benchmark
+        continue-on-error: true
+
+      # Reporting must never fail the workflow. Before this split, a 403 in the comment step
+      # turned a fully green benchmark run into a red check and blocked unrelated PRs.
+      - name: Comment benchmark results on PR
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // `require` is injected by github-script as a proxy wrapper and works for node
+            // builtins. It is resolved INSIDE the try rather than at the top of the script
+            // because v8/v9 moved this action to ESM and made `require('@actions/github')`
+            // fail; the builtin case still works, but a reporting step must not die on the
+            // question. If it ever does stop working, the comment degrades to a placeholder
+            // instead of throwing.
+            //
+            // Carry the actual numbers. The previous body said only "Benchmarks have been run
+            // ... check the workflow logs", spending an API call and a PR comment to report
+            // that a thing had happened.
+            let output;
+            let sameHost = null;   // reassigned by the per-section cap below
+            let arm64 = null;      // reassigned by the per-section cap below
+            try {
+              const fs = require("fs");
+              output = fs.readFileSync("benchmark-output.txt", "utf8").trim();
+              // Optional and separate: absent on a push, and absent when the lockfile changed
+              // between the merge base and the head. Its absence must not cost the whole comment.
+              try {
+                sameHost = fs.readFileSync("same-host-comparison.txt", "utf8").trim();
+              } catch { sameHost = null; }
+              try {
+                // Machine first: an arm64 number without the machine it came from is not reusable,
+                // and this project has a baseline in its history that claimed the wrong one.
+                const machine = fs.readFileSync("arm64-machine.txt", "utf8").trim();
+                const bench = fs.readFileSync("arm64-benchmark.txt", "utf8").trim();
+                arm64 = `${machine}\n\n${bench}`;
+              } catch { arm64 = null; }
+            } catch (err) {
+              // Logged, not swallowed: if the artifact is missing, the reason belongs in the
+              // job log rather than being replaced silently by a placeholder.
+              console.error("Could not read benchmark-output.txt:", err.message);
+              output = "(benchmark output was not captured -- see the workflow logs)";
+            }
+
+            // GitHub rejects bodies over 65536 characters, and the previous version of this step
+            // capped each SECTION independently -- 60,000 for the full output, 20,000 for arm64,
+            // nothing at all for the same-host block. Three sections each inside their own limit
+            // can still sum past the ceiling, at which point the API call fails; and because this
+            // step is `continue-on-error`, the report would vanish while the workflow stayed
+            // green. Reviewer-found. The budget is now enforced on the ASSEMBLED body.
+            const HARD_LIMIT = 65000;   // headroom under GitHub's 65536
+
+            // A fence longer than any backtick run in the content, so output that itself contains
+            // ``` cannot break out of the code block. Applied to EVERY interpolated block now, not
+            // just the full output -- the same-host and arm64 blocks used a static ```text fence
+            // and carry runner-produced text just as the full output does.
+            const fenceFor = (text) => {
+              const longest = (text.match(/`+/g) || []).reduce((n, s) => Math.max(n, s.length), 0);
+              return "`".repeat(Math.max(3, longest + 1));
+            };
+            // `slice` cuts UTF-16 code units, so a boundary can land inside a surrogate pair and
+            // leave a lone half. Drop it rather than emit a broken character.
+            const keepTail = (text, budget) =>
+              budget <= 0 ? "" :
+                text.length <= budget ? text :
+                  text.slice(-budget).replace(/^[\uDC00-\uDFFF]/, "");
+            const keepHead = (text, budget) =>
+              budget <= 0 ? "" :
+                text.length <= budget ? text :
+                  text.slice(0, budget).replace(/[\uD800-\uDBFF]$/, "");
+
+            // Per-section caps first, so one runaway section cannot starve the others, then the
+            // whole-body budget below. arm64 keeps its HEAD (the machine record is printed first
+            // and is the part that makes the numbers reusable); the others keep their TAIL,
+            // because these benchmarks print their summary last.
+            if (sameHost) sameHost = keepTail(sameHost, 15000);
+            if (arm64) arm64 = keepHead(arm64, 20000);
+
+            // Hidden marker used to find this job's previous comment and update it in place.
+            // Without it every push appended another benchmark comment -- invisible while the
+            // step was 403ing, and acutely visible during an upstream catch-up that touches
+            // src/core/** across many pushes.
+            const MARKER = "<!-- performance-benchmark-results -->";
+
+            // Assemble once with the full output to measure the fixed overhead, then give the
+            // output whatever budget is left. Two passes rather than an estimate, because an
+            // estimate of the markup length is one more number that can drift.
+            let outputBudget = output.length;
+            let outputTruncated = false;
+            const assemble = () => [
+              MARKER,
+              "## Performance Benchmark Results",
+              "",
+              `Benchmark job: **${{ needs.benchmark.result }}**`,
+              "",
+              // FIRST, above the fold, and since v3.6.0 this is the block that can fail the
+              // build. Against a stored baseline the runner pool swamps the signal -- measured
+              // across four v3.4.0 runs, the median delta ranged from -2.3% to +101.4%. This
+              // compares the merge base and the head on the SAME runner in the same job, so that
+              // variance cancels instead of being estimated.
+              ...(sameHost ? [
+                "### Same-host comparison (merge base vs head)",
+                "",
+                fenceFor(sameHost) + "text",
+                sameHost,
+                fenceFor(sameHost),
+                "",
+              ] : [
+                "_No same-host comparison: this was a push, or the merge base and the head would_",
+                "_install different dependency trees, which would make the two runs incomparable._",
+                "",
+              ]),
+              ...(outputTruncated ? [
+                `_Full output truncated to its last ${outputBudget} characters to fit GitHub's_`,
+                "_comment size limit._", ""] : []),
+              // arm64 is collapsed: it is a reference measurement rather than a pass/fail signal,
+              // and the same-host block above is what a reviewer acts on.
+              ...(arm64 ? [
+                "<details><summary>arm64 throughput (reference, does not gate)</summary>",
+                "",
+                fenceFor(arm64) + "text",
+                arm64,
+                fenceFor(arm64),
+                "",
+                "</details>",
+                "",
+              ] : []),
+              "<details><summary>Full benchmark output</summary>",
+              "",
+              // Computed inside `assemble` rather than once above it, so the second pass fences
+              // the TRUNCATED output. A fence sized for the untruncated text would be correct but
+              // arbitrary; sized for text that is no longer there, it could be too short.
+              fenceFor(output),
+              output,
+              fenceFor(output),
+              "",
+              "</details>",
+              "",
+              "> Compared against `benchmarks/baseline.json` at its recorded tolerance. **This",
+              "> check fails on a regression**, and on a baselined task disappearing from the run.",
+              "> A task faster than baseline by more than the tolerance is reported rather than",
+              "> failed -- the usual cause is a benchmark that stopped doing the work.",
+            ].join("\n");
+
+            let body = assemble();
+            if (body.length > HARD_LIMIT) {
+              // Everything except the output block is fixed cost; the output gets the remainder.
+              const overhead = body.length - output.length;
+              outputBudget = Math.max(0, HARD_LIMIT - overhead);
+              output = keepTail(output, outputBudget);
+              outputTruncated = true;
+              body = assemble();
+              // Belt and braces: if the fixed sections alone still exceed the limit -- which would
+              // mean the capped same-host and arm64 blocks plus markup are over 65,000 on their
+              // own -- trim the whole body rather than let the API reject it and the report vanish.
+              if (body.length > HARD_LIMIT) body = keepHead(body, HARD_LIMIT);
+            }
+
+            // Update the existing comment if there is one, otherwise post a new one.
+            //
+            // `paginate` returns ONE FLAT ARRAY across all pages. That is the whole reason to use
+            // it here rather than listComments: `gh api --paginate` and the raw REST list emit one
+            // array PER PAGE, so a `.find()` written for a single array silently misses the marker
+            // on a long thread and degrades into exactly the duplicate-posting this fixes. That
+            // failure was reproduced in scripts/agy-review.sh before being fixed there.
+            let existing;
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              });
+              // Match on the marker AND on authorship. The marker alone is not a claim of
+              // ownership: anyone who can comment on the PR could paste it and have this job
+              // overwrite their comment on the next run. Restricting to the Actions bot means the
+              // worst case is an extra comment, never destroying someone else's text.
+              existing = comments.find(c =>
+                c.body &&
+                c.body.includes(MARKER) &&
+                c.user &&
+                c.user.type === "Bot" &&
+                c.user.login === "github-actions[bot]"
+              ) || null;
+            } catch (err) {
+              // Fall through to a plain create. A duplicate comment is noise; failing to report a
+              // benchmark run at all is worse, so a lookup failure must not fail the job.
+              core.warning(`could not list comments, posting a new one: ${err.message}`);
+            }
+
+            // `await`: without it a rejection became an unhandled rejection that took the job
+            // down with an opaque stack instead of a readable error.
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body
+              });
+            }

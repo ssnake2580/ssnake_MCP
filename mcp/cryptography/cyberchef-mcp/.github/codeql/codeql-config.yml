@@ -1,0 +1,69 @@
+# CodeQL configuration for CyberChef-MCP.
+#
+# The MCP layer (`src/node/**`) and everything else this fork authors stays fully analysed. The
+# only adjustment is one query filter, and it is deliberately narrow.
+name: "CyberChef-MCP CodeQL config"
+
+queries:
+  - uses: security-and-quality
+
+# Vendored third-party source, carried verbatim so that a package which cannot be loaded as
+# published is still usable. It is already exempt from this repository's linter (eslint.config.mjs)
+# and from coverage (vitest.config.mjs), for the same reason it is exempt here: it is not ours to
+# change, and an alert on it is a finding we can neither act on nor sensibly dismiss one by one.
+# `src/vendor/crypto-api/` alone produced a `js/useless-assignment-to-local` on a line of upstream's
+# Snefru implementation.
+#
+# This does NOT cover `src/core/vendor/**`, which stays analysed: alerts there have been individually
+# dispositioned and removing them from view would lose that record.
+paths-ignore:
+  - src/vendor/**
+
+  # Archived measurement harnesses (docs/internal/measurements/**), salvaged out of a scratch
+  # directory so the numbers cited in the findings logs stay reproducible. They are already exempt
+  # from the linter (docs/ is outside the eslint targets), from coverage, and from the npm `files`
+  # allowlist -- they are evidence, not shipped code, and no gate runs them.
+  #
+  # Committing them immediately produced two alerts, which is how this entry came to exist:
+  #
+  #   js/incomplete-multi-character-sanitization  strip-test.mjs:10
+  #   js/unused-local-variable                    mkpatch.mjs:1
+  #
+  # The first is CORRECT and unfixable by design. `strip-test.mjs` exists to demonstrate the
+  # difference between the naive single-pass strip and the fixpoint-plus-escape version that
+  # replaced it, after CodeQL flagged the real one in docs-site/scripts/collect.mjs. It therefore
+  # CONTAINS the vulnerable form deliberately, as the control in a comparison. "Fixing" it would
+  # delete the thing it demonstrates, and the file has no callers.
+  #
+  # Revisit if anything under this path ever becomes executable by the server or enters a gate.
+  # Nothing here is imported by src/**; that is the property that makes this safe.
+  - docs/internal/measurements/**
+
+query-filters:
+  # js/incomplete-sanitization -- excluded, with evidence.
+  #
+  # All three instances fire on `src/core/**`, which is mirrored VERBATIM from GCHQ CyberChef.
+  # This fork cannot fix them: hand-edits there are overwritten by the next upstream sync (see
+  # docs/security/2026-08-30-saferegex-reverted-by-upstream-sync.md for the incident where a
+  # security mitigation vanished exactly that way).
+  #
+  # More to the point, the flagged code is NOT vulnerable, and this was measured rather than
+  # assumed. `Utils.parseRecipeConfig` is the strongest case: CodeQL flags the `.replace(/"/g, ...)`
+  # on line 1025 for "not escaping backslash characters", but upstream v11.4.0 added
+  # `Utils._validatePrettyRecipe()`, which rejects malformed input BEFORE that line runs:
+  #
+  #     A(\')          -> REJECTED: Invalid recipe
+  #     A(\\')         -> REJECTED: Invalid recipe
+  #     A('a\'b')      -> REJECTED: Invalid recipe
+  #     A('\\','x')    -> parsed as two legitimate args, not an injection
+  #
+  # CodeQL analyses that line in isolation and cannot see the validator's guarantee.
+  #
+  # This fork tried the "obvious" fix -- escaping backslashes first -- as patches/fork/02. It
+  # applied cleanly, was WRONG, and broke upstream's own test for escaped quotes and backslashes
+  # with `SyntaxError: Bad escaped character in JSON`. Suppressing the rule is the correct
+  # response here; "fixing" it demonstrably makes the parser incorrect.
+  #
+  # Revisit if this rule ever fires on `src/node/**`, which this fork does own.
+  - exclude:
+      id: js/incomplete-sanitization

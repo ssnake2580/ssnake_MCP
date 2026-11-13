@@ -1,0 +1,55 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * The registry manifest: every tool that is not a CyberChef operation, listed explicitly.
+ *
+ * This file is the whole loading mechanism, and its plainness is deliberate. There is no directory
+ * scan, no glob, no `import()` of a path from configuration -- adding a tool means adding a line
+ * here, in a pull request, reviewed. See
+ * [ADR 0002](../../../docs/adr/0002-tool-registry-is-not-a-plugin-loader.md) for why a loader is
+ * not being built until sandboxing is real rather than nominal.
+ *
+ * @author DoubleGate
+ * @license GPL-3.0-or-later
+ */
+
+import { ToolRegistry } from "./registry.mjs";
+import certChain from "./cert-chain.mjs";
+import classicalCipher from "./classical-cipher.mjs";
+import corpusDiff from "./corpus-diff.mjs";
+import cribDrag from "./crib-drag.mjs";
+import entropyScan from "./entropy-scan.mjs";
+import cyclicPattern from "./cyclic-pattern.mjs";
+import ecdsaRecover from "./ecdsa-recover.mjs";
+import hashCrack from "./hash-crack.mjs";
+import hashIdentify from "./hash-identify.mjs";
+import hashStatistics from "./hash-statistics.mjs";
+import jwtWeakness from "./jwt-weakness.mjs";
+import plaintextCheck from "./plaintext-check.mjs";
+import pqcIdentify from "./pqc-identify.mjs";
+import rsaAttack from "./rsa-attack.mjs";
+import rsaMultiKey from "./rsa-multi-key.mjs";
+import substitutionBreak from "./substitution-break.mjs";
+import timestampIdentify from "./timestamp-identify.mjs";
+import vigenereBreak from "./vigenere-break.mjs";
+import xorKeyLength from "./xor-key-length.mjs";
+
+/** Tools, in the order they should appear in `tools/list`. */
+const TOOLS = [certChain, classicalCipher, corpusDiff, cribDrag, cyclicPattern, ecdsaRecover, entropyScan, hashCrack, hashIdentify, hashStatistics, jwtWeakness, plaintextCheck, pqcIdentify, rsaAttack, rsaMultiKey, substitutionBreak, timestampIdentify, vigenereBreak, xorKeyLength];
+
+/**
+ * Build the registry.
+ *
+ * @param {Object} [options] - Options.
+ * @param {Set<string>|string[]} [options.reservedNames] - Exposed tool names that must not be
+ *   shadowed: every operation tool and every meta-tool. A collision throws at construction, which
+ *   is a startup failure rather than a surprise at call time.
+ * @returns {ToolRegistry} The populated registry.
+ */
+export function buildRegistry({ reservedNames = [] } = {}) {
+    const registry = new ToolRegistry({ reservedNames });
+    for (const tool of TOOLS) registry.register(tool);
+    return registry;
+}
+
+export { ToolRegistry };

@@ -1,0 +1,147 @@
+# Dependabot configuration for CyberChef-MCP.
+#
+# Before this file existed the repository received only Dependabot *security* updates
+# (which are on by default and need no config). That is why the alert backlog reached
+# 194 with no corresponding version-update PRs. This adds proactive version updates for
+# all three ecosystems the project actually uses.
+#
+# Grouping keeps the PR volume sane: minor+patch bumps are batched per ecosystem, while
+# majors are raised individually so each breaking change gets its own review.
+version: 2
+
+updates:
+  # ---------------------------------------------------------------- npm
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    versioning-strategy: "increase"
+    labels:
+      - "dependencies"
+      - "npm"
+    commit-message:
+      prefix: "build(deps)"
+      prefix-development: "build(deps-dev)"
+    # Cooldown, raised above GitHub's 3-day default. This project consumes cryptography and
+    # parser libraries where a bad release is a real hazard, and nothing here is urgent enough to
+    # justify being the first to find out. Security updates ignore cooldown entirely, which is
+    # exactly the behaviour wanted: a published CVE should not wait out a safety margin.
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      production-minor-patch:
+        applies-to: version-updates
+        dependency-type: "production"
+        update-types: ["minor", "patch"]
+      development-minor-patch:
+        applies-to: version-updates
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+      # Restricted to minor+patch so a MAJOR security update still arrives as its own PR,
+      # matching the majors-get-individual-review policy stated at the top of this file.
+      security-patches:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # The `version` field tracks the upstream CyberChef release, not our own semver, and
+      # the operation/core dependency set is adopted wholesale from upstream by the
+      # upstream-sync workflow. Letting Dependabot bump these independently would fight
+      # that sync and desynchronise us from the pinned upstream base.
+      - dependency-name: "grunt"
+      - dependency-name: "grunt-*"
+      # Two majors HELD, with the evidence recorded rather than the PR silently closed each week.
+      # Both break upstream-owned files we mirror verbatim, and upstream still pins the old line,
+      # so taking them means carrying a fork patch against code upstream will keep changing.
+      #
+      #   @xmldom/xmldom 0.9 -- `parseFromString` made mimeType REQUIRED and `errorHandler` was
+      #     replaced by `onError`. Both are mechanical, and BOTH WERE TRIED: the resulting DOM
+      #     still differs enough that `CSS selector` returns 0 matches and `XPath expression`
+      #     returns 1 of 2 through the real pipeline. Behavioural, not a rename. Upstream pins
+      #     ^0.8.14.
+      #   geodesy 2.x -- upstream's own comment says the blocker is "cannot load .js modules into
+      #     a .mjs file", which is STALE: geodesy 2 is `"type": "module"` and imports fine on
+      #     Node 24. The real blocker is that v2's LatLon subclasses do not compose --
+      #     `utm.js` exports a LatLon with `toUtm` and no `toOsGrid`, `osgridref.js` the reverse,
+      #     and ConvertCoordinates.mjs needs both on one object. Upstream pins 1.1.3 exactly.
+      #
+      # Re-evaluate when upstream moves; drop the ignore then rather than carrying a patch.
+      - dependency-name: "@xmldom/xmldom"
+        versions: [">=0.9.0"]
+      - dependency-name: "geodesy"
+        versions: [">=2.0.0"]
+      #   jq-web 0.6 -- its module namespace exports `then`, which makes the namespace object a
+      #     THENABLE. `await import("jq-web")` therefore tries to resolve it as a promise and
+      #     throws `TypeError: Method Promise.prototype.then called on incompatible receiver
+      #     [object Module]`. Measured: it broke 10 test files, before any operation ran. The
+      #     0.5 -> 0.6 API change itself is manageable (the default export becomes async, so
+      #     `Jq.mjs` needs `await`), but that is moot while importing the package is unsafe.
+      #     Upstream pins ^0.5.1.
+      - dependency-name: "jq-web"
+        versions: [">=0.6.0"]
+
+
+  # ------------------------------------------------------- github-actions
+  # The 0.28.0 -> v0.36.0 trivy-action breakage that took Security Scan down for months
+  # is exactly what this ecosystem catches.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+    ignore:
+      # docker/setup-qemu-action v4 HANGS the multi-arch release build. Measured across three runs
+      # of the same commit content:
+      #
+      #   v3  build  378s  success  (v3.8.0)
+      #   v4  build 1979s  HUNG     (v3.9.0, twice, nothing pushed to any registry)
+      #   v3  build  399s  success  (v3.9.0)
+      #
+      # The v4 STEP reports success in 8 seconds -- installing binfmt handlers works; whether the
+      # resulting emulation works is not something it measures. That false green is why this took
+      # two wasted 33-minute runs to find.
+      #
+      # Taken from Dependabot #127 during v3.9.0 and reverted the same release. Drop this ignore
+      # when a v4 patch release claims to fix multi-platform builds, and verify by watching the
+      # build DURATION rather than the setup step's conclusion.
+      - dependency-name: "docker/setup-qemu-action"
+        versions: [">=4"]
+
+  # -------------------------------------------------------------- docker
+  # Tracks the Chainguard base images in Dockerfile.mcp.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "build(docker)"
+    groups:
+      docker-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]

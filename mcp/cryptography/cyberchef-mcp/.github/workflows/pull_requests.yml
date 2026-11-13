@@ -1,0 +1,140 @@
+name: "Pull Request Checks"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [synchronize, opened, reopened]
+
+jobs:
+  core-test:
+    runs-on: ubuntu-latest
+
+    # 26 is the declared floor in `engines` AND what the published image runs, since v4.0.0
+    # raised the floor from 24. One runtime, and it is the one that ships -- see core-ci.yml for
+    # why the matrix stays a matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['26']
+
+    name: core-test (node ${{ matrix.node-version }})
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set node version
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ matrix.node-version }}
+
+    - name: Install
+      run: |
+        npm install
+        npm run setheapsize
+
+    - name: Patch Dependencies (SlowBuffer)
+      run: |
+        sed -i 's/new SlowBuffer/Buffer.alloc/g' node_modules/avsc/lib/types.js
+        sed -i 's/SlowBuffer/Buffer/g' node_modules/buffer-equal-constant-time/index.js
+
+    - name: Lint
+      run: npx grunt lint
+
+    # A prose checklist could not fail a build, and did not: v2.9.0 shipped with the Helm chart and
+    # the compose file still pointing at 2.8.1, which is the third consecutive release to get this
+    # wrong while AGENTS.md told the author not to.
+    - name: Version consistency
+      run: npm run check:versions
+
+    # `server.json` exists to be machine-read by the MCP registry, and until v3.4.0 nothing read
+    # it: it declared the 2025-07-09 schema while being written in the 2025-09-29 shape, and failed
+    # validation in six places. Runs offline against transcribed rules -- see the script header for
+    # why not a JSON Schema validator against the live URL.
+    - name: server.json validity
+      run: npm run check:server-json
+
+    # THE ORACLE, alongside the offline gate above.
+    #
+    # The transcribed checker verifies what its author believed the schema says. Only the registry's
+    # own tool can contradict them, and in v3.5.0 it did: `check-server-json.mjs` shipped in v3.4.0
+    # encoding the 2025-09-29 schema while 2025-12-11 was already current, and nothing in the tree
+    # could have noticed. `mcp-publisher validate` reports it in one line.
+    #
+    # This is the same arrangement `npm run conformance` has with the in-tree protocol tests, for
+    # the same reason -- and the reason it was not applied here sooner is that `server.json` did not
+    # look like the kind of file that has an oracle.
+    #
+    # It needs the network, so it cannot replace the offline gate; it is additive. `continue-on-
+    # error` is deliberately NOT set: a validation failure here is a `server.json` the registry
+    # would reject, which is worth failing a pull request for. A deprecation WARNING does not fail
+    # the tool, and is surfaced in the log rather than swallowed.
+    - name: server.json against the registry's own validator
+      run: |
+        set -o pipefail
+        curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+          | tar xz mcp-publisher
+        ./mcp-publisher validate 2>&1 | tee validation.txt
+        # The tool exits 0 on a deprecated schema. Treat that as a failure here, because shipping a
+        # deprecated declaration is exactly what this step exists to catch -- and it is how v3.4.0's
+        # gate came to be a version behind on the day it shipped.
+        if grep -q "Deprecated schema detected" validation.txt; then
+          echo "::error::server.json declares a deprecated schema. Update it AND the KNOWN_SCHEMA"
+          echo "::error::constant in scripts/check-server-json.mjs together, then re-check the"
+          echo "::error::transcribed rules against the new schema -- they are not always the same."
+          exit 1
+        fi
+
+    - name: Config Tests
+      run: npx grunt configTests
+
+    - name: Unit Tests
+      run: |
+        npm test
+        npm run testnodeconsumer
+
+  # The MCP suite and the coverage gate, on every pull request.
+  #
+  # Neither ran on a PR before. `core-test` above covers lint and the CORE tests; the MCP tests and
+  # `test:coverage` lived only in core-ci.yml, which triggers on PUSH to master or release/** -- so
+  # a PR from an ordinary branch was merged without either ever running.
+  #
+  # That is not theoretical. v2.1.0 was reviewed, merged and tagged while all four coverage
+  # thresholds were failing, because the job that checks them never ran on its PR and only turned
+  # red afterwards, on the push to master.
+  mcp-test:
+    runs-on: ubuntu-latest
+
+    # 26 is the declared floor in `engines` AND what the published image runs, since v4.0.0
+    # raised the floor from 24. One runtime, and it is the one that ships -- see core-ci.yml for
+    # why the matrix stays a matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['26']
+
+    name: mcp-test (node ${{ matrix.node-version }})
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set node version
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ matrix.node-version }}
+
+    - name: Install
+      run: |
+        npm install
+        npm run setheapsize
+
+    # avsc still references the removed SlowBuffer; see the note in core-ci.yml.
+    - name: Patch Dependencies
+      run: |
+        sed -i 's/new SlowBuffer/Buffer.alloc/g' node_modules/avsc/lib/types.js
+        sed -i 's/SlowBuffer/Buffer/g' node_modules/buffer-equal-constant-time/index.js
+
+    # OperationConfig.json and src/node/index.mjs are generated and gitignored; the MCP server
+    # cannot start without them.
+    - name: Config Tests
+      run: npx grunt configTests
+
+    - name: MCP Tests with Coverage
+      run: npm run test:coverage

@@ -1,0 +1,14 @@
+{
+  "name": "cipherhub",
+  "description": "CipherHUB plugins: cryptography tooling for AI agents, backed by the hosted CipherHUB MCP service",
+  "owner": {
+    "name": "Yang X. CHEN"
+  },
+  "plugins": [
+    {
+      "name": "cipherhub-crypto",
+      "source": "./",
+      "description": "Cryptography toolkit skill over the hosted CipherHUB MCP service — hashing, HMAC, symmetric and public-key crypto, SM2/SM9, ML-KEM/ML-DSA, certificates, CMS and COSE, CBOR and ASN.1"
+    }
+  ]
+}
