@@ -39,6 +39,166 @@ def find(servers, name):
     return next((s for s in servers
                  if s["name"].casefold() == name.casefold()), None)
 
+
+def verify_mcp(name):
+    import os
+    import select
+    import time
+
+    name = name.lower()
+    current = configured()
+
+    if name in current:
+        entry = current[name]
+        if "command" not in entry:
+            print("Only stdio MCP servers are supported.")
+            return 1
+        command = [entry["command"], *entry.get("args", [])]
+        env = os.environ.copy()
+        env.update(entry.get("env", {}))
+    elif name == "filesystem":
+        directory = str(Path.home() / "MCP")
+        if not Path(directory).is_dir():
+            print("Filesystem directory not found:", directory)
+            return 1
+        command = [
+            "npx", "-y",
+            "@modelcontextprotocol/server-filesystem@2.3.0",
+            "--read-only", directory
+        ]
+        env = os.environ.copy()
+    elif name == "playwright":
+        command = [
+            "npx", "-y", "@playwright/mcp@latest",
+            "--headless"
+        ]
+        env = os.environ.copy()
+    else:
+        print("No verification recipe:", name)
+        return 1
+
+    print("Verifying MCP:", name, flush=True)
+    print("Starting server...", flush=True)
+
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        bufsize=0
+    )
+
+    buffer = bytearray()
+    deadline = time.monotonic() + 90
+
+    def send(message):
+        data = json.dumps(message, separators=(",", ":"))
+        proc.stdin.write((data + "\\n").encode())
+        proc.stdin.flush()
+
+    def receive(request_id):
+        nonlocal buffer
+
+        while time.monotonic() < deadline:
+            while b"\\n" in buffer:
+                line, _, rest = buffer.partition(b"\\n")
+                buffer = bytearray(rest)
+
+                try:
+                    message = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+
+                if message.get("id") == request_id:
+                    return message
+
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"MCP server exited early: {proc.returncode}"
+                )
+
+            remaining = max(0, deadline - time.monotonic())
+            readable, _, _ = select.select(
+                [proc.stdout], [], [], min(remaining, 1)
+            )
+
+            if readable:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError("MCP server closed stdout")
+                buffer.extend(chunk)
+
+        raise TimeoutError("MCP verification timed out (90s)")
+
+    try:
+        send({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "ssnake-mcp-verifier",
+                    "version": "1.0"
+                }
+            }
+        })
+
+        initialized = receive(1)
+        if "error" in initialized:
+            raise RuntimeError(str(initialized["error"]))
+
+        result = initialized.get("result", {})
+        if not result.get("protocolVersion"):
+            raise RuntimeError("Invalid initialize response")
+
+        print("Initialize: OK")
+        print("Protocol:", result["protocolVersion"])
+
+        send({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })
+
+        send({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        })
+
+        response = receive(2)
+        if "error" in response:
+            raise RuntimeError(str(response["error"]))
+
+        tools = response.get("result", {}).get("tools")
+        if not isinstance(tools, list):
+            raise RuntimeError("Invalid tools/list response")
+
+        print("Tools:", len(tools))
+        print("[OK] MCP protocol verification successful")
+        return 0
+
+    except (OSError, RuntimeError, TimeoutError) as error:
+        print("[FAIL]", error)
+        return 1
+
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc.stdin:
+            proc.stdin.close()
+        if proc.stdout:
+            proc.stdout.close()
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -68,6 +228,12 @@ def main():
 
         print("Cleanup complete. REA was preserved.")
         return 0
+
+    if action == "verify":
+        if len(args) != 2:
+            print("Usage: mcp verify NAME")
+            return 1
+        return verify_mcp(args[1])
 
     servers = registry()
 
