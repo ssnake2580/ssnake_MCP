@@ -1,0 +1,256 @@
+{
+  "executive_summary": "DC01 (10.42.85.10), a Windows Server 2012 R2 domain controller, is CONFIRMED COMPROMISED. Memory forensics of citadeldc01.mem (captured 2020-09-19) reveals a multi-stage intrusion: a rogue process named coreupdater.ex (PID 3644) established a confirmed outbound C2 connection to 203.78.103.109:443 before self-terminating after a 15-second execution window. Code injection is confirmed in five processes — Microsoft.Acti (PID 1292, 5 regions), spoolsv.exe (PID 3724, 4 regions), ServerManager. (PID 400, 3 regions), explorer.exe (PID 3472, 2 regions), and svchost.exe (PID 1236, 1 region) — totaling 15 anonymous PAGE_EXECUTE_READWRITE memory regions consistent with shellcode staging or reflective DLL injection. Three processes carry phantom/non-existent parent PIDs (coreupdater.ex PPID 2244, explorer.exe PPID 3960, ServerManager. PPID 1904), indicating remote execution delivery where the spawning process exited before capture. The attacker operated in Session 2 (a second interactive session on the DC) and had approximately 39 minutes of unobserved activity between coreupdater.ex execution (03:56 UTC) and forensic acquisition (04:37 UTC). The domain controller's privileged position — with injection confirmed in the Active Directory Web Services process (ADWS) — means full domain credential and directory compromise must be assumed. The sole confirmed external C2 endpoint is 203.78.103.109:443 and must be blocked immediately across all perimeter controls.",
+  "findings": [
+    {
+      "claim": "A rogue process named coreupdater.ex (PID 3644) was present in memory with a phantom parent PID 2244 that does not exist in the 40-process list, ran in anomalous Session 2, had zero threads at capture time, and had already exited (created 03:56:37 UTC, exited 03:56:52 UTC — a 15-second lifespan).",
+      "status": "confirmed",
+      "tool_call_id": "5c6631224a9284e459ee624cc1226edaf34985a546f60d1d908cd6d6c159510e",
+      "evidence_excerpt": "{\"pid\": 3644, \"ppid\": 2244, \"name\": \"coreupdater.ex\", \"threads\": 0, \"session_id\": 2, \"create_time\": \"2020-09-19T03:56:37+00:00\", \"exit_time\": \"2020-09-19T03:56:52+00:00\"}"
+    },
+    {
+      "claim": "coreupdater.ex (PID 3644) had no recoverable command-line arguments (null), consistent with fileless execution or a self-deleting binary.",
+      "status": "confirmed",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db",
+      "evidence_excerpt": "{\"pid\": 3644, \"process\": \"coreupdater.ex\", \"args\": null}"
+    },
+    {
+      "claim": "coreupdater.ex (PID 3644) had an ESTABLISHED outbound TCP connection from 10.42.85.10:62613 to the external IP 203.78.103.109 on port 443 at the time of memory capture.",
+      "status": "confirmed",
+      "tool_call_id": "cb5ea571ee90915f4e7b36a9b241ce2bfde7f883c44641c5381e0b986f6c81ac",
+      "evidence_excerpt": "{\"proto\": \"TCPv4\", \"local_addr\": \"10.42.85.10\", \"local_port\": 62613, \"foreign_addr\": \"203.78.103.109\", \"foreign_port\": 443, \"state\": \"ESTABLISHED\", \"pid\": 3644, \"owner\": \"coreupdater.ex\"}"
+    },
+    {
+      "claim": "Microsoft.Acti (PID 1292, full binary Microsoft.ActiveDirectory.WebServices.exe) contains 5 injected anonymous memory regions with PAGE_EXECUTE_READWRITE protection and VadS tag — the highest injection count of any process on the system.",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1",
+      "evidence_excerpt": "{\"pid\": 1292, \"process\": \"Microsoft.Acti\", \"protection\": \"PAGE_EXECUTE_READWRITE\", \"tag\": \"VadS\"} [5 entries for PID 1292]"
+    },
+    {
+      "claim": "The full command-line path for Microsoft.Acti (PID 1292) is C:\\Windows\\ADWS\\Microsoft.ActiveDirectory.WebServices.exe, confirming it is the Active Directory Web Services process — a SYSTEM-level process with direct access to the AD database.",
+      "status": "confirmed",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db",
+      "evidence_excerpt": "{\"pid\": 1292, \"process\": \"Microsoft.Acti\", \"args\": \"C:\\\\Windows\\\\ADWS\\\\Microsoft.ActiveDirectory.WebServices.exe\"}"
+    },
+    {
+      "claim": "spoolsv.exe (PID 3724) contains 4 injected anonymous memory regions with PAGE_EXECUTE_READWRITE protection and VadS tag, ranging from approximately 144 KB to 896 KB in size.",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1",
+      "evidence_excerpt": "{\"pid\": 3724, \"process\": \"spoolsv.exe\", \"protection\": \"PAGE_EXECUTE_READWRITE\", \"tag\": \"VadS\"} [4 entries for PID 3724]"
+    },
+    {
+      "claim": "spoolsv.exe (PID 3724) started at 03:29:40 UTC — approximately 2 hours and 7 minutes after system boot at 01:22:38 UTC — which is anomalous because the Print Spooler service starts at boot time.",
+      "status": "confirmed",
+      "tool_call_id": "5c6631224a9284e459ee624cc1226edaf34985a546f60d1d908cd6d6c159510e",
+      "evidence_excerpt": "{\"pid\": 3724, \"ppid\": 452, \"name\": \"spoolsv.exe\", \"create_time\": \"2020-09-19T03:29:40+00:00\"} vs System create_time \"2020-09-19T01:22:38+00:00\""
+    },
+    {
+      "claim": "explorer.exe (PID 3472) contains 2 injected anonymous memory regions with PAGE_EXECUTE_READWRITE protection and VadS tag, each approximately 4 KB in size (consistent with shellcode stubs or trampolines).",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1",
+      "evidence_excerpt": "{\"pid\": 3472, \"process\": \"explorer.exe\", \"protection\": \"PAGE_EXECUTE_READWRITE\", \"tag\": \"VadS\"} [2 entries for PID 3472]"
+    },
+    {
+      "claim": "explorer.exe (PID 3472) has a phantom parent PID 3960 that does not exist anywhere in the 40-process list.",
+      "status": "confirmed",
+      "tool_call_id": "2d685da4ccf3d1de63975f99298be0f40ae002ae2fc7a4cf75f6cfab57964f15",
+      "evidence_excerpt": "{\"pid\": 3472, \"ppid\": 3960, \"name\": \"explorer.exe\"} — PID 3960 absent from all 40 process entries"
+    },
+    {
+      "claim": "ServerManager. (PID 400) contains 3 injected anonymous memory regions with PAGE_EXECUTE_READWRITE protection and VadS tag, each approximately 52–64 KB in size.",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1",
+      "evidence_excerpt": "{\"pid\": 400, \"process\": \"ServerManager.\", \"protection\": \"PAGE_EXECUTE_READWRITE\", \"tag\": \"VadS\"} [3 entries for PID 400]"
+    },
+    {
+      "claim": "ServerManager. (PID 400) has a phantom parent PID 1904 that does not exist in the process list, and has null command-line arguments.",
+      "status": "confirmed",
+      "tool_call_id": "2d685da4ccf3d1de63975f99298be0f40ae002ae2fc7a4cf75f6cfab57964f15",
+      "evidence_excerpt": "{\"pid\": 400, \"ppid\": 1904, \"name\": \"ServerManager.\"} — PID 1904 absent from all 40 process entries"
+    },
+    {
+      "claim": "ServerManager. (PID 400) has null command-line arguments, consistent with fileless execution or process hollowing.",
+      "status": "confirmed",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db",
+      "evidence_excerpt": "{\"pid\": 400, \"process\": \"ServerManager.\", \"args\": null}"
+    },
+    {
+      "claim": "svchost.exe (PID 1236, command line: svchost.exe -k LocalSystemNetworkRestricted) contains 1 injected anonymous memory region with PAGE_EXECUTE_READWRITE protection and VadS tag, approximately 4 KB in size.",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1",
+      "evidence_excerpt": "{\"pid\": 1236, \"process\": \"svchost.exe\", \"start\": 116248150016, \"end\": 116248154111, \"protection\": \"PAGE_EXECUTE_READWRITE\", \"tag\": \"VadS\"}"
+    },
+    {
+      "claim": "The total injection count across the memory image is 15 anonymous PAGE_EXECUTE_READWRITE VadS regions across 5 processes (Microsoft.Acti: 5, spoolsv.exe: 4, ServerManager.: 3, explorer.exe: 2, svchost.exe: 1). All legitimate code is file-backed; VadS anonymous RWX regions have no on-disk backing and are the canonical signature of shellcode or reflective DLL injection.",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1",
+      "evidence_excerpt": "{\"injection_count\": 15, \"total_scanned\": 15} — all 15 entries carry protection PAGE_EXECUTE_READWRITE and tag VadS"
+    },
+    {
+      "claim": "Three separate processes have phantom parent PIDs that do not exist in the 40-process list: coreupdater.ex (PPID 2244), explorer.exe (PPID 3960), and ServerManager. (PPID 1904). This pattern is consistent with remote execution delivery (WMI, PsExec, scheduled tasks) where the spawning process exits before memory capture.",
+      "status": "confirmed",
+      "tool_call_id": "2d685da4ccf3d1de63975f99298be0f40ae002ae2fc7a4cf75f6cfab57964f15",
+      "evidence_excerpt": "Process list of 40 entries contains no PID 2244, no PID 3960, and no PID 1904; coreupdater.ex ppid=2244, explorer.exe ppid=3960, ServerManager. ppid=1904"
+    },
+    {
+      "claim": "The only external (non-loopback, non-link-local) ESTABLISHED TCP connection in the entire memory image is the C2 connection from coreupdater.ex to 203.78.103.109:443. All other ESTABLISHED connections are loopback or link-local (LDAP, DFS, DNS — legitimate DC traffic).",
+      "status": "confirmed",
+      "tool_call_id": "cb5ea571ee90915f4e7b36a9b241ce2bfde7f883c44641c5381e0b986f6c81ac",
+      "evidence_excerpt": "17 ESTABLISHED connections total; 16 are loopback/link-local; only {\"proto\": \"TCPv4\", \"local_addr\": \"10.42.85.10\", \"local_port\": 62613, \"foreign_addr\": \"203.78.103.109\", \"foreign_port\": 443, \"state\": \"ESTABLISHED\", \"pid\": 3644, \"owner\": \"coreupdater.ex\"} is external"
+    },
+    {
+      "claim": "coreupdater.ex ran in Session 2 on the domain controller. On a Windows Server 2012 R2 DC, Session 0 is the service session and Session 1 is the first interactive/console logon. Session 2 indicates a second interactive or RDP session — consistent with an attacker-controlled remote logon.",
+      "status": "confirmed",
+      "tool_call_id": "5c6631224a9284e459ee624cc1226edaf34985a546f60d1d908cd6d6c159510e",
+      "evidence_excerpt": "{\"pid\": 3644, \"name\": \"coreupdater.ex\", \"session_id\": 2}"
+    },
+    {
+      "claim": "The forensic acquisition tool FTK Imager.exe (PID 2840) was launched at 04:37:04 UTC as a child of explorer.exe (PID 3472), approximately 39 minutes after coreupdater.ex executed at 03:56:37 UTC. The attacker had an unobserved window of approximately 39 minutes before acquisition began.",
+      "status": "confirmed",
+      "tool_call_id": "5c6631224a9284e459ee624cc1226edaf34985a546f60d1d908cd6d6c159510e",
+      "evidence_excerpt": "{\"pid\": 2840, \"ppid\": 3472, \"name\": \"FTK Imager.exe\", \"create_time\": \"2020-09-19T04:37:04+00:00\"} vs coreupdater.ex create_time \"2020-09-19T03:56:37+00:00\""
+    },
+    {
+      "claim": "The injected payloads in Microsoft.Acti (PID 1292), spoolsv.exe (PID 3724), explorer.exe (PID 3472), ServerManager. (PID 400), and svchost.exe (PID 1236) were still resident in memory at the time of forensic acquisition, meaning the malicious code was actively loaded in these processes when the image was captured.",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1",
+      "evidence_excerpt": "malfind returned 15 live injection entries across 5 processes with no exit_time indicators — all processes were running at capture time per pslist"
+    },
+    {
+      "claim": "The intrusion vector most likely involved a second interactive session (Session 2) on the DC, consistent with RDP access or a second console session controlled by the attacker, from which coreupdater.ex was launched.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "coreupdater.ex functioned as a first-stage dropper or stager: it connected to C2 (203.78.103.109:443), received or deployed a payload, injected it into resident processes (Microsoft.Acti, spoolsv.exe, explorer.exe, ServerManager., svchost.exe), then self-terminated to reduce footprint — all within a 15-second execution window.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The injected code in Microsoft.Acti (ADWS) likely performs credential harvesting or Active Directory enumeration, given that ADWS runs as SYSTEM with direct access to the AD data model and is the highest-value injection target on the system.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The multi-region injection pattern in spoolsv.exe (4 large anonymous RWX regions ranging from ~144 KB to ~896 KB) is consistent with a reflective DLL loader such as Cobalt Strike or Metasploit Meterpreter.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "Active Directory credentials and domain integrity are likely compromised. A SYSTEM-level process (ADWS) with injected code on a DC, combined with a 39-minute unobserved window, is sufficient for DCSync attacks, rogue account creation, Domain Admin group modification, or GPO backdooring.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "coreupdater.ex likely had no on-disk presence at the time of capture — null command-line arguments and a phantom parent are consistent with fileless execution (e.g., PowerShell download-and-execute, WMI script, or reflective injection from a remote process) with no binary written to disk.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    }
+  ],
+  "iocs": [
+    {
+      "type": "ip",
+      "value": "203.78.103.109",
+      "tool_call_id": "cb5ea571ee90915f4e7b36a9b241ce2bfde7f883c44641c5381e0b986f6c81ac"
+    },
+    {
+      "type": "url",
+      "value": "203.78.103.109:443/tcp",
+      "tool_call_id": "cb5ea571ee90915f4e7b36a9b241ce2bfde7f883c44641c5381e0b986f6c81ac"
+    },
+    {
+      "type": "process",
+      "value": "coreupdater.ex (PID 3644, Session 2, PPID 2244 phantom, created 2020-09-19T03:56:37Z, exited 2020-09-19T03:56:52Z)",
+      "tool_call_id": "5c6631224a9284e459ee624cc1226edaf34985a546f60d1d908cd6d6c159510e"
+    },
+    {
+      "type": "process",
+      "value": "Microsoft.Acti (PID 1292) — 5 injected VadS PAGE_EXECUTE_READWRITE regions — C:\\Windows\\ADWS\\Microsoft.ActiveDirectory.WebServices.exe",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "type": "process",
+      "value": "spoolsv.exe (PID 3724) — 4 injected VadS PAGE_EXECUTE_READWRITE regions — anomalous start 03:29:40 UTC",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "type": "process",
+      "value": "explorer.exe (PID 3472, PPID 3960 phantom) — 2 injected VadS PAGE_EXECUTE_READWRITE regions",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "type": "process",
+      "value": "ServerManager. (PID 400, PPID 1904 phantom, null cmdline) — 3 injected VadS PAGE_EXECUTE_READWRITE regions",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "type": "process",
+      "value": "svchost.exe (PID 1236, -k LocalSystemNetworkRestricted) — 1 injected VadS PAGE_EXECUTE_READWRITE region",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "type": "path",
+      "value": "C:\\Windows\\ADWS\\Microsoft.ActiveDirectory.WebServices.exe",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db"
+    },
+    {
+      "type": "path",
+      "value": "C:\\Windows\\System32\\spoolsv.exe",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db"
+    },
+    {
+      "type": "other",
+      "value": "Phantom PPID 2244 (parent of coreupdater.ex PID 3644) — non-existent process",
+      "tool_call_id": "2d685da4ccf3d1de63975f99298be0f40ae002ae2fc7a4cf75f6cfab57964f15"
+    },
+    {
+      "type": "other",
+      "value": "Phantom PPID 3960 (parent of explorer.exe PID 3472) — non-existent process",
+      "tool_call_id": "2d685da4ccf3d1de63975f99298be0f40ae002ae2fc7a4cf75f6cfab57964f15"
+    },
+    {
+      "type": "other",
+      "value": "Phantom PPID 1904 (parent of ServerManager. PID 400) — non-existent process",
+      "tool_call_id": "2d685da4ccf3d1de63975f99298be0f40ae002ae2fc7a4cf75f6cfab57964f15"
+    },
+    {
+      "type": "other",
+      "value": "Session 2 process on domain controller — coreupdater.ex PID 3644 — indicates attacker-controlled second interactive session",
+      "tool_call_id": "5c6631224a9284e459ee624cc1226edaf34985a546f60d1d908cd6d6c159510e"
+    },
+    {
+      "type": "other",
+      "value": "15 VadS PAGE_EXECUTE_READWRITE anonymous memory regions across 5 processes — memory injection pattern",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "type": "other",
+      "value": "Network connection artifact: 10.42.85.10:62613 -> 203.78.103.109:443 ESTABLISHED (TCPv4, owner coreupdater.ex PID 3644)",
+      "tool_call_id": "cb5ea571ee90915f4e7b36a9b241ce2bfde7f883c44641c5381e0b986f6c81ac"
+    }
+  ],
+  "open_questions": [
+    "What is the full binary name and hash of coreupdater.exe? No disk image is available; if a disk image is obtained, the binary should be extracted from its inode and submitted to threat intelligence platforms.",
+    "What payload was delivered via the C2 connection to 203.78.103.109:443? The 15-second execution window suggests a download-and-inject operation; network capture (PCAP) from the 03:56 UTC window would answer this.",
+    "What account was used for the Session 2 logon that spawned coreupdater.ex? Windows Security Event Log (Event ID 4624) would identify the logon account, source IP, and logon type — not available in this memory-only case.",
+    "Were any Active Directory objects (accounts, groups, GPOs, ACLs) modified during the 39-minute unobserved window (03:56–04:37 UTC)? Requires AD audit logs or a domain controller event log review.",
+    "What process spawned coreupdater.ex (PPID 2244)? The parent process exited before capture; its identity (WMI provider host, PowerShell, cmd.exe, etc.) would reveal the delivery mechanism.",
+    "Has 203.78.103.109 been used in other intrusions? Threat intelligence lookup required — this IP may be attributed to a known threat actor or campaign.",
+    "Are other domain controllers or domain-joined systems in the environment also compromised? Lateral movement from DC01 is likely given the 39-minute unobserved window; memory acquisition from other DCs is recommended.",
+    "What persistence mechanisms were installed? Scheduled tasks, service registry keys, WMI subscriptions, and startup folder entries cannot be examined without a disk image or registry hive.",
+    "What is the full extent of the spoolsv.exe anomaly? The Print Spooler service restarting 2h7m post-boot may indicate exploitation of a PrintNightmare-class vulnerability (CVE-2021-1675 / CVE-2021-34527) or manual service manipulation — requires disk and event log analysis to confirm.",
+    "Was LSASS (PID 460, 31 threads) directly targeted for credential dumping? LSASS memory was not directly analyzed in this pass; a targeted malfind or handles analysis of PID 460 would determine if it was also injected."
+  ],
+  "enforcement": {
+    "audit_chain_ok": true,
+    "confirmed": 19,
+    "inferred": 6,
+    "downgraded": 0
+  },
+  "report_audit_id": "50be50f15a60698cb99c1d0970bcc5e37ea308f1a5aae8906c4cf93c0c0d6283"
+}

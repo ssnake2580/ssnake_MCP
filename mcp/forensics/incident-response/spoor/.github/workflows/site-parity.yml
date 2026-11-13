@@ -1,0 +1,75 @@
+name: site-parity
+
+on:
+  # The honesty gate (export → chain verify → drift → build) must guard `main`
+  # directly, not only the PRs that target it — a direct push to main must re-run
+  # it too. Both events share one path list (YAML anchor) so they can't drift apart.
+  push:
+    branches: [main]
+    paths: &parity_paths
+      - "web/**"
+      - "runs/**"
+      - "scripts/export_site_data.py"
+      - "spoor_sift/accuracy.py"
+      - "spoor_sift/audit.py"
+      - "pyproject.toml"
+      - "uv.lock"
+  pull_request:
+    paths: *parity_paths
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python toolchain — uv with lock-file caching
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # Node toolchain — Next.js 16 requires >=20.9.0; use 22 LTS (matches local v24 philosophy)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      # ── Python gate ─────────────────────────────────────────────────────────
+      # 1. Install the spoor package (base deps only — no forensics extra needed;
+      #    export_site_data.py only imports spoor_sift.accuracy + spoor_sift.audit,
+      #    and `uv run spoor verify-audit` only needs the CLI entrypoint).
+      # 2. Re-generate the committed export from the canonical run.
+      # 3. Independently verify the audit chain via the CLI (the same gate the
+      #    site's TS verifier is cross-checked against).
+      - name: Python — install, export gate, and audit chain verify
+        run: |
+          uv sync
+          uv run python scripts/export_site_data.py
+          uv run spoor verify-audit runs/2026-06-12-231634-case001-real/audit.jsonl
+
+      # ── Drift gate ──────────────────────────────────────────────────────────
+      # Fail fast if the committed web/data/case001.json no longer matches what
+      # a fresh export produces. A non-zero exit means the export is stale or
+      # the script output is non-deterministic — both are bugs that must be fixed
+      # before merge, not papered over.
+      - name: Fail if committed export drifted from a fresh export
+        run: git diff --exit-code web/data/case001.json
+
+      # ── Node gate ───────────────────────────────────────────────────────────
+      # Unit tests exercise the TS verifier (SHA-256 recompute + chain walk) and
+      # the build step runs scripts/verify-data.ts before next build, so a broken
+      # chain or schema mismatch surfaces here too.
+      - name: Node — unit tests and build gate
+        run: |
+          cd web
+          # npm install (not ci): Tailwind v4's native engine (@tailwindcss/oxide)
+          # pulls platform-specific optional deps (the @emnapi wasm fallback) that a
+          # macOS-generated lockfile can't fully satisfy under strict `npm ci` on
+          # Linux. install reconciles them; the honesty gates below are unaffected.
+          npm install --no-audit --no-fund
+          npm test
+          npm run build

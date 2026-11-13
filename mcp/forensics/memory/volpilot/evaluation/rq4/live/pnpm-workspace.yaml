@@ -1,0 +1,7 @@
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  '@playwright/browser-chromium': false
+  '@swc/core': false
+  onnxruntime-node: false
+  protobufjs: false

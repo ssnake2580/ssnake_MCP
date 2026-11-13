@@ -1,0 +1,118 @@
+diff --git a/vol_wrapper.py b/vol_wrapper.py
+new file mode 100644
+index 0000000..b6f71cf
+--- /dev/null
++++ b/vol_wrapper.py
+@@ -0,0 +1,14 @@
++"""Tiny shim that satisfies bornpresident's ``python vol.py`` invocation
++pattern using the pip-installed volatility3 package.
++
++The bornpresident server runs ``[python, VOLATILITY_SCRIPT, *args]`` for
++every tool call. By setting VOLATILITY_SCRIPT to this wrapper, we let
++the server keep its subprocess-of-vol.py architecture intact while
++using the canonical volatility3 v2.28.0 package that ships with this
++isolated venv.
++"""
++
++from volatility3 import cli
++
++if __name__ == "__main__":
++    cli.main()
+diff --git a/volatility_mcp_server.py b/volatility_mcp_server.py
+index 8bd6c1c..77495d8 100644
+--- a/volatility_mcp_server.py
++++ b/volatility_mcp_server.py
+@@ -12,9 +12,10 @@ from mcp.server.fastmcp import FastMCP, Context
+ mcp = FastMCP("VolatilityForensics")
+ 
+ 
+-VOLATILITY_PYTHON = sys.executable  
+-VOLATILITY_DIR = os.path.normpath(r"C:\Users\visha\Desktop\volatility3")
+-VOLATILITY_SCRIPT = os.path.join(VOLATILITY_DIR, "vol.py")
++# PATCH (eval/v2): honor env vars for portability across hosts.
++VOLATILITY_PYTHON = os.environ.get("VOLATILITY_PYTHON", sys.executable)
++VOLATILITY_DIR = os.environ.get("VOLATILITY_DIR", os.path.normpath(r"C:\Users\visha\Desktop\volatility3"))
++VOLATILITY_SCRIPT = os.environ.get("VOLATILITY_SCRIPT", os.path.join(VOLATILITY_DIR, "vol.py"))
+ 
+ 
+ async def run_volatility(cmd_args, cwd=VOLATILITY_DIR):
+@@ -22,19 +23,31 @@ async def run_volatility(cmd_args, cwd=VOLATILITY_DIR):
+     cmd = [VOLATILITY_PYTHON, VOLATILITY_SCRIPT] + cmd_args
+     
+     try:
++        # PATCH (eval/v3): on Windows + Python 3.13, omitting stdin causes
++        # the child to inherit the parent's stdin handle (the MCP stdio pipe),
++        # which can deadlock subprocess.communicate(). Force DEVNULL.
+         process = await asyncio.create_subprocess_exec(
+             *cmd,
++            stdin=asyncio.subprocess.DEVNULL,
+             stdout=subprocess.PIPE,
+             stderr=subprocess.PIPE,
+-            cwd=cwd 
++            cwd=cwd
+         )
+         stdout, stderr = await process.communicate()
+-        
+-        if process.returncode != 0:
++
++        stdout_text = stdout.decode('utf-8', errors='replace')
++
++        # PATCH eval/v4: vol.py uses rc=1 as a warning indicator for plugins
++        # like windows.dlllist when some processes refuse DLL enumeration; the
++        # stdout payload is still complete (e.g. ~441 KB of valid DLL rows on
++        # win11.mem). Upstream returned only the stderr error message and
++        # discarded stdout, costing >80% of the chain's data. We now return
++        # stdout whenever it is non-empty regardless of returncode.
++        if process.returncode != 0 and not stdout_text.strip():
+             stderr_text = stderr.decode('utf-8', errors='replace')
+             return f"Error running Volatility command: {stderr_text}"
+-        
+-        return stdout.decode('utf-8', errors='replace')
++
++        return stdout_text
+     except Exception as e:
+         return f"Exception running Volatility: {str(e)}"
+ 
+@@ -89,14 +102,20 @@ async def run_netscan(memory_dump_path: str) -> str:
+     return await run_volatility(["-f", memory_dump_path, "windows.netscan.NetScan"])
+ 
+ @mcp.tool()
+-async def run_malfind(memory_dump_path: str, dump_dir: Optional[str] = None) -> str:
+-
++async def run_malfind(memory_dump_path: str, dump_dir: Optional[str] = None, pid: Optional[int] = None) -> str:
++    # PATCH eval/v2: added optional pid parameter so the W2 chain can
++    # invoke malfind against a single representative process on large
++    # images where scanning all PIDs is impractical (>7 min on a
++    # 227-process win11 image vs <2 s for a single PID).
+     memory_dump_path = os.path.normpath(memory_dump_path)
+     if not os.path.isfile(memory_dump_path):
+         return f"Error: Memory dump file not found at {memory_dump_path}"
+-    
++
+     cmd_args = ["-f", memory_dump_path, "windows.malfind.Malfind"]
+-    
++
++    if pid is not None:
++        cmd_args.extend(["--pid", str(pid)])
++
+     if dump_dir:
+         dump_dir = os.path.normpath(dump_dir)
+         if not os.path.isdir(dump_dir):
+@@ -105,7 +124,7 @@ async def run_malfind(memory_dump_path: str, dump_dir: Optional[str] = None) ->
+             except Exception as e:
+                 return f"Error creating dump directory: {str(e)}"
+         cmd_args.extend(["--dump-dir", dump_dir])
+-    
++
+     result = await run_volatility(cmd_args)
+     
+     if dump_dir and os.path.exists(dump_dir):
+@@ -140,7 +159,7 @@ async def run_dlllist(memory_dump_path: str, pid: Optional[int] = None) -> str:
+ 
+ @mcp.tool()
+ async def run_handles(memory_dump_path: str, pid: Optional[int] = None) -> str:
+-ts
++    # PATCH (eval/v2): removed stray 'ts' token that broke syntax in upstream.
+     memory_dump_path = os.path.normpath(memory_dump_path)
+     if not os.path.isfile(memory_dump_path):
+         return f"Error: Memory dump file not found at {memory_dump_path}"

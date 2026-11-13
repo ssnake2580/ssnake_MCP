@@ -1,0 +1,29 @@
+{
+  "image": "C:\\Users\\Anonymous\\Documents\\GitHub\\VolPilot\\win11.mem",
+  "runs": 2,
+  "tokenizer": "tiktoken/cl100k_base",
+  "results": {
+    "VolPilot (ours)": {
+      "n_processes": 249,
+      "n_processes_consistent": true,
+      "bytes_mean": 61089,
+      "bytes_std": 0.0,
+      "tokens_mean": 24356,
+      "tokens_std": 0.0,
+      "latency_mean": 1.4800225999997565,
+      "latency_std": 0.008725556256922819,
+      "trials": 2
+    },
+    "vol.py text (subprocess)": {
+      "n_processes": 249,
+      "n_processes_consistent": true,
+      "bytes_mean": 23866,
+      "bytes_std": 0.0,
+      "tokens_mean": 12359,
+      "tokens_std": 0.0,
+      "latency_mean": 2.409138150000217,
+      "latency_std": 0.6108741444603213,
+      "trials": 2
+    }
+  }
+}

@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 760" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f85149"/>
+    </marker>
+  </defs>
+
+  <rect width="980" height="760" fill="#0d1117"/>
+  <text x="24" y="34" fill="#e6edf3" font-size="19" font-weight="bold">Spoor — autonomous DFIR agent</text>
+  <text x="24" y="54" fill="#8b949e" font-size="12">LangGraph orchestration · MCP tool layer · architectural guardrails · tamper-evident audit</text>
+
+  <!-- ══ ORCHESTRATION LAYER ══ -->
+  <rect x="24" y="72" width="660" height="190" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="40" y="96" fill="#58a6ff" font-size="13" font-weight="bold">ORCHESTRATION — LangGraph supervisor graph (checkpointed)</text>
+
+  <rect x="40" y="110" width="180" height="58" rx="6" fill="#1f2937" stroke="#58a6ff"/>
+  <text x="130" y="134" fill="#e6edf3" font-size="12" font-weight="bold" text-anchor="middle">Lead Investigator</text>
+  <text x="130" y="152" fill="#8b949e" font-size="10" text-anchor="middle">routes · re-routes on failure</text>
+
+  <g font-size="11" fill="#e6edf3">
+    <rect x="250" y="106" width="100" height="34" rx="5" fill="#1f2937" stroke="#30363d"/>
+    <text x="300" y="127" text-anchor="middle">triage</text>
+    <rect x="358" y="106" width="100" height="34" rx="5" fill="#1f2937" stroke="#30363d"/>
+    <text x="408" y="127" text-anchor="middle">timeline</text>
+    <rect x="466" y="106" width="110" height="34" rx="5" fill="#1f2937" stroke="#30363d"/>
+    <text x="521" y="127" text-anchor="middle">ioc_correlation</text>
+    <rect x="250" y="148" width="100" height="34" rx="5" fill="#1f2937" stroke="#bc8cff"/>
+    <text x="300" y="169" text-anchor="middle">reporter</text>
+  </g>
+  <path d="M 220 139 L 244 123" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 220 150 L 244 165" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="358" y="148" width="310" height="100" rx="6" fill="#1b1430" stroke="#bc8cff"/>
+  <text x="370" y="168" fill="#bc8cff" font-size="11" font-weight="bold">CITATION CONTRACT (enforced in code — submit_report)</text>
+  <text x="370" y="186" fill="#c9d1d9" font-size="10">"confirmed" ⇢ must cite a tool_call_id present in the</text>
+  <text x="370" y="200" fill="#c9d1d9" font-size="10">VERIFIED hash chain — else downgraded to inference.</text>
+  <text x="370" y="214" fill="#c9d1d9" font-size="10">Broken chain ⇒ nothing is confirmable. The report's own</text>
+  <text x="370" y="228" fill="#c9d1d9" font-size="10">content hash is sealed onto the chain (tamper-evident).</text>
+  <path d="M 300 182 L 300 196 L 352 196" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Human + approval gate -->
+  <rect x="724" y="72" width="232" height="84" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="840" y="98" fill="#e6edf3" font-size="13" font-weight="bold" text-anchor="middle">Human analyst</text>
+  <text x="840" y="116" fill="#8b949e" font-size="10" text-anchor="middle">case brief · resume decisions</text>
+  <text x="840" y="132" fill="#8b949e" font-size="10" text-anchor="middle">reads the enforced report</text>
+
+  <rect x="724" y="180" width="232" height="100" rx="8" fill="#2a1416" stroke="#f85149" stroke-width="1.5"/>
+  <text x="840" y="203" fill="#f85149" font-size="12" font-weight="bold" text-anchor="middle">B4 · APPROVAL GATE</text>
+  <text x="840" y="221" fill="#c9d1d9" font-size="10" text-anchor="middle">live actions call interrupt()</text>
+  <text x="840" y="236" fill="#c9d1d9" font-size="10" text-anchor="middle">BEFORE any side effect — graph halts;</text>
+  <text x="840" y="251" fill="#c9d1d9" font-size="10" text-anchor="middle">only a human resume continues it.</text>
+  <text x="840" y="266" fill="#c9d1d9" font-size="10" text-anchor="middle">Approve AND reject are audited.</text>
+  <path d="M 840 156 L 840 176" stroke="#f85149" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+  <path d="M 684 152 L 720 200" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrowRed)"/>
+  <text x="700" y="178" fill="#f85149" font-size="9">isolate_host</text>
+
+  <!-- ══ MCP / TOOL LAYER ══ -->
+  <path d="M 354 262 L 354 296" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="364" y="284" fill="#8b949e" font-size="10">MCP (stdio) — same surface for Claude Code / IDEs</text>
+
+  <rect x="24" y="300" width="660" height="160" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="40" y="324" fill="#58a6ff" font-size="13" font-weight="bold">MCP SERVER — spoor-sift (FastMCP) · 12 read-only typed tools</text>
+  <g font-size="10" fill="#c9d1d9">
+    <rect x="40" y="338" width="150" height="104" rx="5" fill="#0d1117" stroke="#30363d"/>
+    <text x="52" y="356" fill="#8b949e" font-weight="bold">memory (Volatility 3)</text>
+    <text x="52" y="372">vol_pslist · vol_pstree</text>
+    <text x="52" y="386">vol_netscan (dedupe,</text>
+    <text x="52" y="400">state filter, caps)</text>
+    <text x="52" y="414">vol_malfind</text>
+    <text x="52" y="428">vol_cmdline</text>
+    <rect x="206" y="338" width="150" height="104" rx="5" fill="#0d1117" stroke="#30363d"/>
+    <text x="218" y="356" fill="#8b949e" font-weight="bold">timeline (plaso)</text>
+    <text x="218" y="372">log2timeline_run</text>
+    <text x="218" y="386">psort_query</text>
+    <text x="218" y="402" fill="#8b949e">rows capped server-side</text>
+    <text x="218" y="416" fill="#8b949e">before reaching the model</text>
+    <rect x="372" y="338" width="140" height="104" rx="5" fill="#0d1117" stroke="#30363d"/>
+    <text x="384" y="356" fill="#8b949e" font-weight="bold">disk / registry</text>
+    <text x="384" y="372">tsk_fls (deleted files)</text>
+    <text x="384" y="386">tsk_icat (extract →</text>
+    <text x="384" y="400">SHA-256 sealed)</text>
+    <text x="384" y="414">regripper_run</text>
+    <rect x="528" y="338" width="140" height="104" rx="5" fill="#0d1117" stroke="#30363d"/>
+    <text x="540" y="356" fill="#8b949e" font-weight="bold">indicators</text>
+    <text x="540" y="372">hash_file (in-process)</text>
+    <text x="540" y="386">yara_scan</text>
+    <text x="540" y="402" fill="#8b949e">failures return as data</text>
+    <text x="540" y="416" fill="#8b949e">⇒ agent self-corrects</text>
+  </g>
+
+  <!-- ══ GUARDRAIL SPINE ══ -->
+  <path d="M 354 460 L 354 492" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="24" y="496" width="660" height="124" rx="8" fill="#11261a" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="40" y="520" fill="#3fb950" font-size="13" font-weight="bold">GUARDRAIL SPINE — enforced in code, not prompts (bypass-tested)</text>
+  <g font-size="10" fill="#c9d1d9">
+    <text x="40" y="542" fill="#f85149" font-weight="bold">B1 · PATH JAIL</text>
+    <text x="40" y="558">evidence resolved + contained;</text>
+    <text x="40" y="572">symlink/traversal escapes</text>
+    <text x="40" y="586">rejected before exec</text>
+    <text x="250" y="542" fill="#f85149" font-weight="bold">B2 · NO-SHELL ALLOW-LIST</text>
+    <text x="250" y="558">only 7 forensic binaries can</text>
+    <text x="250" y="572">spawn, argv-list only — arbitrary</text>
+    <text x="250" y="586">commands impossible by construction</text>
+    <text x="490" y="542" fill="#f85149" font-weight="bold">B3 · WORKSPACE JAIL</text>
+    <text x="490" y="558">tool artifacts write ONLY to a</text>
+    <text x="490" y="572">workspace disjoint from evidence</text>
+    <text x="490" y="586">(enforced at graph build)</text>
+  </g>
+
+  <!-- ══ EXECUTION + STORAGE ══ -->
+  <path d="M 200 620 L 200 652" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="24" y="656" width="400" height="80" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="40" y="680" fill="#e6edf3" font-size="12" font-weight="bold">SIFT forensic binaries</text>
+  <text x="40" y="700" fill="#8b949e" font-size="10">vol · log2timeline.py · psort.py · fls · icat · rip.pl · yara</text>
+  <text x="40" y="718" fill="#8b949e" font-size="10">(SIFT Workstation, or native via the `forensics` extra)</text>
+
+  <rect x="448" y="656" width="180" height="80" rx="8" fill="#161b22" stroke="#f85149"/>
+  <text x="538" y="678" fill="#f85149" font-size="11" font-weight="bold" text-anchor="middle">EVIDENCE (read-only)</text>
+  <text x="538" y="696" fill="#8b949e" font-size="10" text-anchor="middle">images · hives · captures</text>
+  <text x="538" y="712" fill="#8b949e" font-size="10" text-anchor="middle">SHA-256 pre/post run</text>
+  <text x="538" y="726" fill="#8b949e" font-size="10" text-anchor="middle">proves untouched</text>
+
+  <rect x="648" y="656" width="160" height="80" rx="8" fill="#161b22" stroke="#3fb950"/>
+  <text x="728" y="678" fill="#3fb950" font-size="11" font-weight="bold" text-anchor="middle">WORKSPACE (rw)</text>
+  <text x="728" y="696" fill="#8b949e" font-size="10" text-anchor="middle">.plaso · extractions</text>
+  <text x="728" y="712" fill="#8b949e" font-size="10" text-anchor="middle">yara rules · disjoint</text>
+  <text x="728" y="726" fill="#8b949e" font-size="10" text-anchor="middle">from evidence</text>
+
+  <!-- ══ AUDIT CHAIN (right rail) ══ -->
+  <rect x="724" y="300" width="232" height="320" rx="8" fill="#1b1430" stroke="#bc8cff" stroke-width="1.5"/>
+  <text x="840" y="324" fill="#bc8cff" font-size="12" font-weight="bold" text-anchor="middle">B5 · HASH-CHAINED AUDIT</text>
+  <g font-size="10" fill="#c9d1d9">
+    <text x="840" y="344" text-anchor="middle">every tool call = one record</text>
+    <text x="840" y="358" text-anchor="middle">{ts, tool, args, exit, stdout_sha256,</text>
+    <text x="840" y="372" text-anchor="middle">prev_hash, hash}</text>
+  </g>
+  <g font-size="9" fill="#8b949e">
+    <rect x="764" y="386" width="152" height="26" rx="4" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="840" y="403" text-anchor="middle">seq 0 · prev = GENESIS</text>
+    <rect x="764" y="424" width="152" height="26" rx="4" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="840" y="441" text-anchor="middle">seq 1 · prev = hash(seq 0)</text>
+    <rect x="764" y="462" width="152" height="26" rx="4" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="840" y="479" text-anchor="middle">seq n · report sealed</text>
+  </g>
+  <path d="M 840 412 L 840 420" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 840 450 L 840 458" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <g font-size="10" fill="#c9d1d9">
+    <text x="840" y="510" text-anchor="middle">edits / deletions / reorders</text>
+    <text x="840" y="524" text-anchor="middle">break the chain ⇒ detected by</text>
+    <text x="840" y="538" text-anchor="middle" fill="#bc8cff">spoor verify-audit</text>
+    <text x="840" y="560" text-anchor="middle">concurrency-safe under</text>
+    <text x="840" y="574" text-anchor="middle">parallel tool calls</text>
+    <text x="840" y="596" text-anchor="middle" fill="#8b949e">findings trace to the exact</text>
+    <text x="840" y="610" text-anchor="middle" fill="#8b949e">execution that produced them</text>
+  </g>
+  <path d="M 684 380 L 720 380" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- legend -->
+  <text x="24" y="752" fill="#8b949e" font-size="10">Security boundaries: <tspan fill="#f85149">B1 path jail · B2 no-shell allow-list · B3 workspace/evidence disjointness · B4 human approval interrupt</tspan> · <tspan fill="#bc8cff">B5 tamper-evident audit + citation contract</tspan></text>
+</svg>

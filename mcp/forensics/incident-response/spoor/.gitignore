@@ -1,0 +1,64 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Node / TS
+node_modules/
+dist/
+build/
+out/
+.next/
+coverage/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Foundry / contracts
+cache/
+broadcast/
+artifacts/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local session handoff (not published)
+HANDOFF.md
+
+# DFIR evidence — NEVER commit images or malware-adjacent artifacts
+evidence/
+cases/
+*.raw
+*.mem
+*.vmem
+*.dmp
+*.lime
+*.aff4
+*.E01
+*.Ex01
+*.dd
+*.img
+*.plaso
+
+# Run artifacts — commit curated sample logs under runs/, ignore local/large ones
+runs/*.local
+runs/**/*.local
+# Workspace outputs inside runs are reproducible tool artifacts (extracted
+# binaries, timeline stores) — never committed; the audit log seals their hashes
+runs/**/workspace/
+
+# Brainstorm tooling (visual companion) — local only, never published
+.superpowers/
+
+# Vercel CLI link
+.vercel

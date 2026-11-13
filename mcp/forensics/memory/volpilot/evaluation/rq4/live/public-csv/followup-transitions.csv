@@ -1,0 +1,5 @@
+﻿"original_reason","cases","followup_complete","followup_response_limit","followup_read_timeout"
+"connection_failure","22","15","4","3"
+"output_limit","2","1","0","1"
+"read_timeout","19","9","7","3"
+"response_limit","156","81","67","8"

@@ -1,0 +1,52 @@
+{
+  "findings": [
+    {
+      "category": "ip",
+      "value": "203.78.103.109",
+      "status": "confirmed",
+      "tool_call_id": "cb5ea571ee90915f4e7b36a9b241ce2bfde7f883c44641c5381e0b986f6c81ac"
+    },
+    {
+      "category": "file",
+      "value": "coreupdater.ex",
+      "status": "confirmed",
+      "tool_call_id": "5c6631224a9284e459ee624cc1226edaf34985a546f60d1d908cd6d6c159510e"
+    },
+    {
+      "category": "file",
+      "value": "Microsoft.Acti",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "category": "file",
+      "value": "spoolsv.exe",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "category": "file",
+      "value": "explorer.exe",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "category": "file",
+      "value": "ServerManager.",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "category": "file",
+      "value": "svchost.exe",
+      "status": "confirmed",
+      "tool_call_id": "f45e5b6520dfe2bf97a27bd6309e9981b09afcaddce0686ba739676611bf1df1"
+    },
+    {
+      "category": "file",
+      "value": "C:\\Windows\\ADWS\\Microsoft.ActiveDirectory.WebServices.exe",
+      "status": "confirmed",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db"
+    }
+  ]
+}

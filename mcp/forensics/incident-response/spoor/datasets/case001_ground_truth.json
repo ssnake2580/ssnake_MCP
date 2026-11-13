@@ -1,0 +1,223 @@
+{
+  "case": "DFIR Madness — Case 001: The Stolen Szechuan Sauce",
+  "provenance": {
+    "source": "https://dfirmadness.com/the-stolen-szechuan-sauce/",
+    "answer_key": "https://dfirmadness.com/answers-to-szechuan-case-001/",
+    "encoded_from": "published narrative answer key (read in full)",
+    "encoded_on": "2026-06-10",
+    "status": "v1.0 — verified against the published answer key on 2026-06-10"
+  },
+  "hosts": [
+    {
+      "name": "DC01",
+      "os": "Windows Server 2012 R2",
+      "ip": "10.42.85.10",
+      "role": "Domain Controller — patient zero"
+    },
+    {
+      "name": "DESKTOP-SDN1RPT",
+      "os": "Windows 10",
+      "ip": "10.42.85.115",
+      "role": "Workstation — lateral movement target (RDP from DC01, same credentials, 02:35:55)"
+    }
+  ],
+  "iocs": {
+    "ips": [
+      {
+        "value": "194.61.24.102",
+        "role": "attacker",
+        "host": "DC01",
+        "evidence": [
+          "memory",
+          "disk",
+          "pcap"
+        ],
+        "context": "nmap probe of 3389 (02:19), Hydra RDP brute force of Administrator (02:21), and HTTP malware delivery source"
+      },
+      {
+        "value": "203.78.103.109",
+        "role": "c2",
+        "host": "DC01",
+        "evidence": [
+          "memory",
+          "pcap"
+        ],
+        "context": "coreupdater.exe command-and-control destination; briefly associated with happydoghappycat-th.com"
+      }
+    ],
+    "files": [
+      {
+        "path": "C:\\Windows\\System32\\coreupdater.exe",
+        "role": "malware",
+        "host": "DC01",
+        "evidence": [
+          "memory",
+          "disk"
+        ],
+        "sha256": null,
+        "context": "Meterpreter payload downloaded via IE at 02:24:06 (initially to Administrator Downloads, then moved to System32); installed as an AutoStart service with LocalSystem at 02:27:49. NOTE: verified against the evidence itself — the running process is coreupdater.exe (EPROCESS shows the 14-char truncation 'coreupdater.ex'); the answer-key narrative spells it 'coreupdate.exe'."
+      },
+      {
+        "name": "secret.zip",
+        "role": "exfil_archive",
+        "host": "DC01",
+        "evidence": [
+          "disk",
+          "memory"
+        ],
+        "sha256": null,
+        "context": "created ~02:30, exfiltrated and deleted ~02:31"
+      },
+      {
+        "name": "loot.zip",
+        "role": "exfil_archive",
+        "host": "DESKTOP-SDN1RPT",
+        "evidence": [
+          "disk"
+        ],
+        "sha256": null,
+        "context": "created ~02:46 on the workstation, exfiltrated and deleted ~02:48"
+      }
+    ],
+    "accounts": [
+      {
+        "value": "CITADEL\\Administrator",
+        "role": "compromised",
+        "context": "RDP brute-forced (Hydra); password published in the answer key; reused for lateral movement"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "time": "2020-09-19T02:19Z",
+      "host": "DC01",
+      "event": "nmap probe of TCP 3389 from 194.61.24.102",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:21Z",
+      "host": "DC01",
+      "event": "Hydra RDP brute force begins; Administrator login succeeds",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:24:06Z",
+      "host": "DC01",
+      "event": "coreupdater.exe downloaded over HTTP via Internet Explorer",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:27:49Z",
+      "host": "DC01",
+      "event": "malware installed as Windows AutoStart service with LocalSystem privileges",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:30Z",
+      "host": "DC01",
+      "event": "secret.zip created (exfil staging)",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:31Z",
+      "host": "DC01",
+      "event": "secret.zip exfiltrated and deleted",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:32:21Z",
+      "host": "DC01",
+      "event": "Szechuan Sauce.txt accessed",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:35:55Z",
+      "host": "DC01",
+      "event": "lateral movement: RDP from DC01 to DESKTOP-SDN1RPT re-using Administrator credentials",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:40Z",
+      "host": "DESKTOP-SDN1RPT",
+      "event": "malware downloaded to workstation",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:41Z",
+      "host": "DESKTOP-SDN1RPT",
+      "event": "persistence installed on workstation",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:46Z",
+      "host": "DESKTOP-SDN1RPT",
+      "event": "loot.zip created",
+      "confidence": "confirmed"
+    },
+    {
+      "time": "2020-09-19T02:48Z",
+      "host": "DESKTOP-SDN1RPT",
+      "event": "loot.zip exfiltrated and deleted",
+      "confidence": "confirmed"
+    }
+  ],
+  "attack_chain": [
+    {
+      "step": 1,
+      "technique": "Active Scanning",
+      "mitre": "T1595",
+      "detail": "single nmap probe of TCP 3389 from 194.61.24.102 at 02:19",
+      "source": "answer_key"
+    },
+    {
+      "step": 2,
+      "technique": "Brute Force (RDP)",
+      "mitre": "T1110",
+      "detail": "Hydra brute force of 'Administrator' on DC01 from 194.61.24.102 at 02:21",
+      "source": "answer_key"
+    },
+    {
+      "step": 3,
+      "technique": "Ingress Tool Transfer",
+      "mitre": "T1105",
+      "detail": "coreupdater.exe (Meterpreter) downloaded over HTTP via IE at 02:24:06",
+      "source": "answer_key"
+    },
+    {
+      "step": 4,
+      "technique": "Create or Modify System Process: Windows Service",
+      "mitre": "T1543.003",
+      "detail": "AutoStart service with LocalSystem privileges at 02:27:49; registry entries on both hosts",
+      "source": "answer_key"
+    },
+    {
+      "step": 5,
+      "technique": "Command and Control",
+      "mitre": "T1071",
+      "detail": "coreupdater.exe C2 to 203.78.103.109",
+      "source": "answer_key"
+    },
+    {
+      "step": 6,
+      "technique": "Exfiltration",
+      "mitre": "T1041",
+      "detail": "secret.zip (DC01, ~02:31) and loot.zip (DESKTOP, ~02:48) staged, exfiltrated, deleted",
+      "source": "answer_key"
+    },
+    {
+      "step": 7,
+      "technique": "Remote Services: RDP (lateral movement)",
+      "mitre": "T1021.001",
+      "detail": "RDP from DC01 to DESKTOP-SDN1RPT at 02:35:55 re-using Administrator credentials",
+      "source": "answer_key"
+    },
+    {
+      "step": 8,
+      "technique": "Indicator Removal / Timestomp",
+      "mitre": "T1070.006",
+      "detail": "Beth_Secret.txt timestomped ~02:38",
+      "source": "answer_key"
+    }
+  ],
+  "notes": "File hashes are not published in the answer key (null until computed from evidence). The 'evidence' and 'host' fields scope each IOC to where it is observable; a memory-only DC01 run is graded against the DC01/memory-visible subset (case001_ground_truth_dc01_memory.json) — the full-case file remains canonical."
+}

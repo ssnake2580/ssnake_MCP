@@ -1,0 +1,15 @@
+{
+  "totals": {
+    "input_tokens": 463823,
+    "output_tokens": 26888,
+    "total_tokens": 490711
+  },
+  "by_model": {
+    "anthropic/claude-4.6-sonnet-20260217": {
+      "input_tokens": 463823,
+      "output_tokens": 26888,
+      "total_tokens": 490711,
+      "llm_calls": 13
+    }
+  }
+}

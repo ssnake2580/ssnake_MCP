@@ -1,0 +1,128 @@
+diff --git a/plugins/windows/memory_plugins.py b/plugins/windows/memory_plugins.py
+index 0e485fc..b18e50b 100644
+--- a/plugins/windows/memory_plugins.py
++++ b/plugins/windows/memory_plugins.py
+@@ -3,19 +3,20 @@ from ..base_plugin import BasePlugin
+ 
+ class Malfind(BasePlugin):
+     """Lists process memory ranges that potentially contain injected code"""
+-    
+-    async def run(self, memory_dump_path: str, kw_args: Dict[str, Any] = None) -> str:
++
++    async def run(self, memory_dump_path: str, pid: int = None, kw_args: Dict[str, Any] = None) -> str:
+         """Run the Malfind plugin with the given memory dump and optional keyword arguments."""
++        # PATCH eval/v1: wired up the --pid argument that upstream left
++        # as a commented-out example. Required for the W2 chain to invoke
++        # malfind against a single representative process on large images.
+         memory_dump_path = self.validate_memory_dump(memory_dump_path)
+         if memory_dump_path.startswith("Error"):
+             return memory_dump_path
+-            
++
+         cmd_args = ["-f", memory_dump_path, "windows.malfind.Malfind"]
+-        # Add any relevant args from kw_args if needed by Malfind
+-        # Example: if Malfind had an optional --dump-dir argument
+-        # if kw_args and "dump_dir" in kw_args:
+-        #     cmd_args.extend(["--dump-dir", str(kw_args["dump_dir"])])
+-            
++        if pid is not None:
++            cmd_args.extend(["--pid", str(pid)])
++
+         return await self.volatility_runner(cmd_args)
+ 
+ class MemMap(BasePlugin):
+diff --git a/run_stdio.py b/run_stdio.py
+new file mode 100644
+index 0000000..f33cb23
+--- /dev/null
++++ b/run_stdio.py
+@@ -0,0 +1,34 @@
++"""Stdio entry point for omghozlan's MCP server (eval-only).
++
++Upstream's `if __name__ == "__main__"` block runs `mcp.run_sse_async`,
++which serves the MCP protocol over SSE/HTTP. For E1 we want the
++per-tool-call cost of the MCP wrapper itself, not the transport, so
++this shim sets the required VOLATILITY_* env vars and invokes the same
++`mcp` object in stdio mode (FastMCP's other supported transport, used
++by bornpresident and gaffx).
++
++Side effect of importing `volatility_mcp_server`: the module-level
++VolatilityRunner constructor runs `_validate_paths()`, so VOLATILITY_*
++env vars must be set BEFORE the import.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++
++VENDOR = Path(__file__).resolve().parent
++VENV = VENDOR / ".venv"
++
++os.environ.setdefault("VOLATILITY_PYTHON", str(VENV / "Scripts" / "python.exe"))
++os.environ.setdefault("VOLATILITY_DIR", str(VENDOR))
++os.environ.setdefault("VOLATILITY_SCRIPT", str(VENDOR / "vol_wrapper.py"))
++os.environ.setdefault("SYMBOLS_DIR", str(VENDOR / "symbols"))
++
++sys.path.insert(0, str(VENDOR))
++
++from volatility_mcp_server import mcp  # noqa: E402
++
++if __name__ == "__main__":
++    mcp.run()
+diff --git a/vol_wrapper.py b/vol_wrapper.py
+new file mode 100644
+index 0000000..93748c2
+--- /dev/null
++++ b/vol_wrapper.py
+@@ -0,0 +1,14 @@
++"""Tiny shim that satisfies omghozlan's ``python vol.py`` invocation
++pattern using the pip-installed volatility3 package.
++
++The omghozlan VolatilityRunner runs ``[python, VOLATILITY_SCRIPT, *args]``
++for every plugin call. By setting VOLATILITY_SCRIPT to this wrapper,
++the server keeps its subprocess-of-vol.py architecture intact while
++using the canonical volatility3 v2.28.0 package that ships with this
++isolated venv.
++"""
++
++from volatility3 import cli
++
++if __name__ == "__main__":
++    cli.main()
+diff --git a/volatility_mcp_server.py b/volatility_mcp_server.py
+index c3e9fb7..bb2ce00 100644
+--- a/volatility_mcp_server.py
++++ b/volatility_mcp_server.py
+@@ -116,6 +116,7 @@ class VolatilityRunner:
+         try:
+             process = await asyncio.create_subprocess_exec(
+                 *cmd,
++                stdin=asyncio.subprocess.DEVNULL,  # PATCH eval/v1
+                 stdout=subprocess.PIPE,
+                 stderr=subprocess.PIPE,
+                 cwd=self.volatility_dir
+@@ -133,13 +134,20 @@ class VolatilityRunner:
+                 self.logger.error(error_msg)
+                 return error_msg
+ 
+-            if process.returncode != 0:
++            output = stdout.decode('utf-8', errors='replace')
++
++            # PATCH eval/v2: vol.py emits rc=1 as a warning indicator (e.g.
++            # windows.dlllist when some processes deny DLL enumeration); the
++            # stdout payload is still valid. Upstream discarded stdout on
++            # rc!=0 which truncated dlllist's ~441 KB output on win11.mem
++            # to a useless stderr stub. Return stdout whenever it is
++            # non-empty regardless of returncode.
++            if process.returncode != 0 and not output.strip():
+                 stderr_text = stderr.decode('utf-8', errors='replace')
+                 error_msg = f"Command failed with return code {process.returncode}: {stderr_text}"
+                 self.logger.error(error_msg)
+                 return error_msg
+ 
+-            output = stdout.decode('utf-8', errors='replace')
+             self.logger.debug(f"Command completed successfully: {cmd_str}")
+             return output
+ 

@@ -1,0 +1,18 @@
+{
+  "case": "DFIR Madness — Case 001 (DC01, memory-visible subset)",
+  "provenance": {
+    "derived_from": "case001_ground_truth.json (v1.0, verified 2026-06-10)",
+    "scope": "IOCs observable from the DC01 RAM capture alone — the fair denominator for a memory-only run. loot.zip (workstation, disk-only) and other-host artifacts are excluded.",
+    "encoded_on": "2026-06-10"
+  },
+  "iocs": {
+    "ips": [
+      {"value": "194.61.24.102", "role": "attacker", "context": "RDP brute-force source and HTTP malware delivery (sessions/sockets and strings in RAM)"},
+      {"value": "203.78.103.109", "role": "c2", "context": "coreupdater.exe C2 destination (live connection or socket remnants in RAM)"}
+    ],
+    "files": [
+      {"path": "C:\\Windows\\System32\\coreupdater.exe", "role": "malware", "context": "running process / service binary visible in pslist, cmdline, and service records"},
+      {"name": "secret.zip", "role": "exfil_archive", "context": "created and deleted on DC01 minutes before; MFT/strings remnants may persist in RAM — counted honestly even if hard to recover"}
+    ]
+  }
+}

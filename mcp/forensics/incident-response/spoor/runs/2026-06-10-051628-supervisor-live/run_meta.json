@@ -1,0 +1,13 @@
+{
+  "thread_id": "case001-live-20260610T051628Z",
+  "started_utc": "2026-06-10T05:16:28.324177+00:00",
+  "finished_utc": "2026-06-10T05:21:02.444673+00:00",
+  "lead_model": "anthropic/claude-opus-4.8",
+  "specialist_model": "anthropic/claude-sonnet-4.6",
+  "message_count": 29,
+  "completeness_gate_engagements": 0,
+  "audit_records": 7,
+  "audit_chain_ok": true,
+  "self_correction_observed": true,
+  "scenario": "canned Case-001-flavored Volatility outputs (see script header)"
+}

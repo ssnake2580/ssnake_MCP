@@ -1,0 +1,7 @@
+fastmcp>=3,<4
+aiohttp>=3.9.0
+ccl_chromium_reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader.git
+cryptography>=41.0.0
+firefox-decrypt @ git+https://github.com/unode/firefox_decrypt.git
+lz4>=4.4.5
+python-dotenv>=1.0.0

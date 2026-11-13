@@ -1,0 +1,6 @@
+{
+  "name": "volpilot-rq4-live",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {"promptfoo": "0.123.1"}
+}

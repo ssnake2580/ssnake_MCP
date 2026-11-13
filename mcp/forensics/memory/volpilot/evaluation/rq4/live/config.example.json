@@ -1,0 +1,11 @@
+{
+  "base_url": "http://<MODEL_HOST>:<PORT>/v1",
+  "model": "<MODEL_ID_FROM_V1_MODELS>",
+  "image_path": "/absolute/path/to/memory.vmem",
+  "api_key_env": "RQ4_MODEL_API_KEY",
+  "temperature": 0,
+  "max_tokens": 2048,
+  "max_rounds": 4,
+  "request_timeout_seconds": 120,
+  "tool_timeout_seconds": 90
+}

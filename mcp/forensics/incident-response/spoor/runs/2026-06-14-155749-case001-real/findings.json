@@ -1,0 +1,46 @@
+{
+  "findings": [
+    {
+      "category": "ip",
+      "value": "203.78.103.109",
+      "status": "confirmed",
+      "tool_call_id": "556a2b539523fc6add0597442ac791e28408142640ff9d72f1d8028f341b7afc"
+    },
+    {
+      "category": "file",
+      "value": "coreupdater.exe",
+      "status": "confirmed",
+      "tool_call_id": "af87f7d3d8077123c287e0cf2bd00608a804b621b1613a71ca6e4a5ff970d861"
+    },
+    {
+      "category": "file",
+      "value": "spoolsv.exe",
+      "status": "confirmed",
+      "tool_call_id": "c0ff25135a5361f3e1e52bd7ffbc08678ebcf5005f614fbe08b2d7d5f19bcc96"
+    },
+    {
+      "category": "file",
+      "value": "Microsoft.ActiveDirectory.WebServices.exe",
+      "status": "confirmed",
+      "tool_call_id": "c0ff25135a5361f3e1e52bd7ffbc08678ebcf5005f614fbe08b2d7d5f19bcc96"
+    },
+    {
+      "category": "file",
+      "value": "explorer.exe",
+      "status": "confirmed",
+      "tool_call_id": "c0ff25135a5361f3e1e52bd7ffbc08678ebcf5005f614fbe08b2d7d5f19bcc96"
+    },
+    {
+      "category": "file",
+      "value": "ServerManager.exe",
+      "status": "confirmed",
+      "tool_call_id": "c0ff25135a5361f3e1e52bd7ffbc08678ebcf5005f614fbe08b2d7d5f19bcc96"
+    },
+    {
+      "category": "file",
+      "value": "svchost.exe",
+      "status": "confirmed",
+      "tool_call_id": "c0ff25135a5361f3e1e52bd7ffbc08678ebcf5005f614fbe08b2d7d5f19bcc96"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+[project]
+name = "volpilot"
+version = "0.1.0"
+description = "MCP server wrapping Volatility3 for conversational Windows memory forensics"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "volatility3==2.28.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "tiktoken>=0.7.0",
+]
+# Mirrors volatility3's own "full" extra (yara-python, capstone, pycryptodome,
+# pillow, leechcorepyc). Unlocks windows.registry.{hashdump,lsadump,cachedump},
+# windows.vadyarascan, windows.mftscan, and windows.malware.{direct,indirect}_system_calls.
+# pillow and leechcorepyc are pulled in for parity with upstream but are not
+# exercised by any Windows plugin this server wraps.
+full = [
+    "volatility3[full]==2.28.0",
+]

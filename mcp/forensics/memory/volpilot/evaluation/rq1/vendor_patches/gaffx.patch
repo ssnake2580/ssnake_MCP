@@ -1,0 +1,18 @@
+diff --git a/http_client.py b/http_client.py
+index 174959f..4a6893a 100644
+--- a/http_client.py
++++ b/http_client.py
+@@ -21,7 +21,12 @@ class HttpClient:
+         timeout: Request timeout in seconds, defaults to DEFAULT_TIMEOUT
+     """
+     
+-    DEFAULT_TIMEOUT = 30
++    # PATCH eval/v1: cold ISF resolution on win11.mem can run 60-120s,
++    # and W2 chain plugins like malfind / netscan on a 200+ process image
++    # can exceed the upstream 30s default. Bumping to 600s prevents the
++    # FastAPI roundtrip from giving up on a still-running vol.py
++    # subprocess.
++    DEFAULT_TIMEOUT = 600
+     
+     def __init__(self, timeout: int = DEFAULT_TIMEOUT):
+         """

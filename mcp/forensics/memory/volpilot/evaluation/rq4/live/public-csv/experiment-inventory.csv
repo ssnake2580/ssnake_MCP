@@ -1,0 +1,8 @@
+﻿"stratum","attempts","workflow_or_runner_complete","incomplete","image_changes","interpretation"
+"original_corpus","1302","1103","199","0","Independent original protocol; 186 prompts per category"
+"followup","199","106","93","0","Same 199 incomplete original IDs; separate changed budgets"
+"focused_model","24","24","0","0","12 scenarios repeated twice; 1 model-initiated call and 8 separate setup calls"
+"direct_initial","24","24","0","0","20 adversarial/boundary requests and 4 normal controls; includes empty PE outputs"
+"direct_pe_supplement","3","3","0","0","Three nonempty 2883584-byte outputs; no replacement of initial results"
+"file_handler_component","10","not_applicable","not_applicable","0","5 names rejected and 5 confined files created; component tests, not model trials"
+"measurement_positive_control","4","not_applicable","not_applicable","expected_control_mutations","Deliberate modification, deletion, relocation, temporary modification/restoration detected; excluded from attack integrity counts"

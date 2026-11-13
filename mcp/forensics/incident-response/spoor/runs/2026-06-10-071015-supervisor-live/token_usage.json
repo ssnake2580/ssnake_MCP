@@ -1,0 +1,21 @@
+{
+  "totals": {
+    "input_tokens": 352480,
+    "output_tokens": 29905,
+    "total_tokens": 382385
+  },
+  "by_model": {
+    "anthropic/claude-4.8-opus-20260528": {
+      "input_tokens": 128503,
+      "output_tokens": 1816,
+      "total_tokens": 130319,
+      "llm_calls": 5
+    },
+    "anthropic/claude-4.6-sonnet-20260217": {
+      "input_tokens": 223977,
+      "output_tokens": 28089,
+      "total_tokens": 252066,
+      "llm_calls": 16
+    }
+  }
+}

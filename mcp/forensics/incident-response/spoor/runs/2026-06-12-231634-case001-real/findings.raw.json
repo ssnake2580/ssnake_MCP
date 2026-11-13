@@ -1,0 +1,22 @@
+{
+  "findings": [
+    {
+      "category": "ip",
+      "value": "203.78.103.109",
+      "status": "confirmed",
+      "tool_call_id": "cb5ea571ee90915f4e7b36a9b241ce2bfde7f883c44641c5381e0b986f6c81ac"
+    },
+    {
+      "category": "file",
+      "value": "C:\\Windows\\ADWS\\Microsoft.ActiveDirectory.WebServices.exe",
+      "status": "confirmed",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db"
+    },
+    {
+      "category": "file",
+      "value": "C:\\Windows\\System32\\spoolsv.exe",
+      "status": "confirmed",
+      "tool_call_id": "3cba9c41366e3244a3495ac9f2d00a88e824d20bf24b56665d83a945e8c305db"
+    }
+  ]
+}
