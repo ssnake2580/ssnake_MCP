@@ -242,6 +242,138 @@ def verify_mcp(name, save=False):
             proc.stdout.close()
 
 
+
+def doctor():
+    import shutil
+    import platform
+
+    print("MCP Manager Environment Doctor")
+    print("=" * 45)
+
+    checks = [
+        ("Python", ["python3", "--version"]),
+        ("Node.js", ["node", "--version"]),
+        ("npm", ["npm", "--version"]),
+        ("npx", ["npx", "--version"]),
+        ("GitHub CLI", ["gh", "--version"]),
+        ("Codex CLI", ["codex", "--version"]),
+    ]
+
+    failed = 0
+
+    for label, command in checks:
+        if not shutil.which(command[0]):
+            print(f"[FAIL] {label}: not found")
+            failed += 1
+            continue
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            output = (result.stdout or result.stderr).strip()
+            version = output.splitlines()[0] if output else "no output"
+
+            if result.returncode == 0:
+                print(f"[OK]   {label}: {version}")
+            else:
+                print(f"[FAIL] {label}: {version}")
+                failed += 1
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(f"[FAIL] {label}: {error}")
+            failed += 1
+
+    print(f"[INFO] OS: {platform.platform()}")
+
+    config_path = Path.home() / ".codex/config.toml"
+    if config_path.is_file():
+        print(f"[OK]   Codex config: {config_path}")
+        try:
+            current = configured()
+            print(f"[INFO] Configured MCP servers: {len(current)}")
+            for name, entry in current.items():
+                state = "disabled" if entry.get("enabled") is False else "enabled"
+                print(f"       {name}: {state}")
+        except Exception as error:
+            print(f"[FAIL] Codex config: {error}")
+            failed += 1
+    else:
+        print("[FAIL] Codex config not found")
+        failed += 1
+
+    try:
+        auth = subprocess.run(
+            ["gh", "auth", "status"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15
+        )
+        if auth.returncode == 0:
+            print("[OK]   GitHub authentication")
+        else:
+            print("[FAIL] GitHub authentication")
+            failed += 1
+    except (OSError, subprocess.TimeoutExpired):
+        print("[FAIL] GitHub authentication")
+        failed += 1
+
+    print("=" * 45)
+    print(f"Doctor result: {failed} issue(s)")
+    return 1 if failed else 0
+
+
+def verify_all(save=False):
+    try:
+        current = configured()
+    except Exception as error:
+        print(f"[FAIL] Cannot read Codex config: {error}")
+        return 1
+
+    targets = []
+    skipped = []
+
+    for name, entry in current.items():
+        if entry.get("enabled") is False:
+            skipped.append((name, "disabled"))
+        elif "command" not in entry:
+            skipped.append((name, "not a stdio server"))
+        else:
+            targets.append(name)
+
+    print(f"Active stdio MCP servers: {len(targets)}")
+
+    for name, reason in skipped:
+        print(f"[SKIP] {name}: {reason}")
+
+    if not targets:
+        print("No active stdio MCP servers to verify.")
+        return 0
+
+    passed = 0
+    failed = 0
+
+    for name in targets:
+        print()
+        print("=" * 45)
+        try:
+            result = verify_mcp(name, save=save)
+            if result == 0:
+                passed += 1
+            else:
+                failed += 1
+        except Exception as error:
+            print(f"[FAIL] {name}: {error}")
+            failed += 1
+
+    print()
+    print("=" * 45)
+    print(f"Verification summary: {passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -272,23 +404,54 @@ def main():
         print("Cleanup complete. REA was preserved.")
         return 0
 
+    if action == "doctor":
+        return doctor()
+
     if action == "verify":
         if len(args) not in (2, 3) or (
             len(args) == 3 and args[2] != "--save"
         ):
-            print("Usage: mcp verify NAME [--save]")
+            print("Usage: mcp verify NAME|--all [--save]")
             return 1
-        return verify_mcp(args[1], save="--save" in args[2:])
+
+        save = "--save" in args[2:]
+
+        if args[1] == "--all":
+            return verify_all(save=save)
+
+        return verify_mcp(args[1], save=save)
 
     servers = registry()
 
     if action == "list":
         current = configured()
+        print(
+            f'{"CATEGORY":15} {"NAME":20} '
+            f'{"CONFIG":12} {"VERIFY":10} {"TOOLS":>5}'
+        )
+        print("-" * 72)
+
         for s in servers:
             name = s["name"]
             key = name.lower().replace(" ", "-")
-            status = "configured" if key in current else s["status"]
-            print(f'{s["category"]:15} {name:20} {status}')
+
+            if key in current:
+                config = (
+                    "disabled"
+                    if current[key].get("enabled") is False
+                    else "configured"
+                )
+            else:
+                config = s["status"]
+
+            verification = s.get("verification", {})
+            verify_status = verification.get("status", "-")
+            tool_count = verification.get("tool_count", "-")
+
+            print(
+                f'{s["category"]:15} {name:20} '
+                f'{config:12} {verify_status:10} {str(tool_count):>5}'
+            )
         return 0
 
     if action == "info":
