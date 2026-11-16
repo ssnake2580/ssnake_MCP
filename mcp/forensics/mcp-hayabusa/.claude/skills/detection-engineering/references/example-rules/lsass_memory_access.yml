@@ -1,0 +1,57 @@
+title: Suspicious Process Access to LSASS Memory
+id: 7a2e9c14-8f3b-4d61-9e2a-6c5b1a0d4f77
+status: experimental
+description: |
+    Detects a process opening a handle to lsass.exe with an access mask broad enough
+    to read process memory, the common precursor to reading credential material out of
+    LSASS (T1003.001) regardless of which specific tool or technique performs the read
+    (procdump, mimikatz, comsvcs.dll, task manager, etc.) — this rule is intentionally
+    tool-agnostic and keys only on the target process and the granted-access mask, not
+    on any tool-specific call trace or command line.
+    level: high — an access mask this broad against lsass.exe from a non-whitelisted
+    process is strong evidence of an attempted credential read; it is not "critical"
+    because opening the handle alone does not prove memory was successfully read or
+    exfiltrated, and legitimate EDR/AV agents can also trigger this (see falsepositives).
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://www.ired.team/offensive-security/credential-access-and-credential-dumping
+    - |
+      Test evidence: validated against sample_evtx/EVTX-ATTACK-SAMPLES/Credential Access/
+      sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx via scan_evtx — matches the
+      Sysmon EventID 10 record (RecordID 4807) where mimikatz.exe opens lsass.exe with
+      GrantedAccess 0x1010; expected match: high, confirmed.
+author: Detection Engineering Skill (example)
+date: 2026-07-17
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+logsource:
+    category: process_access
+    product: windows
+detection:
+    process_access:
+        EventID: 10
+        Channel: Microsoft-Windows-Sysmon/Operational
+    selection_target:
+        TargetImage|endswith: \lsass.exe
+    selection_access:
+        GrantedAccess|contains:
+            - '0x1010'
+            - '0x1038'
+            - '0x1400'
+            - '0x1410'
+            - '0x143a'
+            - '0x1fffff'
+    filter_optional_edr_agents:
+        SourceImage|endswith:
+            - \MsMpEng.exe
+            - \MsSense.exe
+            - \SenseIR.exe
+    condition: process_access and (selection_target and selection_access and not 1 of filter_optional_*)
+falsepositives:
+    - Endpoint agents (Microsoft Defender/MDE, and similarly-designed EDR) that walk lsass.exe
+      memory for legitimate scanning/telemetry purposes
+    - Custom, signed internal diagnostic tooling that intentionally opens lsass.exe for
+      authorized crash/troubleshooting dumps (rare; should be an explicit, documented exception)
+level: high
+ruletype: Sigma

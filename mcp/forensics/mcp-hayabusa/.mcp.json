@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hayabusa": {
+      "command": "C:\\Users\\USER\\mcp-hayabusa\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_hayabusa.server"],
+      "cwd": "C:\\Users\\USER\\mcp-hayabusa",
+      "env": {
+        "HAYABUSA_BIN": "C:\\Users\\USER\\mcp-hayabusa\\hayabusa\\hayabusa.exe"
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "_fixture_note": "Synthetic, minimal Azure AD sign-in log record — not derived from a real export (this repo has no Azure log samples, and Hayabusa/scan_evtx only parses Windows .evtx, so this rule can't be validated via scan_evtx). Built solely to exercise the rule's detection logic: properties.message set to the exact value the selection matches on. Non-detection fields are plausible placeholders, not evidence.",
+  "time": "2022-06-01T14:32:07Z",
+  "operationName": "Sign-in activity",
+  "category": "SignInLogs",
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "resultType": "0",
+  "callerIpAddress": "203.0.113.42",
+  "identity": "test.user@example.com",
+  "properties": {
+    "id": "11111111-2222-3333-4444-555555555555",
+    "createdDateTime": "2022-06-01T14:32:07Z",
+    "userDisplayName": "Test User",
+    "userPrincipalName": "test.user@example.com",
+    "appId": "99999999-8888-7777-6666-555555555555",
+    "appDisplayName": "Legacy Line-of-Business App",
+    "ipAddress": "203.0.113.42",
+    "message": "ROPC"
+  },
+  "_expected_match": "azure_app_ropc_authentication.yml fires: selection (properties.message equals ROPC) true -> condition holds, level medium."
+}

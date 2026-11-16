@@ -1,0 +1,54 @@
+title: Rundll32 Invoking Comsvcs.dll MiniDump Export
+id: 5dd37f46-4192-49a7-a5da-9971cd90faf2
+status: experimental
+description: |
+    Detects rundll32.exe being used to directly call the `MiniDump` export of the built-in
+    comsvcs.dll, the command-line side of the well-known mimikatz-free LSASS (or other
+    process) memory dumping technique (T1003.001) — no external tool needs to be dropped
+    since comsvcs.dll ships with Windows. This rule matches the export invoked by its literal
+    name (`MiniDump`/`MiniDumpW`); it deliberately does not chase the numeric-ordinal (`#24`)
+    obfuscation variant of the same call, which is a separate, noisier pattern.
+    level: high — a signed, built-in Windows DLL exposing a debugging/dump primitive being
+    invoked by rundll32 with the MiniDump export name and a "full" dump type is a narrow,
+    well-documented attacker technique with very little legitimate everyday use.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://modexp.wordpress.com/2019/08/30/minidumpwritedump-via-com-services-dll/
+    - https://twitter.com/shantanukhande/status/1229348874298388484
+    - |
+      Test evidence: validated against sample_evtx/EVTX-ATTACK-SAMPLES/Credential Access/
+      sysmon_10_1_memdump_comsvcs_minidump.evtx (RecordID 32154, Sysmon EventID 1) via
+      scan_evtx with rules_dir=rules/custom — Cmdline "rundll32 C:\windows\system32\comsvcs.dll,
+      MiniDump 4868 C:\Windows\System32\notepad.bin full" matches selection_img and
+      selection_cli, expected match: high. The dumped target in that public sample is
+      notepad.exe rather than lsass.exe; this rule is process-creation based and (unlike
+      lsass_memory_dump_via_comsvcs_minidump.yml) does not check the dump target at all,
+      since the target PID/name is a numeric argument, not the process image being created.
+author: Adigo Yakubu Attah
+date: 2026-07-15
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    process_creation:
+        EventID: 1
+        Channel: Microsoft-Windows-Sysmon/Operational
+    selection_img:
+        - Image|endswith: \rundll32.exe
+        - OriginalFileName: RUNDLL32.EXE
+    selection_cli:
+        CommandLine|contains|all:
+            - comsvcs.dll
+            - MiniDump
+    condition: process_creation and selection_img and selection_cli
+falsepositives:
+    - Authorized incident-response or forensic tooling that intentionally drives rundll32
+      against comsvcs.dll's MiniDump export to capture a process dump during a sanctioned
+      investigation
+    - Internal crash-diagnostics scripts that reuse this well-known technique instead of
+      procdump/Task Manager to collect a memory dump of a hung, non-LSASS process
+level: high
+ruletype: Sigma

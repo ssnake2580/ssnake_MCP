@@ -1,0 +1,65 @@
+title: LSASS Memory Dump via Comsvcs.dll MiniDump
+id: efde31af-f21a-47fc-87df-900c751c38cc
+status: experimental
+description: |
+    Detects LSASS process memory access consistent with the comsvcs.dll `MiniDump` export
+    being used to write a memory dump of `lsass.exe` — a documented, mimikatz-free technique
+    for harvesting credentials (T1003.001) that works with the built-in, signed comsvcs.dll
+    rather than dropping an external tool like procdump. Matches on a Sysmon ProcessAccess
+    (event 10) record where `comsvcs.dll` appears in the call trace of an access to
+    `lsass.exe` with a granted-access mask broad enough to read process memory.
+    level: high — this call-trace/access-mask combination has very few legitimate callers
+    (see falsepositives) and is strong, if not conclusive, evidence of an LSASS memory dump
+    attempt; it is not "critical" because dumping alone does not prove credentials were
+    successfully extracted or exfiltrated.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://modexp.wordpress.com/2019/08/30/minidumpwritedump-via-com-services-dll/
+    - https://www.ired.team/offensive-security/credential-access-and-credential-dumping/dump-credentials-from-lsass-process-without-mimikatz
+    - |
+      Test evidence: validated against sample_evtx/EVTX-ATTACK-SAMPLES/Credential Access/
+      sysmon_10_1_memdump_comsvcs_minidump.evtx (RecordID 32156) via scan_evtx, which confirms
+      the comsvcs.dll CallTrace + 0x1fffff GrantedAccess signature this rule keys on, though
+      that public sample's TargetImage is notepad.exe (a stand-in target), not lsass.exe. Full
+      end-to-end match (including TargetImage) verified against the equivalent fixture
+      rules/custom/tests/lsass_memory_dump_via_comsvcs_minidump.json, a copy of that same
+      record with TargetImage swapped to lsass.exe — expected match documented inline in the
+      fixture's _expected_match field.
+author: Adigo Yakubu Attah
+date: 2026-07-15
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+logsource:
+    category: process_access
+    product: windows
+detection:
+    process_access:
+        EventID: 10
+        Channel: Microsoft-Windows-Sysmon/Operational
+    selection_target:
+        TargetImage|endswith: \lsass.exe
+    selection_calltrace:
+        CallTrace|contains: comsvcs.dll
+    selection_access:
+        GrantedAccess|contains:
+            - '0x1010'
+            - '0x1038'
+            - '0x1400'
+            - '0x1410'
+            - '0x143a'
+            - '0x1fffff'
+    filter_optional_edr_agents:
+        SourceImage|endswith:
+            - \MsMpEng.exe
+            - \MsSense.exe
+            - \SenseIR.exe
+    condition: process_access and (selection_target and selection_calltrace and selection_access and not 1 of filter_optional_*)
+falsepositives:
+    - Endpoint agents (Microsoft Defender/MDE, and similarly-designed EDR) that walk lsass.exe
+      memory for legitimate scanning/telemetry purposes and happen to route through comsvcs.dll
+    - Custom, signed internal diagnostic tooling that intentionally calls comsvcs.dll's MiniDump
+      export against lsass.exe for authorized crash/troubleshooting dumps (rare; should be an
+      explicit, documented exception if it occurs)
+level: high
+ruletype: Sigma

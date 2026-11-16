@@ -1,0 +1,4 @@
+target: sample_evtx/YamatoSecurity/LateralMovement/T1563.002_RDP-Hijacking_Security.evtx
+rule_filter: rdp
+min_level: medium
+rules_dir: hayabusa/rules

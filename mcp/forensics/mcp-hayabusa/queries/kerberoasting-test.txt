@@ -1,0 +1,4 @@
+target: sample_evtx/YamatoSecurity/CredentialAccess/T1558.003_StealOrForgeKerberosTicketsKerberoasting_Security.evtx
+rule_filter: kerberoast
+min_level: medium
+rules_dir: hayabusa/rules
