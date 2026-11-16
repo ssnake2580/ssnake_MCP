@@ -1,0 +1,1177 @@
+#!/bin/sh
+set -eu
+
+BIN="src/r2mcp"
+INJECT_MARKER="__R2MCP_INJECTED__"
+
+need_cmd() {
+	command -v "$1" >/dev/null 2>&1 || {
+		echo "missing required command: $1" >&2
+		exit 1
+	}
+}
+
+fail() {
+	echo "FAIL: $*" >&2
+	exit 1
+}
+
+append_request() {
+	local file="$1"
+	local id="$2"
+	local method="$3"
+	local params_json="$4"
+	jq -cn \
+		--argjson id "$id" \
+		--arg method "$method" \
+		--argjson params "$params_json" \
+		'{jsonrpc:"2.0", id:$id, method:$method, params:$params}' >> "$file"
+	printf '\n' >> "$file"
+}
+
+append_notification() {
+	local file="$1"
+	local method="$2"
+	local params_json="$3"
+	jq -cn \
+		--arg method "$method" \
+		--argjson params "$params_json" \
+		'{jsonrpc:"2.0", method:$method, params:$params}' >> "$file"
+	printf '\n' >> "$file"
+}
+
+append_tool_call() {
+	local file="$1"
+	local id="$2"
+	local tool="$3"
+	local args_json="$4"
+	jq -cn \
+		--argjson id "$id" \
+		--arg tool "$tool" \
+		--argjson args "$args_json" \
+		'{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:$tool, arguments:$args}}' >> "$file"
+	printf '\n' >> "$file"
+}
+
+run_session() {
+	local req="$1"
+	local resp="$2"
+	shift 2
+	env ASAN_OPTIONS=detect_leaks=0 LSAN_OPTIONS=detect_leaks=0 "$BIN" "$@" < "$req" | grep '^{' > "$resp" || true
+	jq -s . "$resp" >/dev/null 2>&1 || fail "invalid JSON response stream in $resp"
+}
+
+response_by_id() {
+	local resp="$1"
+	local id="$2"
+	jq -c --argjson id "$id" 'select(.id == $id)' "$resp" | tail -n 1
+}
+
+curl_code() {
+	local out="$1"
+	local code
+	local rc
+	shift
+	set +e
+	code=$(curl -s -o "$out" -w "%{http_code}" "$@" 2>/dev/null)
+	rc=$?
+	set -e
+	if [ "$rc" -ne 0 ]; then
+		printf '000'
+	else
+		printf '%s' "$code"
+	fi
+}
+
+fetch_catalog() {
+	local out="$1"
+	shift
+	local cursor=""
+	local pages="$TMPDIR/pages.jsonl"
+	: > "$pages"
+	while :; do
+		local req="$TMPDIR/catalog.req"
+		local resp="$TMPDIR/catalog.resp"
+		local params='{}'
+		: > "$req"
+		append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+		append_notification "$req" notifications/initialized '{}'
+		if [ -n "$cursor" ]; then
+			params=$(jq -cn --arg cursor "$cursor" '{cursor:$cursor}')
+		fi
+		append_request "$req" 2 tools/list "$params"
+		run_session "$req" "$resp" "$@"
+		local page
+		page=$(jq -c 'select(.id == 2).result' "$resp")
+		[ -n "$page" ] || fail "missing tools/list response"
+		printf '%s\n' "$page" >> "$pages"
+		cursor=$(printf '%s\n' "$page" | jq -r '.nextCursor // empty')
+		[ -n "$cursor" ] || break
+	done
+	jq -s '[.[].tools[]]' "$pages" > "$out"
+}
+
+build_cases() {
+	local catalog="$1"
+	local out="$2"
+	jq -cn \
+		--slurpfile catalog "$catalog" \
+		--arg file "$TEST_FILE" \
+		--arg script "$TEST_SCRIPT" \
+		--arg dir "$TEST_DIR" \
+		--arg marker "$INJECT_MARKER" '
+		def default_value($tool; $name; $prop):
+			if $tool == "run_script" and $name == "file_path" then $script
+			elif $name == "file_path" then $file
+			elif $name == "path" then $dir
+			elif $name == "address" then "0"
+			elif $name == "classname" then "main"
+			elif $name == "prototype" then "int fuzz(void)"
+			elif $name == "message" then "hello from tests"
+			elif $name == "expression" then "1+1"
+			elif $name == "baddr" then "0x400000"
+			elif $name == "query" then "main"
+			elif $name == "type" and $tool == "search" then "string"
+			elif $name == "name" and $tool == "use_decompiler" then "pdc"
+			elif $name == "name" then "fuzz_name"
+			elif $name == "new_name" then "fuzz_name_new"
+			elif $name == "protection" then "r-x"
+			elif $name == "url" then "http://127.0.0.1:1"
+			elif $name == "cursor" then ""
+			elif $name == "size" and (($prop.type // "") == "string") then "16"
+			elif (($prop.type // "") == "boolean") then false
+			elif (($prop.type // "") == "integer" or ($prop.type // "") == "number") then 1
+			else "x"
+			end;
+		def wrong_value($type):
+			if $type == "string" then 0
+			elif ($type == "integer" or $type == "number") then "oops"
+			elif $type == "boolean" then "oops"
+			else empty
+			end;
+		def injection_value($name):
+			if $name == "path" then "/tmp;f " + $marker + "=entry0"
+			else "x;f " + $marker + "=entry0"
+			end;
+		def skip_smoke($tool):
+			($tool == "open_session"
+				or $tool == "close_file"
+				or $tool == "run_command"
+				or $tool == "run_javascript");
+		def skip_string_fuzz($tool):
+			($tool == "open_session"
+				or $tool == "run_command"
+				or $tool == "run_javascript");
+		[
+			$catalog[0][] as $tool
+			| ($tool.inputSchema.properties // {}) as $props
+			| ($tool.inputSchema.required // []) as $required
+			| ($props | to_entries) as $entries
+			| (reduce $entries[] as $entry ({}; .[$entry.key] = default_value($tool.name; $entry.key; $entry.value))) as $base
+			| (
+				if skip_smoke($tool.name) then
+					empty
+				else
+					{kind:"smoke", tool:$tool.name, args:$base}
+				end
+			),
+			(
+				$required[]? as $param
+				| {kind:"missing-required", tool:$tool.name, param:$param, args:($base | del(.[$param]))}
+			),
+			(
+				$entries[]
+				| (.value.type // "") as $type
+				| select($type == "string" or $type == "integer" or $type == "number" or $type == "boolean")
+				| {kind:"wrong-type", tool:$tool.name, param:.key, args:($base + {(.key): wrong_value($type)})}
+			),
+			(
+				$entries[]
+				| (.value.type // "") as $type
+				| select($type == "string" and (skip_string_fuzz($tool.name) | not))
+				| {kind:"empty-string", tool:$tool.name, param:.key, args:($base + {(.key): ""})}
+			),
+			(
+				$entries[]
+				| (.value.type // "") as $type
+				| select($type == "string" and (skip_string_fuzz($tool.name) | not))
+				| {kind:"injection", tool:$tool.name, param:.key, marker:$marker, args:($base + {(.key): injection_value(.key)})}
+			),
+			(
+				$entries[]
+				| (.value.type // "") as $type
+				| select($type == "integer" or $type == "number")
+				| {kind:"negative-number", tool:$tool.name, param:.key, args:($base + {(.key): -1})}
+			)
+		]' > "$out"
+}
+
+append_cases() {
+	local cases="$1"
+	local req="$2"
+	local meta="$3"
+	local _cases_expanded="$TMPDIR/_cases_expanded.jsonl"
+	jq -c '.[]' "$cases" > "$_cases_expanded"
+	while IFS= read -r case_json; do
+		local id="$NEXT_ID"
+		NEXT_ID=$((NEXT_ID + 1))
+		local tool
+		local args_json
+		tool=$(printf '%s\n' "$case_json" | jq -r '.tool')
+		args_json=$(printf '%s\n' "$case_json" | jq -c '.args')
+		append_tool_call "$req" "$id" "$tool" "$args_json"
+		printf '%s\n' "$case_json" | jq -c --argjson id "$id" '. + {id:$id}' >> "$meta"
+	done < "$_cases_expanded"
+}
+
+assert_error_contains_param() {
+	local response="$1"
+	local param="$2"
+	local context="$3"
+	local code
+	local message
+	code=$(printf '%s\n' "$response" | jq -r '.error.code // empty')
+	message=$(printf '%s\n' "$response" | jq -r '.error.message // empty')
+	[ "$code" = "-32602" ] || fail "$context: expected -32602, got $response"
+	case "$message" in
+		*"$param"*) ;;
+		*) fail "$context: expected message mentioning '$param', got '$message'" ;;
+	esac
+}
+
+assert_marker_absent() {
+	local response="$1"
+	local marker="$2"
+	local context="$3"
+	if printf '%s\n' "$response" | grep -q "$marker"; then
+		fail "$context: command injection marker leaked into response: $response"
+	fi
+}
+
+run_dynamic_suite() {
+	local catalog="$1"
+	local suite_name="$2"
+	local open_mode="$3"
+	shift 3
+	local cases="$TMPDIR/$suite_name.cases.json"
+	local req="$TMPDIR/$suite_name.req"
+	local resp="$TMPDIR/$suite_name.resp"
+	local meta="$TMPDIR/$suite_name.meta.jsonl"
+
+	build_cases "$catalog" "$cases"
+	: > "$req"
+	: > "$meta"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	if [ "$open_mode" = "with-open" ]; then
+		append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	fi
+	NEXT_ID=10
+	append_cases "$cases" "$req" "$meta"
+	if [ "$open_mode" = "with-open" ]; then
+		append_tool_call "$req" "$NEXT_ID" list_symbols "$(jq -cn --arg marker "$INJECT_MARKER" '{filter:$marker}')"
+		jq -cn --argjson id "$NEXT_ID" --arg kind injection-probe --arg marker "$INJECT_MARKER" \
+			'{id:$id, kind:$kind, marker:$marker}' >> "$meta"
+		NEXT_ID=$((NEXT_ID + 1))
+	fi
+	run_session "$req" "$resp" "$@"
+
+	if [ "$open_mode" = "with-open" ]; then
+		local open_file_response
+		open_file_response=$(response_by_id "$resp" 2)
+		[ -n "$open_file_response" ] || fail "$suite_name: missing open_file response"
+	fi
+
+	while IFS= read -r case_json; do
+		local id
+		local kind
+		local tool
+		local param
+		local marker
+		local response
+
+		id=$(printf '%s\n' "$case_json" | jq -r '.id')
+		kind=$(printf '%s\n' "$case_json" | jq -r '.kind')
+		tool=$(printf '%s\n' "$case_json" | jq -r '.tool')
+		param=$(printf '%s\n' "$case_json" | jq -r '.param // empty')
+		marker=$(printf '%s\n' "$case_json" | jq -r '.marker // empty')
+		response=$(response_by_id "$resp" "$id")
+		[ -n "$response" ] || fail "$suite_name: missing response for $tool/$kind (#$id)"
+
+		case "$kind" in
+		missing-required|wrong-type)
+			assert_error_contains_param "$response" "$param" "$suite_name:$tool:$kind"
+			;;
+		injection)
+			:
+			;;
+		injection-probe)
+			assert_marker_absent "$response" "$marker" "$suite_name:$kind"
+			;;
+		smoke|empty-string|negative-number)
+			:
+			;;
+		*)
+			fail "unknown test case kind: $kind"
+			;;
+		esac
+	done < "$meta"
+
+	echo "== $suite_name =="
+	echo "cases: $(wc -l < "$meta" | tr -d ' ')"
+}
+
+run_close_file_regression() {
+	local req="$TMPDIR/close.req"
+	local resp="$TMPDIR/close.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 close_file '{}'
+	append_tool_call "$req" 4 get_current_address '{}'
+	run_session "$req" "$resp"
+
+	local close_response
+	local after_close
+	close_response=$(response_by_id "$resp" 3)
+	after_close=$(response_by_id "$resp" 4)
+	[ -n "$close_response" ] || fail "close_file: missing close response"
+	[ -n "$after_close" ] || fail "close_file: missing post-close response"
+	printf '%s\n' "$after_close" | jq -e '.error.code == -32611' >/dev/null 2>&1 || {
+		fail "close_file: expected open_file requirement after close, got $after_close"
+	}
+}
+
+run_list_functions_without_open_regression() {
+	local req="$TMPDIR/list-functions-no-open.req"
+	local resp="$TMPDIR/list-functions-no-open.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 list_functions '{}'
+	run_session "$req" "$resp"
+
+	printf '%s\n' "$(response_by_id "$resp" 2)" | jq -e '.result.content[0].text | contains("Call open_file first")' >/dev/null 2>&1 || {
+		fail "list_functions without open_file should return a tool response, not an RPC error"
+	}
+}
+
+run_session_tools_require_L_regression() {
+	local req="$TMPDIR/session-tools-require-l.req"
+	local resp="$TMPDIR/session-tools-require-l.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 list_sessions '{}'
+	append_tool_call "$req" 3 open_session "$(jq -cn '{url:"http://127.0.0.1:1"}')"
+	append_tool_call "$req" 4 close_session '{}'
+	run_session "$req" "$resp" -p
+
+	for id in 2 3 4; do
+		printf '%s\n' "$(response_by_id "$resp" "$id")" | jq -e '.error.code == -32603 and (.error.message | contains("-L"))' >/dev/null 2>&1 || {
+			fail "session tool without -L should be rejected even in permissive mode, got $(response_by_id "$resp" "$id")"
+		}
+	done
+}
+
+run_open_file_regressions() {
+	local req="$TMPDIR/open.req"
+	local resp="$TMPDIR/open.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file '{}'
+	append_tool_call "$req" 3 open_file "$(jq -cn '{file_path:0}')"
+	append_tool_call "$req" 4 open_file "$(jq -cn '{file_path:""}')"
+	append_tool_call "$req" 5 open_file "$(jq -cn --arg path "/tmp;?e $INJECT_MARKER" '{file_path:$path}')"
+	run_session "$req" "$resp"
+
+	assert_error_contains_param "$(response_by_id "$resp" 2)" "file_path" "open_file:missing-required"
+	assert_error_contains_param "$(response_by_id "$resp" 3)" "file_path" "open_file:wrong-type"
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text == "Failed to open file."' >/dev/null 2>&1 || {
+		fail "open_file: empty string should fail cleanly"
+	}
+	assert_marker_absent "$(response_by_id "$resp" 5)" "$INJECT_MARKER" "open_file:injection"
+}
+
+run_repeated_open_file_regression() {
+	local req="$TMPDIR/open-repeat.req"
+	local resp="$TMPDIR/open-repeat.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 4 get_current_address '{}'
+	run_session "$req" "$resp"
+
+	printf '%s\n' "$(response_by_id "$resp" 2)" | jq -e '.result.content[0].text == "File opened successfully."' >/dev/null 2>&1 || {
+		fail "open_file: first open should succeed"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.content[0].text | contains("File already opened:")' >/dev/null 2>&1 || {
+		fail "open_file: repeated open of the same file should be a no-op"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text | contains("0x")' >/dev/null 2>&1 || {
+		fail "open_file: tool call after repeated open should still work"
+	}
+}
+
+run_different_open_file_regression() {
+	local req="$TMPDIR/open-different.req"
+	local resp="$TMPDIR/open-different.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 open_file "$(jq -cn --arg file "$TEST_FILE2" '{file_path:$file}')"
+	append_tool_call "$req" 4 get_current_address '{}'
+	run_session "$req" "$resp"
+
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.content[0].text | contains("Closed previously opened file:") and contains("File opened successfully.")' >/dev/null 2>&1 || {
+		fail "open_file: opening a different file should close the previous file and succeed"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text | contains("0x")' >/dev/null 2>&1 || {
+		fail "open_file: tool call after opening a different file should still work"
+	}
+}
+
+run_open_file_baddr_regression() {
+	local req="$TMPDIR/open-baddr.req"
+	local resp="$TMPDIR/open-baddr.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file,baddr:"0x400000"}')"
+	append_tool_call "$req" 3 calculate '{"expression":"entry0 - 0x400000"}'
+	append_tool_call "$req" 4 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file,baddr:"0x500000"}')"
+	append_tool_call "$req" 5 calculate '{"expression":"entry0 - 0x500000"}'
+	append_tool_call "$req" 6 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file,baddr:0}')"
+	run_session "$req" "$resp"
+
+	printf '%s\n' "$(response_by_id "$resp" 2)" | jq -e '.result.content[0].text == "File opened successfully."' >/dev/null 2>&1 || {
+		fail "open_file baddr: first open should succeed"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text | contains("Closed previously opened file:") and contains("File opened successfully.")' >/dev/null 2>&1 || {
+		fail "open_file baddr: changing base should reopen the same file"
+	}
+	local offset1
+	local offset2
+	offset1=$(printf '%s\n' "$(response_by_id "$resp" 3)" | jq -r '.result.content[0].text')
+	offset2=$(printf '%s\n' "$(response_by_id "$resp" 5)" | jq -r '.result.content[0].text')
+	[ "$offset1" = "$offset2" ] || {
+		fail "open_file baddr: rebased entry offset changed ($offset1 vs $offset2)"
+	}
+	case "$offset1" in
+	0x*) ;;
+	*) fail "open_file baddr: expected hex entry offset, got $offset1" ;;
+	esac
+	assert_error_contains_param "$(response_by_id "$resp" 6)" "baddr" "open_file:baddr-wrong-type"
+}
+
+run_numeric_string_regression() {
+	local req="$TMPDIR/numeric-string.req"
+	local resp="$TMPDIR/numeric-string.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 list_functions "$(jq -cn '{max_length:"-1"}')"
+	append_tool_call "$req" 4 list_functions '{}'
+	run_session "$req" "$resp"
+
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.content[0].text and (.error | not)' >/dev/null 2>&1 || {
+		fail "list_functions: numeric string max_length should be accepted"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text and (.error | not)' >/dev/null 2>&1 || {
+		fail "list_functions: max_length should be optional"
+	}
+}
+
+run_tool_argument_regressions() {
+	local req="$TMPDIR/tool-arguments.req"
+	local resp="$TMPDIR/tool-arguments.resp"
+	local cases="$TMPDIR/tool-arguments.cases.json"
+	local meta="$TMPDIR/tool-arguments.meta.jsonl"
+	local literal_path="$TEST_DIR/literal;quote'line
+break"
+	local payload="one;f $INJECT_MARKER=1337
+three#four'five"
+	mkdir -p "$literal_path"
+	: > "$literal_path/kept.txt"
+	: > "$req"
+	: > "$meta"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 run_command '{"command":"f R2MCP_HIGH=0xffffffffffffffff;f R2MCP_MATH_ADDR=0x10;f R2MCP_0xgg=0x11"}'
+	append_tool_call "$req" 4 lookup_address '{"address":"0xffffffffffffffff"}'
+	append_tool_call "$req" 5 hexdump '{"address":"0","size":"0x10"}'
+	append_tool_call "$req" 6 hexdump '{"address":"0","size":""}'
+	append_tool_call "$req" 7 hexdump '{"address":"0"}'
+	append_tool_call "$req" 8 search '{"type":"value","query":"0","value_size":1}'
+	append_tool_call "$req" 9 lookup_symbol '{"address":"0xffffffffffffffff"}'
+	append_tool_call "$req" 10 hexdump '{"address":"R2MCP_MATH_ADDR | 1","size":"4*4"}'
+	append_tool_call "$req" 11 hexdump '{"address":"0x11","size":"16"}'
+	append_tool_call "$req" 12 lookup_address '{"address":"R2MCP_HIGH"}'
+	append_tool_call "$req" 13 search '{"type":"value","query":"-1","value_size":"1<<2"}'
+	append_tool_call "$req" 14 hexdump '{"address":"0+1","size":"0b100"}'
+	append_tool_call "$req" 15 hexdump '{"address":"(R2MCP_MATH_ADDR + 0X1)","size":"0x0000_0010"}'
+	append_tool_call "$req" 16 hexdump '{"address":"R2MCP_0xgg","size":"0x10u"}'
+	build_cases "$NORMAL_CATALOG" "$cases"
+	jq --arg marker "$INJECT_MARKER" '
+		["hexdump", "lookup_address", "lookup_symbol"] as $tools
+		| [.[] | select(.kind == "smoke" and (.args | has("address")))
+			| .args.address = ("0\u0027f " + $marker + "=1337;\u0027")
+			| . + {kind:"numeric-boundary",param:"address"}]
+		+ [$tools[] as $tool
+			| ["", " ", "0x", "0xgg", "0X", "0Xgg", "0x10zz", "1+0x", "1+0xgg", "0x10uJUNK", "0x10000000000000000", "18446744073709551616", "12junk", "__R2MCP_MISSING_SYMBOL__", "(1+2", "1/0"][] as $address
+			| {tool:$tool,kind:"invalid-numeric",param:"address",args:{address:$address,size:"16"}}]
+		+ [["bad", "0x", "0xgg", "0x10zz", "16+0xgg", "16junk", "0;f " + $marker + "=1337", "-1", "0", "2147483648"][] as $size
+			| {tool:"hexdump",kind:"invalid-numeric",param:"size",args:{address:"0",size:$size}}]
+		+ [["bad", "0x", "0xgg", "0x10zz", "1+0xgg", "16junk", "18446744073709551616", "(1+2", "1/0"][] as $query
+			| {tool:"search",kind:"invalid-numeric",param:"query",args:{type:"value",query:$query}}]
+		+ [{tool:"search",kind:"numeric-boundary",param:"query",args:{type:"value",query:("0;f " + $marker + "=1337")}}]
+		+ [{tool:"search",kind:"invalid-numeric",param:"value_size",args:{type:"value",query:"0",value_size:3}}]
+	' "$cases" > "$cases.new"
+	mv "$cases.new" "$cases"
+	NEXT_ID=17
+	append_cases "$cases" "$req" "$meta"
+	local literal_id="$NEXT_ID"
+	append_tool_call "$req" "$literal_id" list_files "$(jq -cn --arg path "$literal_path" '{path:$path}')"
+	NEXT_ID=$((NEXT_ID + 1))
+	append_tool_call "$req" "$NEXT_ID" list_methods "$(jq -cn --arg classname "$payload" '{classname:$classname}')"
+	NEXT_ID=$((NEXT_ID + 1))
+	append_tool_call "$req" "$NEXT_ID" lookup_export "$(jq -cn --arg name "$payload" '{name:$name}')"
+	NEXT_ID=$((NEXT_ID + 1))
+	append_tool_call "$req" "$NEXT_ID" run_command '{"command":"o malloc://256"}'
+	NEXT_ID=$((NEXT_ID + 1))
+	append_tool_call "$req" "$NEXT_ID" run_command "$(jq -cn --arg hex "$(printf '%s' "$payload" | od -An -tx1 | tr -d ' \n')" '{command:("wx " + $hex)}')"
+	NEXT_ID=$((NEXT_ID + 1))
+	local search_id="$NEXT_ID"
+	append_tool_call "$req" "$search_id" search "$(jq -cn --arg query "$payload" '{query:$query}')"
+	NEXT_ID=$((NEXT_ID + 1))
+	append_tool_call "$req" "$NEXT_ID" search "$(jq -cn --arg query "$payload" '{query:$query,type:"wide"}')"
+	NEXT_ID=$((NEXT_ID + 1))
+	append_tool_call "$req" "$NEXT_ID" search "$(jq -cn --arg marker "$INJECT_MARKER" '{query:("6161;f " + $marker + "=1337"),type:"hex"}')"
+	NEXT_ID=$((NEXT_ID + 1))
+	append_tool_call "$req" "$NEXT_ID" calculate "$(jq -cn --arg expression "$INJECT_MARKER" '{expression:$expression}')"
+	run_session "$req" "$resp" -r -g all
+
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text | contains("R2MCP_HIGH")' >/dev/null || {
+		fail "lookup_address: full-width hexadecimal address was not preserved"
+	}
+	local id
+	for id in 5 6 7 8 9 10 11 12 13 14 15 16; do
+		printf '%s\n' "$(response_by_id "$resp" "$id")" | jq -e '.result.content[0].text != null and (.error | not)' >/dev/null || {
+			fail "tool argument regression: numeric expression or optional hexdump size failed (#$id)"
+		}
+	done
+	for id in 10 15 16; do
+		[ "$(response_by_id "$resp" "$id" | jq -r '.result.content[0].text')" = "$(response_by_id "$resp" 11 | jq -r '.result.content[0].text')" ] || {
+			fail "hexdump: symbol, bitwise address, and size expressions must match their numeric values (#$id)"
+		}
+	done
+	printf '%s\n' "$(response_by_id "$resp" 12)" | jq -e '.result.content[0].text | contains("R2MCP_HIGH")' >/dev/null || {
+		fail "lookup_address: flag name did not resolve"
+	}
+	while IFS= read -r case_json; do
+		id=$(printf '%s\n' "$case_json" | jq -r '.id')
+		local param
+		param=$(printf '%s\n' "$case_json" | jq -r '.param')
+		if [ "$(printf '%s\n' "$case_json" | jq -r '.kind')" = "invalid-numeric" ]; then
+			assert_error_contains_param "$(response_by_id "$resp" "$id")" "$param" "tool argument regression:#$id"
+		else
+			printf '%s\n' "$(response_by_id "$resp" "$id")" | jq -e 'has("result") or .error.code == -32602' >/dev/null || {
+				fail "tool argument regression: missing numeric boundary response (#$id)"
+			}
+		fi
+	done < "$meta"
+	printf '%s\n' "$(response_by_id "$resp" "$literal_id")" | jq -e '.result.content[0].text | contains("kept.txt")' >/dev/null || {
+		fail "list_files: semicolon, quote, and newline in path must be literal"
+	}
+	printf '%s\n' "$(response_by_id "$resp" "$search_id")" | jq -e '.result.content[0].text | test("hit[0-9]+_[0-9]+")' >/dev/null || {
+		fail "search: semicolon, quote, and newline in string must be literal"
+	}
+	printf '%s\n' "$(response_by_id "$resp" "$NEXT_ID")" | jq -e '.result.content[0].text == "0x0"' >/dev/null || {
+		fail "tool argument regression: input created injection marker"
+	}
+
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 decompile_function "$(jq -cn --arg address "0'f $INJECT_MARKER=1337;'" '{address:$address}')"
+	append_tool_call "$req" 4 list_methods "$(jq -cn --arg classname "$payload" '{classname:$classname}')"
+	append_tool_call "$req" 5 list_files "$(jq -cn --arg path "$literal_path" '{path:$path}')"
+	append_tool_call "$req" 6 calculate "$(jq -cn --arg expression "$INJECT_MARKER" '{expression:$expression}')"
+	run_session "$req" "$resp" -p -R -g all
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e 'has("result") or .error.code == -32602' >/dev/null || {
+		fail "read-only address injection: missing response"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 5)" | jq -e '.result.content[0].text | contains("kept.txt")' >/dev/null || {
+		fail "read-only list_files: punctuation in path must be literal"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 6)" | jq -e '.result.content[0].text == "0x0"' >/dev/null || {
+		fail "read-only tools: input created injection marker"
+	}
+}
+
+run_lookup_export_regression() {
+	local req="$TMPDIR/lookup-export.req"
+	local resp="$TMPDIR/lookup-export.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_OBJECT" '{file_path:$file}')"
+	append_tool_call "$req" 3 run_command '{"command":"iEj"}'
+	run_session "$req" "$resp" -r
+	local export
+	export=$(response_by_id "$resp" 3 | jq -c '.result.content[0].text | fromjson | .[0]')
+	[ "$export" != "null" ] || fail "lookup_export: object fixture has no exports"
+	local name
+	local address
+	name=$(printf '%s\n' "$export" | jq -r '.name')
+	address=$(printf '0x%x' "$(printf '%s\n' "$export" | jq -r '.vaddr')")
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_OBJECT" '{file_path:$file}')"
+	append_tool_call "$req" 3 lookup_export "$(jq -cn --arg name "$name" '{name:$name}')"
+	append_tool_call "$req" 4 lookup_export '{"name":"__R2MCP_NO_SUCH_EXPORT__"}'
+	run_session "$req" "$resp"
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e --arg address "$address" '.result.content[0].text == $address' >/dev/null || {
+		fail "lookup_export: '$name' did not resolve to $address"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text == "Export not found"' >/dev/null || {
+		fail "lookup_export: missing export should not match other exports"
+	}
+}
+
+run_list_filter_regressions() {
+	local req="$TMPDIR/list-filter.req"
+	local resp="$TMPDIR/list-filter.resp"
+	local meta="$TMPDIR/list-filter.meta.jsonl"
+	local tools="$TMPDIR/list-filter.tools"
+	local marker="__R2MCP_NO_FILTER_MATCH__"
+	local id=10
+	: > "$req"
+	: > "$meta"
+
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_OBJECT" '{file_path:$file}')"
+	append_tool_call "$req" 3 list_functions '{"filter":"r2mcp_sandbox_check"}'
+	append_tool_call "$req" 4 list_functions '{"filter":"r2mcp_sandbox_.*","count":true}'
+	append_tool_call "$req" 5 list_symbols '{"filter":"r2mcp_sandbox_.*","count":true}'
+
+	jq -r '.[] | select((.inputSchema.properties // {}) | has("filter")) | .name' "$NORMAL_CATALOG" > "$tools"
+	while IFS= read -r tool; do
+		local args
+		case "$tool" in
+		list_files)
+			args=$(jq -cn --arg filter "$marker" --arg path "$TEST_DIR" '{filter:$filter,path:$path}')
+			;;
+		list_methods)
+			args=$(jq -cn --arg filter "$marker" '{filter:$filter,classname:"__no_such_class__"}')
+			;;
+		*)
+			args=$(jq -cn --arg filter "$marker" '{filter:$filter}')
+			;;
+		esac
+		append_tool_call "$req" "$id" "$tool" "$args"
+		jq -cn --argjson id "$id" --arg tool "$tool" '{id:$id,tool:$tool}' >> "$meta"
+		id=$((id + 1))
+	done < "$tools"
+	[ -s "$meta" ] || fail "list filters: catalog exposed no filter-capable tools"
+
+	run_session "$req" "$resp"
+
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.content[0].text | test("(sym|dbg)\\.r2mcp_sandbox_check(\\s|$)")' >/dev/null 2>&1 || {
+		fail "list_functions filter: single matching row was lost, got $(response_by_id "$resp" 3)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text == "1"' >/dev/null 2>&1 || {
+		fail "list_functions filter count: regex count differs from list results, got $(response_by_id "$resp" 4)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 5)" | jq -e '.result.content[0].text == "1"' >/dev/null 2>&1 || {
+		fail "list_symbols filter count: regex count differs from list results, got $(response_by_id "$resp" 5)"
+	}
+
+	while IFS= read -r case_json; do
+		local case_id
+		local tool
+		local expected="No results matched the given filter."
+		case_id=$(printf '%s\n' "$case_json" | jq -r '.id')
+		tool=$(printf '%s\n' "$case_json" | jq -r '.tool')
+		if [ "$tool" = "list_functions" ]; then
+			expected="No functions matched the given filter."
+		fi
+		printf '%s\n' "$(response_by_id "$resp" "$case_id")" | jq -e --arg expected "$expected" '.result.content[0].text == $expected' >/dev/null 2>&1 || {
+			fail "$tool filter: expected a meaningful no-match response, got $(response_by_id "$resp" "$case_id")"
+		}
+	done < "$meta"
+}
+
+run_open_session_regression() {
+	local port="19392"
+	local good_url="http://127.0.0.1:$port/cmd/"
+	local req="$TMPDIR/open-session.req"
+	local resp="$TMPDIR/open-session.resp"
+	local server_log="$TMPDIR/open-session.server.log"
+	local server_pid=""
+	local ready="0"
+	local i="0"
+
+	r2 -q0 -e http.bind=127.0.0.1 -c "=h $port" /bin/ls > /dev/null 2>"$server_log" &
+	server_pid=$!
+	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -rf "$TMPDIR"' EXIT INT TERM
+	while [ "$i" -lt 20 ]; do
+		if curl -fsS --data-raw i "$good_url" >/dev/null 2>&1; then
+			ready="1"
+			break
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	[ "$ready" = "1" ] || fail "open_session: failed to start local r2 http server"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_session "$(jq -cn --arg url "$good_url" '{url:$url}')"
+	append_tool_call "$req" 3 get_current_address '{}'
+	append_tool_call "$req" 4 open_session "$(jq -cn '{url:"http://127.0.0.1:1"}')"
+	append_tool_call "$req" 5 get_current_address '{}'
+	append_tool_call "$req" 6 close_session '{}'
+	run_session "$req" "$resp" -L -p
+
+	printf '%s\n' "$(response_by_id "$resp" 2)" | jq -e '.result.content[0].text | contains("Successfully connected")' >/dev/null 2>&1 || {
+		fail "open_session: initial connect should succeed, got $(response_by_id "$resp" 2)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.content[0].text | type == "string"' >/dev/null 2>&1 || {
+		fail "open_session: expected active remote session before reconnect, got $(response_by_id "$resp" 3)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.error.code == -32603 and (.error.message | contains("Failed to connect"))' >/dev/null 2>&1 || {
+		fail "open_session: failed reconnect should report an error, got $(response_by_id "$resp" 4)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 5)" | jq -e '.result.content[0].text | type == "string"' >/dev/null 2>&1 || {
+		fail "open_session: existing remote session should survive failed reconnect, got $(response_by_id "$resp" 5)"
+	}
+	kill "$server_pid" 2>/dev/null || true
+	wait "$server_pid" 2>/dev/null || true
+	trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+}
+
+run_http_sandbox_grain_regression() {
+	local normal_log="$TMPDIR/sandbox-grain.normal.log"
+	local http_log="$TMPDIR/sandbox-grain.http.log"
+	local override_log="$TMPDIR/sandbox-grain.override.log"
+
+	"$BIN" -t -l "$normal_log" >/dev/null
+	"$BIN" -u "http://127.0.0.1:1/cmd/" -t -l "$http_log" >/dev/null
+	"$BIN" -u "http://127.0.0.1:1/cmd/" -g "exec,socket" -t -l "$override_log" >/dev/null
+
+	grep -q "sandbox grain: exec,socket" "$normal_log" || {
+		fail "sandbox grain: normal mode should default to exec,socket"
+	}
+	grep -q "sandbox grain: exec,network" "$http_log" || {
+		fail "sandbox grain: HTTP mode should default to exec,network"
+	}
+	grep -q "sandbox grain: exec,socket" "$override_log" || {
+		fail "sandbox grain: explicit -g should override the HTTP mode default"
+	}
+}
+
+run_http_auth_regression() {
+	local port="19393"
+	local token="test-token"
+	local body="$TMPDIR/http-auth.body"
+	local server_log="$TMPDIR/http-auth.server.log"
+	local server_out="$TMPDIR/http-auth.server.out"
+	local server_pid=""
+	local ready="0"
+	local code
+	local i="0"
+
+	if "$BIN" -h 2>&1 | grep -q "requires radare2 ABI"; then
+		echo "skip HTTP auth regression: missing HTTP header API"
+		return
+	fi
+
+	"$BIN" -H "$port" -n -a "$token" > "$server_out" 2>"$server_log" &
+	server_pid=$!
+	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -rf "$TMPDIR"' EXIT INT TERM
+	while [ "$i" -lt 20 ]; do
+		code=$(curl_code "$body" "http://127.0.0.1:$port/")
+		if [ "$code" != "000" ]; then
+			ready="1"
+			break
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	[ "$ready" = "1" ] || fail "HTTP auth: failed to start local r2mcp HTTP server"
+
+	code=$(curl_code "$body" "http://127.0.0.1:$port/")
+	[ "$code" = "401" ] || fail "HTTP auth: missing token should return 401, got $code"
+
+	code=$(curl_code "$body" -H "Authorization: Bearer wrong" "http://127.0.0.1:$port/")
+	[ "$code" = "401" ] || fail "HTTP auth: wrong token should return 401, got $code"
+
+	code=$(curl_code "$body" -H "Authorization: Bearer $token" "http://127.0.0.1:$port/")
+	[ "$code" = "200" ] || fail "HTTP auth: correct token should allow GET, got $code"
+	jq -e '.name == "r2mcp"' "$body" >/dev/null 2>&1 || fail "HTTP auth: authenticated GET body should be JSON info"
+
+	code=$(curl_code "$body" -X OPTIONS "http://127.0.0.1:$port/")
+	[ "$code" = "200" ] || fail "HTTP auth: OPTIONS preflight should not require auth, got $code"
+
+	code=$(curl_code "$body" \
+		-H "Authorization: Bearer $token" \
+		-H "Content-Type: application/json" \
+		--data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}}' \
+		"http://127.0.0.1:$port/")
+	[ "$code" = "200" ] || fail "HTTP auth: authenticated POST should return 200, got $code"
+	jq -e '.id == 1 and .result.serverInfo.name == "Radare2 MCP Connector"' "$body" >/dev/null 2>&1 || {
+		fail "HTTP auth: authenticated POST should return initialize result"
+	}
+
+	code=$(curl_code "$body" \
+		-H "Authorization: Bearer $token" \
+		-H "Content-Type: application/json" \
+		--data '{"jsonrpc":"2.0","id":"001","method":"ping","params":{}}' \
+		"http://127.0.0.1:$port/")
+	[ "$code" = "200" ] || fail "HTTP auth: string-ID POST should return 200, got $code"
+	jq -e '.id == "001" and .result == {}' "$body" >/dev/null 2>&1 || {
+		fail "HTTP auth: string JSON-RPC IDs must be echoed without numeric coercion"
+	}
+
+	kill "$server_pid" 2>/dev/null || true
+	wait "$server_pid" 2>/dev/null || true
+	trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+}
+
+run_sandbox_regressions() {
+	local sb="$TMPDIR/sandbox"
+	local req="$TMPDIR/sandbox.req"
+	local resp="$TMPDIR/sandbox.resp"
+	mkdir -p "$sb"
+	cp /bin/ls "$sb/ls"
+	ln -s /bin "$sb/escape"
+	: > "$req"
+
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$sb/ls" '{file_path:$file}')"
+	append_tool_call "$req" 3 open_file "$(jq -cn --arg file "$sb/escape/ls" '{file_path:$file}')"
+	append_tool_call "$req" 4 list_files "$(jq -cn --arg path "$sb/../" '{path:$path}')"
+	append_tool_call "$req" 5 list_files "$(jq -cn --arg path "$sb/escape" '{path:$path}')"
+	append_tool_call "$req" 6 open_file "$(jq -cn --arg file "file://$sb/ls" '{file_path:$file}')"
+	append_tool_call "$req" 7 open_file "$(jq -cn --arg file "file:///bin/ls" '{file_path:$file}')"
+	run_session "$req" "$resp" -s "$sb"
+
+	local open_escape
+	local traversal
+	local list_escape
+	local open_file_uri
+	local open_file_uri_escape
+	open_escape=$(response_by_id "$resp" 3)
+	traversal=$(response_by_id "$resp" 4)
+	list_escape=$(response_by_id "$resp" 5)
+	open_file_uri=$(response_by_id "$resp" 6)
+	open_file_uri_escape=$(response_by_id "$resp" 7)
+
+	printf '%s\n' "$open_escape" | jq -e '.result.content[0].text == "Failed to open file."' >/dev/null 2>&1 || {
+		fail "sandbox open_file symlink escape should fail, got $open_escape"
+	}
+	printf '%s\n' "$traversal" | jq -e '.error.code == -32603 and (.error.message | contains("Path traversal"))' >/dev/null 2>&1 || {
+		fail "sandbox traversal should be rejected, got $traversal"
+	}
+	printf '%s\n' "$list_escape" | jq -e '.error.code == -32603 and (.error.message | contains("outside of the sandbox"))' >/dev/null 2>&1 || {
+		fail "sandbox symlink escape should be rejected, got $list_escape"
+	}
+	printf '%s\n' "$open_file_uri" | jq -e '.result.content[0].text | contains("File opened") or contains("File already opened")' >/dev/null 2>&1 || {
+		fail "sandbox file:// inside sandbox should succeed, got $open_file_uri"
+	}
+	printf '%s\n' "$open_file_uri_escape" | jq -e '.result.content[0].text == "Failed to open file."' >/dev/null 2>&1 || {
+		fail "sandbox file:// escape should fail, got $open_file_uri_escape"
+	}
+}
+
+run_startup_command_regression() {
+	local req="$TMPDIR/startup.req"
+	local resp="$TMPDIR/startup.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_tool_call "$req" 2 run_command '{"command":"e cmd.prompt"}'
+	append_tool_call "$req" 3 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 4 run_command '{"command":"e cmd.prompt"}'
+	"$BIN" -n -N -r -c 'e cmd.prompt=first' \
+		-c 'e cmd.prompt=R2MCP_STARTUP; ?e ignored output' < "$req" > "$resp"
+	jq -s -e 'length == 4 and all(.[]; .jsonrpc == "2.0")' "$resp" >/dev/null || fail "startup output corrupted MCP stdout"
+	response_by_id "$resp" 2 | jq -e '.error.code == -32611 and (.error.message | contains("open_file"))' >/dev/null
+	response_by_id "$resp" 4 | jq -e '.result.content[0].text == "R2MCP_STARTUP\n"' >/dev/null || fail "startup commands did not run in order"
+	"$BIN" -n -N -r -c 'e cmd.prompt=R2MCP_STARTUP' \
+		-T "open_file file_path=\"$TEST_FILE\"; run_command command=\"e cmd.prompt\"" 2> "$resp"
+	grep -q '"text":"R2MCP_STARTUP\\n"' "$resp" || fail "startup commands did not run before DSL tests"
+}
+
+run_sql_plugin_missing_regression() {
+	local req="$TMPDIR/sql_missing.req"
+	local resp="$TMPDIR/sql_missing.resp"
+	: > "$req"
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 sql '{"query":"SELECT 1"}'
+	run_session "$req" "$resp" -n -N
+	response_by_id "$resp" 3 | jq -e '.error.code == -32603 and (.error.message | contains("No SQL core plugin"))' >/dev/null || fail "missing SQL plugin must be reported"
+}
+
+run_command_smoke_regression() {
+	local req="$TMPDIR/runcmd_smoke.req"
+	local resp="$TMPDIR/runcmd_smoke.resp"
+	: > "$req"
+
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 run_command '{"command":"px"}'
+	append_tool_call "$req" 4 run_command '{"command":""}'
+	run_session "$req" "$resp" -r
+
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.content[0].text | type == "string" and length > 0' >/dev/null 2>&1 || {
+		fail "run_command smoke: expected px to return non-empty text, got $(response_by_id "$resp" 3)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text | type == "string"' >/dev/null 2>&1 || {
+		fail "run_command smoke: expected empty command to return text, got $(response_by_id "$resp" 4)"
+	}
+}
+
+run_command_json_pagination_regression() {
+	local req="$TMPDIR/runcmd_json_page.req"
+	local resp="$TMPDIR/runcmd_json_page.resp"
+	: > "$req"
+
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 run_command '{"command":"iij","page_size":2}'
+	append_tool_call "$req" 4 run_command '{"command":"iij","cursor":"2","page_size":2}'
+	run_session "$req" "$resp" -r -C structured
+
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '
+		.result.structuredContent
+		| type == "array" and length == 2
+	' >/dev/null 2>&1 || {
+		fail "run_command JSON pagination: expected first page structured array, got $(response_by_id "$resp" 3)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.pagination.nextCursor == "2"' >/dev/null 2>&1 || {
+		fail "run_command JSON pagination: expected nextCursor=2, got $(response_by_id "$resp" 3)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '
+		.result.structuredContent
+		| type == "array" and length == 2
+	' >/dev/null 2>&1 || {
+		fail "run_command JSON pagination: expected second page structured array, got $(response_by_id "$resp" 4)"
+	}
+}
+
+run_command_filter_regression() {
+	local req="$TMPDIR/filter.req"
+	local resp="$TMPDIR/filter.resp"
+	local payload='x$(f __R2MCP_INJECTED__=entry0)'
+	: > "$req"
+
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 run_command "$(jq -cn --arg command "$payload" '{command:$command}')"
+	append_tool_call "$req" 4 list_symbols "$(jq -cn --arg marker "$INJECT_MARKER" '{filter:$marker}')"
+	run_session "$req" "$resp" -r
+
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.result.content[0].text | type == "string"' >/dev/null 2>&1 || {
+		fail "command filter regression: expected run_command to return text, got $(response_by_id "$resp" 3)"
+	}
+	assert_marker_absent "$(response_by_id "$resp" 4)" "$INJECT_MARKER" "command filter regression"
+}
+
+run_script_sandbox_regression() {
+	local req="$TMPDIR/run_script_sandbox.req"
+	local resp="$TMPDIR/run_script_sandbox.resp"
+	: > "$req"
+
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 run_script "$(jq -cn --arg file "$TEST_SCRIPT" '{file_path:$file}')"
+	run_session "$req" "$resp" -r
+
+	printf '%s\n' "$(response_by_id "$resp" 3)" | jq -e '.error.code == -32603 and (.error.message | contains("Sandbox forbids reading script files"))' >/dev/null 2>&1 || {
+		fail "run_script sandbox: script should not run with default sandbox, got $(response_by_id "$resp" 3)"
+	}
+}
+
+run_use_decompiler_regression() {
+	local req="$TMPDIR/decompiler.req"
+	local resp="$TMPDIR/decompiler.resp"
+	local rejected="Unknown or unavailable decompiler"
+	local available
+	local ghidra_expected
+	local selected
+	: > "$req"
+
+	append_request "$req" 1 initialize '{"capabilities":{},"clientInfo":{"name":"testsuite","version":"1"}}'
+	append_notification "$req" notifications/initialized '{}'
+	append_tool_call "$req" 2 open_file "$(jq -cn --arg file "$TEST_FILE" '{file_path:$file}')"
+	append_tool_call "$req" 3 run_command '{"command":"e cmd.pdc=?"}'
+	# A fresh core may leave cmd.pdc empty even though pdc is available.
+	# Select a known backend before checking that rejected names preserve it.
+	append_tool_call "$req" 4 use_decompiler '{"name":"pdc"}'
+	append_tool_call "$req" 5 run_command '{"command":"e cmd.pdc"}'
+	# Partial/arbitrary names must be rejected: only complete registered
+	# commands may be selected ("pd", "c" used to be accepted as substrings).
+	append_tool_call "$req" 6 use_decompiler '{"name":"pd"}'
+	append_tool_call "$req" 7 use_decompiler '{"name":"c"}'
+	# Rejected input must retain the previous selection.
+	append_tool_call "$req" 8 run_command '{"command":"e cmd.pdc"}'
+	# Empty names are a parameter error.
+	append_tool_call "$req" 9 use_decompiler '{"name":""}'
+	# Alias for the optional Ghidra backend (accepted only when advertised).
+	append_tool_call "$req" 10 use_decompiler '{"name":"ghidra"}'
+	append_tool_call "$req" 11 use_decompiler '{"name":"pd:g"}'
+	# Reset to pdc and verify decompile_function keeps pdc dispatch semantics
+	# (asm.addr.base is set/restored inside radare2, not by the tool).
+	append_tool_call "$req" 12 use_decompiler '{"name":"pdc"}'
+	append_tool_call "$req" 13 run_command '{"command":"e asm.addr.base=10"}'
+	append_tool_call "$req" 14 decompile_function '{"address":"entry0"}'
+	append_tool_call "$req" 15 run_command '{"command":"e asm.addr.base"}'
+	run_session "$req" "$resp" -r
+
+	available=$(response_by_id "$resp" 3 | jq -r '.result.content[0].text')
+	if printf '%s\n' "$available" | grep -qx 'pdg'; then
+		ghidra_expected="ok"
+	else
+		ghidra_expected="$rejected"
+	fi
+
+	printf '%s\n' "$(response_by_id "$resp" 4)" | jq -e '.result.content[0].text == "ok"' >/dev/null 2>&1 || {
+		fail "use_decompiler: pdc should be accepted, got $(response_by_id "$resp" 4)"
+	}
+	selected=$(response_by_id "$resp" 5 | jq -r '.result.content[0].text')
+	[ "$selected" = "pdc" ] || {
+		fail "use_decompiler: expected cmd.pdc=pdc after selection, got $(response_by_id "$resp" 5)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 6)" | jq -e --arg m "$rejected" '.result.content[0].text == $m' >/dev/null 2>&1 || {
+		fail "use_decompiler: partial name 'pd' must be rejected, got $(response_by_id "$resp" 6)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 7)" | jq -e --arg m "$rejected" '.result.content[0].text == $m' >/dev/null 2>&1 || {
+		fail "use_decompiler: partial name 'c' must be rejected, got $(response_by_id "$resp" 7)"
+	}
+	[ "$(response_by_id "$resp" 8 | jq -r '.result.content[0].text')" = "$selected" ] || {
+		fail "use_decompiler: rejected input changed cmd.pdc, got $(response_by_id "$resp" 8)"
+	}
+	assert_error_contains_param "$(response_by_id "$resp" 9)" "name" "use_decompiler:empty-name"
+	printf '%s\n' "$(response_by_id "$resp" 10)" | jq -e --arg m "$ghidra_expected" '.result.content[0].text == $m' >/dev/null 2>&1 || {
+		fail "use_decompiler: 'ghidra' expected '$ghidra_expected', got $(response_by_id "$resp" 10)"
+	}
+	if [ "$ghidra_expected" = "ok" ]; then
+		printf '%s\n' "$(response_by_id "$resp" 11)" | jq -e '.result.content[0].text == "ok"' >/dev/null 2>&1 || {
+			fail "use_decompiler: 'pd:g' alias should resolve, got $(response_by_id "$resp" 11)"
+		}
+	fi
+	printf '%s\n' "$(response_by_id "$resp" 12)" | jq -e '.result.content[0].text == "ok"' >/dev/null 2>&1 || {
+		fail "use_decompiler: reset to pdc failed, got $(response_by_id "$resp" 12)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 14)" | jq -e '.result.content[0].text | type == "string" and length > 0' >/dev/null 2>&1 || {
+		fail "decompile_function: expected non-empty text, got $(response_by_id "$resp" 14)"
+	}
+	printf '%s\n' "$(response_by_id "$resp" 15)" | jq -e '.result.content[0].text | contains("10")' >/dev/null 2>&1 || {
+		fail "decompile_function: pdc dispatch must restore asm.addr.base, got $(response_by_id "$resp" 15)"
+	}
+}
+
+need_cmd jq
+need_cmd mktemp
+need_cmd curl
+need_cmd r2
+
+echo "== Build =="
+make -C src all > /dev/null
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+TEST_DIR="$TMPDIR/work"
+TEST_FILE="$TEST_DIR/ls.bin"
+TEST_FILE2="$TEST_DIR/cat.bin"
+TEST_SCRIPT="$TEST_DIR/script.r2"
+TEST_OBJECT="$PWD/src/r2mcp.o"
+mkdir -p "$TEST_DIR"
+cp /bin/ls "$TEST_FILE"
+cp /bin/cat "$TEST_FILE2"
+printf '?e R2MCP_SCRIPT_ONE\r\n# comment\r\n?e R2MCP_SCRIPT_TWO\r\n' > "$TEST_SCRIPT"
+
+NORMAL_CATALOG="$TMPDIR/catalog.normal.json"
+DANGEROUS_CATALOG="$TMPDIR/catalog.dangerous.json"
+READONLY_CATALOG="$TMPDIR/catalog.readonly.json"
+SESSION_CATALOG="$TMPDIR/catalog.sessions.json"
+SESSION_ONLY_CATALOG="$TMPDIR/catalog.sessions.only.json"
+NORMAL_RUNTIME_CATALOG="$TMPDIR/catalog.normal.runtime.json"
+DANGEROUS_ONLY="$TMPDIR/catalog.dangerous.only.json"
+
+echo "== Catalog =="
+fetch_catalog "$NORMAL_CATALOG"
+fetch_catalog "$DANGEROUS_CATALOG" -r
+fetch_catalog "$READONLY_CATALOG" -R
+fetch_catalog "$SESSION_CATALOG" -L
+jq -e '
+	length > 0
+	and ((map(.name) | unique | length) == length)
+	and all(.[]; (.inputSchema | type) == "object")
+	and all(.[]; ((.inputSchema.properties // {}) | type) == "object")
+	and all(.[]; ((.inputSchema.required // []) | type) == "array")
+' "$NORMAL_CATALOG" >/dev/null
+jq -e 'map(.name) as $names
+	| ($names | index("list_sessions") | not)
+	and ($names | index("sql"))
+	and ($names | index("open_session") | not)
+	and ($names | index("close_session") | not)' "$NORMAL_CATALOG" >/dev/null
+jq -e 'map(.name) as $names
+	| ($names | index("list_sessions"))
+	and ($names | index("open_session"))
+	and ($names | index("close_session"))' "$SESSION_CATALOG" >/dev/null
+jq '[.[] | select(.name == "list_sessions" or .name == "open_session" or .name == "close_session")]' \
+	"$SESSION_CATALOG" > "$SESSION_ONLY_CATALOG"
+jq '[.[] | select(.name != "open_file" and .name != "list_sessions" and .name != "open_session" and .name != "close_session")]' \
+	"$NORMAL_CATALOG" > "$NORMAL_RUNTIME_CATALOG"
+jq --slurpfile normal "$NORMAL_CATALOG" '
+	[.[] | select(.name as $name | ($normal[0] | map(.name) | index($name) | not))]
+' "$DANGEROUS_CATALOG" > "$DANGEROUS_ONLY"
+jq -e 'map(.name) | index("run_command") and index("run_javascript") and index("run_script") and (index("sql") | not)' "$DANGEROUS_ONLY" >/dev/null
+jq -e 'map(.name) | index("sql") | not' "$READONLY_CATALOG" >/dev/null
+echo "normal tools: $(jq 'length' "$NORMAL_RUNTIME_CATALOG")"
+echo "dangerous-only tools: $(jq 'length' "$DANGEROUS_ONLY")"
+echo "session tools: $(jq 'length' "$SESSION_ONLY_CATALOG")"
+
+run_dynamic_suite "$NORMAL_RUNTIME_CATALOG" "dynamic-normal" with-open
+run_dynamic_suite "$DANGEROUS_ONLY" "dynamic-dangerous" with-open -r
+run_dynamic_suite "$SESSION_ONLY_CATALOG" "dynamic-sessions" no-open -L
+run_open_file_regressions
+run_list_functions_without_open_regression
+run_session_tools_require_L_regression
+run_repeated_open_file_regression
+run_different_open_file_regression
+run_open_file_baddr_regression
+run_numeric_string_regression
+run_tool_argument_regressions
+run_lookup_export_regression
+run_list_filter_regressions
+run_close_file_regression
+run_open_session_regression
+run_http_sandbox_grain_regression
+run_http_auth_regression
+run_sandbox_regressions
+run_startup_command_regression
+run_sql_plugin_missing_regression
+run_command_smoke_regression
+run_command_json_pagination_regression
+run_command_filter_regression
+run_script_sandbox_regression
+run_use_decompiler_regression
+
+echo "== OK =="

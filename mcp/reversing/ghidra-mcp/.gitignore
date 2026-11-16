@@ -1,0 +1,77 @@
+# Gradle extension build
+.gradle/
+build/
+dist/
+extension/lib/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Ghidra projects (e.g. from ghidra-mcp --headless --project inside the repo)
+*.gpr
+*.rep/
+*.lock
+*.lock~
+!uv.lock
+
+# Test fixture build by-products
+tests/fixtures/*.pdb
+tests/fixtures/*.lib
+
+# Compiled class files
+*.class
+
+# Logs
+*.log
+
+# IDE files
+# IntelliJ
+.idea/
+*.iml
+*.iws
+out/
+
+# Eclipse
+.project
+.classpath
+.settings/
+bin/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# macOS metadata files
+.Spotlight-V100
+.Trashes
+
+# Finder duplicates ("file 2.py")
+* [0-9]
+* [0-9].*
+
+# Cursor
+.cursor/
+
+# Environment files
+.env
+.env.*
+
+# Java crash logs (if any)
+hs_err_pid*
+replay_pid*

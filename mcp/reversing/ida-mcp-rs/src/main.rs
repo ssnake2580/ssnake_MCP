@@ -1,0 +1,1552 @@
+//! Headless IDA Pro MCP Server
+//!
+//! This binary runs an MCP server that provides headless IDA Pro access
+//! via stdin/stdout transport.
+//!
+//! Architecture:
+//! - Main thread: Runs IDA worker loop (IDA requires main thread)
+//! - Background thread: Runs tokio runtime with async MCP server
+
+use axum::Router;
+use clap::{Args, Parser, Subcommand};
+use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
+use ida_mcp::server::http_config::{
+    build_pooled_session_manager, build_session_manager, build_streamable_config,
+    HttpServerOptions, DEFAULT_MAX_REQUEST_BODY_MIB,
+};
+use ida_mcp::server::task::TaskRegistry;
+use ida_mcp::server::tool_filter::{self, ToolFilter};
+use ida_mcp::server::{SanitizedIdaServer, ServerRuntimeState};
+use ida_mcp::transport::{supervised_stdio, worker_stdio};
+use ida_mcp::{
+    disasm::generate_disasm_line,
+    expand_path, ida,
+    ida::pool::{WorkerPool, WorkerPoolConfig, WorkspaceDatabase, WorkspaceRegistry},
+    ida::worker::WorkerBackend,
+    FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
+};
+use idalib::{idb::IDBOpenOptions, Address, IDB};
+use rmcp::transport::streamable_http_server::StreamableHttpService;
+use rmcp::ServiceExt;
+use std::ffi::OsString;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::Notify;
+use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+mod logging;
+
+const REQUEST_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 1800;
+
+#[derive(Parser)]
+#[command(name = "ida-mcp", version, about = "Headless IDA Pro MCP Server")]
+struct Cli {
+    #[command(flatten)]
+    filter: ToolFilterArgs,
+    #[command(flatten)]
+    ida_network: IdaNetworkArgs,
+    #[command(flatten)]
+    debugger: DebuggerArgs,
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Workspace (opt-in)")]
+struct WorkspaceArgs {
+    /// Enable explicit multi-database routing. open_idb/open_dsc return a
+    /// database_id; database-scoped calls must send it on every call.
+    #[arg(long, global = true)]
+    workspace: bool,
+    /// Maximum child processes used by stdio/HTTP workspace mode.
+    #[arg(long, global = true, default_value_t = 4)]
+    workspace_max_workers: usize,
+    /// Reap an unpinned database after this many idle seconds (0 disables).
+    #[arg(long, global = true, default_value_t = 1800)]
+    workspace_idle_timeout_secs: u64,
+    /// Reap an idle child process after this many seconds (0 disables).
+    #[arg(long, global = true, default_value_t = 300)]
+    workspace_worker_idle_timeout_secs: u64,
+    /// Kill a workspace child that exceeds this operation watchdog.
+    #[arg(long, global = true, default_value_t = 1800)]
+    workspace_worker_op_timeout_secs: u64,
+}
+
+impl WorkspaceArgs {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.workspace_max_workers == 0 {
+            return Err(anyhow::anyhow!(
+                "--workspace-max-workers must be at least 1"
+            ));
+        }
+        if self.workspace_worker_op_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "--workspace-worker-op-timeout-secs must be at least 1"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Worker pool and database registry for a workspace server. Shared by
+    /// the stdio and HTTP entry points so their pool wiring cannot drift.
+    fn build_pool_and_registry(
+        &self,
+        worker_args: Vec<OsString>,
+    ) -> anyhow::Result<(WorkerPool, WorkspaceRegistry)> {
+        let exe_path = std::env::current_exe()
+            .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            max_workers: self.workspace_max_workers,
+            min_workers: 0,
+            worker_idle_timeout: Duration::from_secs(self.workspace_worker_idle_timeout_secs),
+            worker_op_timeout: Duration::from_secs(self.workspace_worker_op_timeout_secs),
+            exe_path,
+            worker_args,
+        });
+        let registry = WorkspaceRegistry::new(
+            pool.clone(),
+            Duration::from_secs(self.workspace_idle_timeout_secs),
+        );
+        Ok((pool, registry))
+    }
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the MCP server (default)
+    Serve,
+    /// Run the MCP server over Streamable HTTP (SSE)
+    ServeHttp(ServeHttpArgs),
+    /// Run a child worker for the HTTP process pool
+    #[command(hide = true)]
+    Worker(WorkerArgs),
+    /// Run a direct CLI probe to exercise idalib
+    Probe(ProbeArgs),
+}
+
+// Tool filter flags. Defined at the top level with `global = true` so they
+// work on the default stdio invocation (`ida-mcp --toolsets=core`) as well
+// as on `ida-mcp serve …` and `ida-mcp serve-http …`.
+//
+// Compose order (locked): no include flags → all tools; otherwise the
+// union of `--toolsets` and `--tools`; then `--exclude-tools`; then
+// `--read-only` strips the curated mutating/arbitrary-code deny-list.
+// Flags override env vars (clap behavior with `env =`).
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Tool filter")]
+struct ToolFilterArgs {
+    /// Named tool profile to start from. `lean` is 28 tools covering Apple
+    /// loading, code/xref reading, annotation, and scripting; --toolsets and
+    /// --tools add to it, --exclude-tools and --read-only subtract.
+    #[arg(long, env = tool_filter::PROFILE_ENV, global = true)]
+    profile: Option<String>,
+    /// Categories to include (comma-separated). When set, replaces the
+    /// implicit "all tools" default. Example: --toolsets=disassembly,decompile
+    #[arg(long, value_delimiter = ',', env = tool_filter::TOOLSETS_ENV, global = true)]
+    toolsets: Vec<String>,
+    /// Individual tool names to include (additive to --toolsets).
+    /// Example: --tools=open_idb,decompile,callees
+    #[arg(long, value_delimiter = ',', env = tool_filter::TOOLS_ENV, global = true)]
+    tools: Vec<String>,
+    /// Tool names to exclude (always wins over includes).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        env = tool_filter::EXCLUDE_TOOLS_ENV,
+        global = true
+    )]
+    exclude_tools: Vec<String>,
+    /// Strip mutating and arbitrary-code tools (run_script, patch, rename,
+    /// type/stack edits, dsc_add_*, analyze_funcs). Lifecycle/discovery
+    /// tools (open_idb, close_idb, status, catalog, help) stay enabled.
+    #[arg(
+        long,
+        env = tool_filter::READ_ONLY_ENV,
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    read_only: bool,
+}
+
+impl ToolFilterArgs {
+    fn build(&self, debugger_enabled: bool, workspace_enabled: bool) -> Result<ToolFilter, String> {
+        ToolFilter::from_profile_and_inputs(
+            self.profile.as_deref(),
+            &self.toolsets,
+            &self.tools,
+            &self.exclude_tools,
+            self.read_only,
+        )
+        .and_then(|filter| filter.with_capabilities(debugger_enabled, workspace_enabled))
+        .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Debugger (experimental opt-in)")]
+struct DebuggerArgs {
+    /// Advertise the headless debugger lifecycle tools on platforms whose
+    /// native integration gate has passed. Currently enabled on Apple Silicon macOS only.
+    #[arg(
+        long,
+        env = "IDA_MCP_ENABLE_DEBUGGER",
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    enable_debugger: bool,
+}
+
+impl DebuggerArgs {
+    fn worker_args(&self) -> Vec<OsString> {
+        if self.enable_debugger {
+            vec![OsString::from("--enable-debugger")]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "IDA network")]
+struct IdaNetworkArgs {
+    /// Allow IDA to contact configured Lumina servers.
+    #[arg(
+        long,
+        env = "IDA_MCP_ALLOW_LUMINA",
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_lumina: bool,
+}
+
+impl IdaNetworkArgs {
+    fn worker_args(&self) -> Vec<OsString> {
+        if self.allow_lumina {
+            vec![OsString::from("--allow-lumina")]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Args)]
+struct ServeHttpArgs {
+    /// Bind address (e.g., 127.0.0.1:8765)
+    #[arg(long, default_value = "127.0.0.1:8765")]
+    bind: String,
+    /// SSE keep-alive interval in seconds (0 disables)
+    #[arg(long, default_value_t = 15)]
+    sse_keep_alive_secs: u64,
+    /// HTTP session inactivity timeout in seconds (0 disables, but may leak
+    /// zombie sessions on silent disconnects). In pooled mode this is the
+    /// fallback for POST-only clients; SSE clients are reclaimed via
+    /// --worker-disconnect-grace-secs.
+    #[arg(long, default_value_t = DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS)]
+    session_keep_alive_secs: u64,
+    /// Use stateless mode (POST only; no sessions)
+    #[arg(long)]
+    stateless: bool,
+    /// Prefer application/json over SSE framing for sessionless responses
+    /// (--stateless mode and all MCP 2026 requests).
+    #[arg(long)]
+    json_response: bool,
+    /// Maximum accepted request body, in MiB. Bulk `patch` (binary as hex,
+    /// ~2x the raw size) and large `run_script` sources need headroom; the
+    /// endpoint is unauthenticated and each in-flight request can retain up
+    /// to this much, so raise it deliberately.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_REQUEST_BODY_MIB,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1024),
+    )]
+    max_request_body_mib: usize,
+    /// Allowed Origin values (comma-separated). Defaults to localhost only.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "http://localhost,http://127.0.0.1"
+    )]
+    allow_origin: Vec<String>,
+    /// Extra allowed Host header values (comma-separated). IP-literal hosts
+    /// reachable through --bind are accepted automatically; add DNS names here.
+    /// Pass `*` or an empty value to disable the Host check.
+    #[arg(long, value_delimiter = ',')]
+    allow_host: Option<Vec<String>>,
+    /// Maximum child worker processes. 1 shares one database across HTTP clients.
+    #[arg(long, default_value_t = 1)]
+    max_workers: usize,
+    /// Minimum idle child worker processes to keep warm in pooled mode.
+    #[arg(long, default_value_t = 0)]
+    min_workers: usize,
+    /// Seconds before an idle pooled worker is reaped (0 disables reaping).
+    #[arg(long, default_value_t = 300)]
+    worker_idle_timeout_secs: u64,
+    /// Per-child operation watchdog in seconds; the parent kills a child that
+    /// exceeds it. This is a wedged-process safety net, not a UX deadline.
+    #[arg(long, default_value_t = 1800)]
+    worker_op_timeout_secs: u64,
+    /// Grace period before pooled sessions are closed after a client stream disconnects.
+    #[arg(long, default_value_t = 2)]
+    worker_disconnect_grace_secs: u64,
+}
+
+#[derive(Args)]
+struct WorkerArgs {}
+
+#[derive(Args)]
+struct ProbeArgs {
+    /// Path to the .i64/.idb database
+    #[arg(long)]
+    path: String,
+    /// Output .i64/.idb path when opening a raw binary (defaults to <path>.i64)
+    #[arg(long)]
+    idb_out: Option<String>,
+    /// Force auto-analysis (default: on for raw binaries, off for .i64/.idb)
+    #[arg(long)]
+    auto_analyse: bool,
+    /// List the first N functions (optional)
+    #[arg(long)]
+    list: Option<usize>,
+    /// Resolve a function name (optional)
+    #[arg(long)]
+    resolve: Option<String>,
+    /// Disassemble a function by name (optional)
+    #[arg(long)]
+    disasm_by_name: Option<String>,
+    /// Disassemble at an address (hex 0x... or decimal, optional)
+    #[arg(long)]
+    disasm_addr: Option<String>,
+    /// Decompile a function at an address (hex 0x... or decimal, optional)
+    #[arg(long)]
+    decompile_addr: Option<String>,
+    /// Instruction count for disassembly (default: 20)
+    #[arg(long, default_value_t = 20)]
+    count: usize,
+    /// Enable IDA console messages (may be verbose)
+    #[arg(long)]
+    ida_console: bool,
+}
+
+fn main() -> anyhow::Result<()> {
+    // Initialize logging to stderr (stdout is used for MCP protocol)
+    let (log_writer, mut log_guard) = logging::stderr()?;
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_writer(log_writer))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("ida_mcp=info")))
+        .init();
+
+    let cli = Cli::parse();
+    // Filter is only used by the MCP server paths. Probe doesn't load any
+    // tools, so don't reject probe runs because a bad IDA_MCP_TOOLSETS is
+    // sitting in the inherited env from a sibling mcpServers.json config.
+    let debugger_enabled = cli.debugger.enable_debugger;
+    let workspace = cli.workspace.clone();
+    let workspace_enabled = workspace.workspace;
+    let build_filter = || {
+        cli.filter
+            .build(debugger_enabled, workspace_enabled)
+            .map(Arc::new)
+            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
+    };
+    let allow_lumina = cli.ida_network.allow_lumina;
+    let mut worker_args = cli.ida_network.worker_args();
+    worker_args.extend(cli.debugger.worker_args());
+    let result = match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve if workspace.workspace => {
+            run_server_workspace(build_filter()?, worker_args, workspace)
+        }
+        Command::Serve => run_server(build_filter()?, worker_args, workspace),
+        Command::ServeHttp(args) => run_server_http(args, build_filter()?, worker_args, workspace),
+        Command::Worker(_args) => run_worker_server(build_filter()?, allow_lumina),
+        Command::Probe(args) => run_probe(args, allow_lumina),
+    };
+    let log_result = match log_guard.shutdown() {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        outcome => outcome.map(|_| ()).map_err(anyhow::Error::from),
+    };
+    result.and(log_result)
+}
+
+/// Waits for a shutdown signal and logs which one arrived, so a receipt can
+/// tell a client's hangup from an explicit terminate.
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // SIGHUP included: an MCP client that exits can hang up its stdio
+        // children, and an unhandled hangup kills the process before IDA
+        // packs the open database.
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigquit = signal(SignalKind::quit())?;
+        let mut sighup = signal(SignalKind::hangup())?;
+        let received = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+            _ = sigquit.recv() => "SIGQUIT",
+            _ = sighup.recv() => "SIGHUP",
+            _ = tokio::signal::ctrl_c() => "ctrl-c",
+        };
+        info!(signal = received, "Shutdown signal received");
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        info!(signal = "ctrl-c", "Shutdown signal received");
+    }
+
+    Ok(())
+}
+
+fn init_stdio_ida_state(allow_lumina: bool) -> anyhow::Result<ida::IdaInitState> {
+    // On Windows, IDA's init_library() probes console handles during
+    // startup. In stdio mode the MCP transport captures stdin/stdout
+    // for JSON-RPC framing, so init must run *before* the transport
+    // starts — otherwise init_library() deadlocks on the owned handle.
+    #[cfg(target_os = "windows")]
+    {
+        ida::init_ida_library(allow_lumina)
+            .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        ida::IdaInitState::deferred(allow_lumina)
+            .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))
+    }
+}
+
+/// Bounded worker shutdown. If IDA is wedged inside auto_wait() these
+/// requests sit behind it and the process can stay alive indefinitely
+/// (issue #32). After the timeout we forcibly exit so the OS reclaims
+/// IDA's mmap'd memory regardless. 124 matches GNU `timeout`'s "did its
+/// best, timed out" convention.
+async fn shutdown_worker_bounded(worker: &WorkerBackend) {
+    const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+    let close_result =
+        tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, worker.close_for_shutdown()).await;
+    let shutdown_result = tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, worker.shutdown()).await;
+    if close_result.is_err() || shutdown_result.is_err() {
+        warn!(
+            timeout_secs = WORKER_SHUTDOWN_TIMEOUT.as_secs(),
+            close_timed_out = close_result.is_err(),
+            shutdown_timed_out = shutdown_result.is_err(),
+            "IDA worker shutdown timed out (likely wedged in auto_wait); \
+             forcing process exit to release IDA-side memory"
+        );
+        std::process::exit(124);
+    }
+}
+
+fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
+    let requested = registry.cancel_all_running(message);
+    if requested > 0 {
+        info!(
+            cancellation_requests = requested,
+            message, "Requested background task cancellation"
+        );
+    }
+}
+
+/// Preserve the database before cancelling task futures or retiring its child.
+async fn shutdown_supervised(
+    pool: &WorkerPool,
+    tasks: &TaskRegistry,
+    drain: impl std::future::Future<Output = ()>,
+    close: impl std::future::Future<Output = Result<(), ida_mcp::error::ToolError>>,
+) {
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
+    // A request waiting on a client can outlive an idle IDA worker. Reserve
+    // time to save that worker while keeping the total shutdown bound fixed.
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
+    let started = tokio::time::Instant::now();
+    pool.begin_drain();
+    if tokio::time::timeout(DRAIN_TIMEOUT, drain).await.is_err() {
+        warn!("MCP requests did not settle before the shutdown drain deadline");
+    }
+    pool.begin_shutdown().await;
+    tokio::pin!(close);
+    let remaining = SHUTDOWN_TIMEOUT.saturating_sub(started.elapsed());
+    match tokio::time::timeout(remaining, &mut close).await {
+        Ok(Ok(())) | Ok(Err(ida_mcp::error::ToolError::NoDatabaseOpen)) => {}
+        Ok(Err(error)) => warn!(%error, "IDA database close failed during shutdown"),
+        Err(_) => warn!("IDA database close timed out during shutdown; retiring the child"),
+    }
+    cancel_background_tasks(tasks, "Cancelled by server shutdown");
+    // Keep the close future alive until retirement has finished; dropping an
+    // unfinished close earlier would delegate cleanup to a detached guard.
+    pool.shutdown_all().await;
+}
+
+/// The default stdio server: the implicit single-database API served by a
+/// router whose IDA runs in one supervised child process.
+///
+/// The child is the same binary in `worker` mode. A call that overruns its
+/// bound kills the child and the next `open_idb` gets a fresh one, which is
+/// what an in-process IDA thread blocked in a native call can never offer.
+/// Idle reaping is off so an open database stays open until `close_idb` or
+/// shutdown, as it always has in this mode.
+fn run_server(
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    workspace: WorkspaceArgs,
+) -> anyhow::Result<()> {
+    if workspace.workspace_worker_op_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--workspace-worker-op-timeout-secs must be at least 1; it is the watchdog for \
+             the supervised IDA worker"
+        ));
+    }
+    info!("Starting IDA MCP Server (stdio transport) with a supervised IDA worker");
+    let exe_path = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+    let pool = WorkerPool::new(WorkerPoolConfig {
+        max_workers: 1,
+        min_workers: 1,
+        worker_idle_timeout: Duration::ZERO,
+        worker_op_timeout: Duration::from_secs(workspace.workspace_worker_op_timeout_secs),
+        exe_path,
+        worker_args,
+    });
+    let database = Arc::new(WorkspaceDatabase::new(pool.clone(), "stdio".to_string()));
+    let backend = WorkerBackend::pooled(database.clone());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+    let result = runtime.block_on(async move {
+        if let Err(error) = pool.warm_min().await {
+            return Err(anyhow::anyhow!(
+                "could not start the IDA worker process ({error}); ida-mcp runs IDA in a \
+                 child process launched from its own executable, so check that the binary \
+                 is executable and, on Windows, sits beside IDA's DLLs"
+            ));
+        }
+        let server = IdaMcpServer::with_filter(backend, ServerMode::Stdio, filter.clone());
+        let task_registry = server.task_registry().clone();
+        // Retain the handler's task lifetime through save-first shutdown.
+        let server_lifetime = server.clone();
+        let sanitized = SanitizedIdaServer::with_filter(server, filter);
+        let (transport, stdio_shutdown) = supervised_stdio();
+        let mut service = sanitized
+            .serve(transport)
+            .await
+            .map_err(|error| anyhow::anyhow!("stdio MCP negotiation failed: {error}"))?;
+        stdio_shutdown.arm();
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) = wait_for_shutdown_signal().await {
+                warn!(%error, "Shutdown signal handler failed");
+            }
+            shutdown_signal.cancel();
+        });
+        loop {
+            tokio::select! {
+                () = stdio_shutdown.closed() => break,
+                _ = shutdown.cancelled() => {
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    // An internal rmcp task failure can close its channel
+                    // without a terminal read/write event on our transport.
+                    if service.is_transport_closed() {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("MCP server shutting down");
+        shutdown_supervised(
+            &pool,
+            &task_registry,
+            stdio_shutdown.drain(),
+            database.close(),
+        )
+        .await;
+        stdio_shutdown.release();
+        let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
+        drop(server_lifetime);
+        info!("Server stopped");
+        Ok::<_, anyhow::Error>(())
+    });
+    // A signal-driven shutdown can leave the stdin reader blocked on a client
+    // that never closed its end; do not let it pin the process.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+fn run_server_workspace(
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    workspace: WorkspaceArgs,
+) -> anyhow::Result<()> {
+    workspace.validate()?;
+
+    info!(
+        max_workers = workspace.workspace_max_workers,
+        "Starting explicit workspace router on stdio; parent will not initialize IDA"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+    let result = runtime.block_on(async move {
+        let (pool, registry) = workspace.build_pool_and_registry(worker_args)?;
+        let server = IdaMcpServer::with_workspace_and_state(
+            registry.clone(),
+            ServerMode::Stdio,
+            filter.clone(),
+            ServerRuntimeState::new(),
+        );
+        let task_registry = server.task_registry().clone();
+        let server_lifetime = server.clone();
+        let sanitized = SanitizedIdaServer::with_workspace(server, filter);
+        let (transport, stdio_shutdown) = supervised_stdio();
+        let mut service = sanitized
+            .serve(transport)
+            .await
+            .map_err(|error| anyhow::anyhow!("stdio MCP negotiation failed: {error}"))?;
+        stdio_shutdown.arm();
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) = wait_for_shutdown_signal().await {
+                warn!(%error, "Workspace shutdown signal handler failed");
+            }
+            shutdown_signal.cancel();
+        });
+        loop {
+            tokio::select! {
+                () = stdio_shutdown.closed() => break,
+                _ = shutdown.cancelled() => {
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    // Also detect rmcp task failures without transport EOF.
+                    if service.is_transport_closed() {
+                        break;
+                    }
+                }
+            }
+        }
+        shutdown_supervised(&pool, &task_registry, stdio_shutdown.drain(), async {
+            registry.shutdown().await;
+            Ok(())
+        })
+        .await;
+        stdio_shutdown.release();
+        let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
+        drop(server_lifetime);
+        Ok::<_, anyhow::Error>(())
+    });
+    // A signal-driven shutdown can leave the stdin reader blocked on a client
+    // that never closed its end; do not let it pin the process.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+fn run_worker_server(filter: Arc<ToolFilter>, allow_lumina: bool) -> anyhow::Result<()> {
+    info!("Starting supervised IDA child (stdio transport)");
+    let init_state = init_stdio_ida_state(allow_lumina)?;
+
+    // Create channel for IDA requests
+    let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
+    let worker = IdaWorker::supervised(tx);
+    let backend = WorkerBackend::local(Arc::new(worker.clone()));
+    let sdk_crash = ida_mcp::crash_guard::SdkCrashSignal::default();
+    let sdk_crash_for_server = sdk_crash.clone();
+
+    // Spawn background thread for tokio runtime and MCP server
+    let worker_for_server = backend.clone();
+    let worker_for_shutdown = backend.clone();
+    let filter_for_server = filter.clone();
+    let server_handle = thread::spawn(move || {
+        // Create tokio runtime on this background thread
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+
+        let result = rt.block_on(async move {
+            info!("MCP server listening on stdio");
+            let server = IdaMcpServer::with_filter(
+                worker_for_server,
+                ServerMode::Worker,
+                filter_for_server.clone(),
+            );
+            let task_registry = server.task_registry().clone();
+            let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
+            let sanitized = sanitized.reporting_sdk_crashes(sdk_crash_for_server);
+            let mut service = match sanitized.serve(worker_stdio()).await {
+                Ok(running) => Some(running),
+                Err(e) => {
+                    // rmcp fails the serve future without answering the client
+                    // when the first message is not a valid initialize/discover
+                    // request. Shut the IDA worker down so the process exits
+                    // instead of wedging with an unread stdin.
+                    error!(error = %e, "stdio MCP negotiation failed; shutting down IDA worker");
+                    shutdown_worker_bounded(&worker_for_shutdown).await;
+                    return Err(anyhow::anyhow!("stdio MCP negotiation failed: {e}"));
+                }
+            };
+            let shutdown_notify = Arc::new(Notify::new());
+            let shutdown_signal = shutdown_notify.clone();
+
+            let shutdown_tasks = task_registry.clone();
+            tokio::spawn(async move {
+                if wait_for_shutdown_signal().await.is_ok() {
+                    cancel_background_tasks(
+                        &shutdown_tasks,
+                        "Cancelled by server shutdown",
+                    );
+                    shutdown_signal.notify_one();
+                } else {
+                    info!("Shutdown signal handler failed; server will continue running");
+                }
+            });
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_notify.notified() => {
+                        cancel_background_tasks(
+                            &task_registry,
+                            "Cancelled by server shutdown",
+                        );
+                        if let Some(mut running) = service.take() {
+                            let _ = running.close().await?;
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if let Some(running) = service.as_ref()
+                            && running.is_transport_closed()
+                        {
+                            cancel_background_tasks(
+                                &task_registry,
+                                "Cancelled by client disconnect",
+                            );
+                            if let Some(mut running) = service.take()
+                                && running
+                                    .close_with_timeout(Duration::from_secs(2))
+                                    .await?
+                                    .is_none()
+                            {
+                                warn!(
+                                    "Timed out waiting for stdio transport cleanup after client disconnect"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            info!("MCP server shutting down");
+            shutdown_worker_bounded(&worker_for_shutdown).await;
+            Ok::<_, anyhow::Error>(())
+        });
+        // A signal-driven shutdown can leave the stdin reader blocked on a
+        // client that never closed its end; do not let it pin the process.
+        rt.shutdown_timeout(Duration::from_secs(2));
+        result
+    });
+
+    // Run IDA worker loop on the main thread after startup preflight.
+    info!("Starting IDA worker loop");
+    ida::run_ida_loop(rx, init_state, sdk_crash);
+    info!("IDA worker loop finished");
+
+    // Wait for server thread to finish
+    // Propagate server-thread failures (e.g. stdio negotiation errors) into
+    // the process exit status so supervisors can tell them from clean shutdown.
+    match server_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
+    }
+
+    info!("Server stopped");
+    Ok(())
+}
+
+fn run_server_http(
+    args: ServeHttpArgs,
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    workspace: WorkspaceArgs,
+) -> anyhow::Result<()> {
+    info!("Starting IDA MCP Server (streamable HTTP mode)");
+    if args.json_response && !args.stateless {
+        info!("--json-response applies to sessionless dispatch (MCP 2026 requests); legacy sessions keep SSE framing for streams");
+    }
+    if workspace.workspace {
+        return run_server_http_workspace(args, filter, worker_args, workspace);
+    }
+    if args.max_workers == 0 {
+        return Err(anyhow::anyhow!("--max-workers must be at least 1"));
+    }
+    if args.min_workers > args.max_workers {
+        return Err(anyhow::anyhow!(
+            "--min-workers ({}) cannot exceed --max-workers ({})",
+            args.min_workers,
+            args.max_workers
+        ));
+    }
+    if args.max_workers > 1 && args.stateless {
+        return Err(anyhow::anyhow!(
+            "--max-workers > 1 requires stateful HTTP sessions; remove --stateless"
+        ));
+    }
+    if args.worker_op_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--worker-op-timeout-secs must be at least 1"
+        ));
+    }
+
+    let bind_addr: SocketAddr = args
+        .bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+    let session_keep_alive_secs = args.session_keep_alive_secs;
+
+    if args.max_workers > 1 {
+        return run_server_http_pooled(
+            args,
+            filter,
+            worker_args,
+            bind_addr,
+            session_keep_alive_secs,
+        );
+    }
+
+    info!("HTTP sessions share one supervised IDA worker");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+    let result = runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
+        let listen_addr = listener
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("failed to read listener address: {e}"))?;
+
+        let access_policy =
+            HttpAccessPolicy::from_cli(listen_addr, &args.allow_origin, args.allow_host.as_deref());
+        info!("HTTP Host guard: {}", access_policy.host_policy_summary());
+
+        let exe_path = std::env::current_exe()
+            .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            max_workers: 1,
+            min_workers: 1,
+            worker_idle_timeout: Duration::ZERO,
+            worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs),
+            exe_path,
+            worker_args,
+        });
+        if let Err(error) = pool.warm_min().await {
+            pool.shutdown_all().await;
+            return Err(anyhow::anyhow!(
+                "could not start the IDA worker process ({error}); check that ida-mcp \
+                     is executable and, on Windows, sits beside IDA's DLLs"
+            ));
+        }
+        // All handler instances, including fresh sessionless handlers,
+        // share this binding and its generation-scoped close ownership.
+        let database = Arc::new(WorkspaceDatabase::new_shared_http(pool.clone()));
+        let backend = WorkerBackend::pooled(database.clone());
+        let runtime_state = if args.stateless {
+            ServerRuntimeState::new_stateless_http()
+        } else {
+            ServerRuntimeState::new()
+        };
+        let task_registry = runtime_state.task_registry().clone();
+
+        let session_manager = build_session_manager(session_keep_alive_secs);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let config = build_streamable_config(
+            HttpServerOptions {
+                sse_keep_alive_secs: args.sse_keep_alive_secs,
+                stateless: args.stateless,
+                json_response: args.json_response,
+                max_request_body_mib: args.max_request_body_mib,
+            },
+            cancel.clone(),
+        );
+
+        let service = StreamableHttpService::new(
+            move || {
+                let inner = IdaMcpServer::with_filter_and_state(
+                    backend.clone(),
+                    ServerMode::Http,
+                    filter.clone(),
+                    runtime_state.clone(),
+                );
+                Ok(SanitizedIdaServer::with_filter(inner, filter.clone()))
+            },
+            session_manager,
+            config,
+        );
+        let service = HttpAccessService::new(service, access_policy);
+
+        let router = Router::new().route_service("/", service);
+        info!("MCP HTTP server listening on http://{listen_addr}");
+
+        let stop_accepting = tokio_util::sync::CancellationToken::new();
+        let cancel_for_serve = stop_accepting.clone();
+        let serve = async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancel_for_serve.cancelled().await;
+                    info!("HTTP server shutting down");
+                })
+                .await
+        };
+        tokio::pin!(serve);
+        let serve_result = tokio::select! {
+            result = &mut serve => Some(result),
+            shutdown = wait_for_shutdown_signal() => {
+                if let Err(error) = shutdown {
+                    warn!(%error, "Shutdown signal handler failed");
+                }
+                None
+            },
+        };
+        stop_accepting.cancel();
+        let shutdown = async {
+            shutdown_supervised(
+                &pool,
+                &task_registry,
+                std::future::ready(()),
+                database.close(),
+            )
+            .await;
+            cancel.cancel();
+        };
+        let serve_result = match serve_result {
+            Some(result) => {
+                shutdown.await;
+                result
+            }
+            None => {
+                // Drive graceful HTTP draining throughout the database save.
+                let drain = async {
+                    tokio::select! {
+                        result = &mut serve => return result,
+                        _ = cancel.cancelled() => {}
+                    }
+                    match tokio::time::timeout(Duration::from_secs(2), &mut serve).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!("HTTP connections did not close during shutdown; dropping them");
+                            Ok(())
+                        }
+                    }
+                };
+                let ((), result) = tokio::join!(shutdown, drain);
+                result
+            }
+        };
+        serve_result.map_err(|error| anyhow::anyhow!("serve failed: {error}"))
+    });
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+fn run_server_http_pooled(
+    args: ServeHttpArgs,
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    bind_addr: SocketAddr,
+    session_keep_alive_secs: u64,
+) -> anyhow::Result<()> {
+    info!(
+        max_workers = args.max_workers,
+        min_workers = args.min_workers,
+        "Starting pooled HTTP router; parent will not initialize IDA"
+    );
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+
+        let result = rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(bind_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
+            let listen_addr = listener
+                .local_addr()
+                .map_err(|e| anyhow::anyhow!("failed to read listener address: {e}"))?;
+
+            let access_policy = HttpAccessPolicy::from_cli(
+                listen_addr,
+                &args.allow_origin,
+                args.allow_host.as_deref(),
+            );
+            info!("HTTP Host guard: {}", access_policy.host_policy_summary());
+
+            let exe_path = std::env::current_exe()
+                .map_err(|e| anyhow::anyhow!("failed to resolve current executable: {e}"))?;
+            let pool = WorkerPool::new(WorkerPoolConfig {
+                max_workers: args.max_workers,
+                min_workers: args.min_workers,
+                worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout_secs),
+                worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs),
+                exe_path,
+                // Public tool filtering stays in the parent so private workers
+                // retain lifecycle tools. Process-wide options still propagate.
+                worker_args,
+            });
+            pool.warm_min()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to warm worker pool: {e}"))?;
+            // Legacy sessions and explicit workspace handles share this one
+            // database-to-worker registry. Legacy entries are pinned to their
+            // session binding and therefore ignore the workspace TTL.
+            let workspace_registry = WorkspaceRegistry::new_legacy(pool.clone());
+
+            let session_manager = build_pooled_session_manager(
+                session_keep_alive_secs,
+                Duration::from_secs(args.worker_disconnect_grace_secs),
+            );
+            info!(
+                session_keep_alive_secs,
+                worker_disconnect_grace_secs = args.worker_disconnect_grace_secs,
+                "Using disconnect-aware pooled HTTP session manager"
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let config = build_streamable_config(
+                HttpServerOptions {
+                    sse_keep_alive_secs: args.sse_keep_alive_secs,
+                    stateless: args.stateless,
+                    json_response: args.json_response,
+                    max_request_body_mib: args.max_request_body_mib,
+                },
+                cancel.clone(),
+            );
+
+            let registry_for_factory = workspace_registry.clone();
+            let filter_for_factory = filter.clone();
+            let service = StreamableHttpService::new(
+                move || {
+                    let legacy_binding = Arc::new(
+                        registry_for_factory.bind_legacy(uuid::Uuid::new_v4().to_string()),
+                    );
+                    let inner = IdaMcpServer::with_filter(
+                        WorkerBackend::pooled_legacy(legacy_binding),
+                        ServerMode::Http,
+                        filter_for_factory.clone(),
+                    );
+                    Ok(SanitizedIdaServer::with_filter(
+                        inner,
+                        filter_for_factory.clone(),
+                    ))
+                },
+                session_manager,
+                config,
+            );
+            let service = HttpAccessService::new(service, access_policy);
+
+            let router = Router::new().route_service("/", service);
+            info!("MCP pooled HTTP server listening on http://{listen_addr}");
+
+            let cancel_for_shutdown = cancel.clone();
+            let pool_for_shutdown = pool.clone();
+            let registry_for_shutdown = workspace_registry.clone();
+            tokio::spawn(async move {
+                if wait_for_shutdown_signal().await.is_ok() {
+                    cancel_for_shutdown.cancel();
+                    registry_for_shutdown.shutdown().await;
+                    pool_for_shutdown.shutdown_all().await;
+                }
+            });
+
+            let cancel_for_serve = cancel.clone();
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancel_for_serve.cancelled().await;
+                    info!("Pooled HTTP server shutting down");
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("serve failed: {e}"))?;
+
+            workspace_registry.shutdown().await;
+            pool.shutdown_all().await;
+            Ok::<_, anyhow::Error>(())
+        });
+        if let Err(err) = &result {
+            error!("Pooled HTTP server error: {err}");
+        }
+        result
+    });
+
+    // Same contract as single-worker HTTP and stdio: a server that never
+    // started must not report success.
+    match server_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
+    }
+
+    info!("Pooled HTTP server stopped");
+    Ok(())
+}
+
+fn run_server_http_workspace(
+    args: ServeHttpArgs,
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    workspace: WorkspaceArgs,
+) -> anyhow::Result<()> {
+    workspace.validate()?;
+    if args.max_workers != 1 || args.min_workers != 0 {
+        info!(
+            "Workspace mode uses --workspace-max-workers; legacy --max-workers/--min-workers are ignored"
+        );
+    }
+    let bind_addr: SocketAddr = args
+        .bind
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid bind address: {error}"))?;
+    info!(
+        max_workers = workspace.workspace_max_workers,
+        "Starting explicit HTTP workspace router; parent will not initialize IDA"
+    );
+
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(bind_addr)
+                .await
+                .map_err(|error| anyhow::anyhow!("bind failed: {error}"))?;
+            let listen_addr = listener
+                .local_addr()
+                .map_err(|error| anyhow::anyhow!("failed to read listener address: {error}"))?;
+            let access_policy = HttpAccessPolicy::from_cli(
+                listen_addr,
+                &args.allow_origin,
+                args.allow_host.as_deref(),
+            );
+            let (pool, registry) = workspace.build_pool_and_registry(worker_args)?;
+            let runtime_state = if args.stateless {
+                ServerRuntimeState::new_stateless_http()
+            } else {
+                ServerRuntimeState::new()
+            };
+            let session_manager = build_session_manager(args.session_keep_alive_secs);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let config = build_streamable_config(
+                HttpServerOptions {
+                    sse_keep_alive_secs: args.sse_keep_alive_secs,
+                    stateless: args.stateless,
+                    json_response: args.json_response,
+                    max_request_body_mib: args.max_request_body_mib,
+                },
+                cancel.clone(),
+            );
+            let registry_for_factory = registry.clone();
+            let filter_for_factory = filter.clone();
+            let service = StreamableHttpService::new(
+                move || {
+                    let inner = IdaMcpServer::with_workspace_and_state(
+                        registry_for_factory.clone(),
+                        ServerMode::Http,
+                        filter_for_factory.clone(),
+                        runtime_state.clone(),
+                    );
+                    Ok(SanitizedIdaServer::with_workspace(
+                        inner,
+                        filter_for_factory.clone(),
+                    ))
+                },
+                session_manager,
+                config,
+            );
+            let service = HttpAccessService::new(service, access_policy);
+            let router = Router::new().route_service("/", service);
+            info!("MCP workspace HTTP server listening on http://{listen_addr}");
+
+            let cancel_for_shutdown = cancel.clone();
+            let registry_for_shutdown = registry.clone();
+            let pool_for_shutdown = pool.clone();
+            tokio::spawn(async move {
+                if wait_for_shutdown_signal().await.is_ok() {
+                    cancel_for_shutdown.cancel();
+                    registry_for_shutdown.shutdown().await;
+                    pool_for_shutdown.shutdown_all().await;
+                }
+            });
+            let cancel_for_serve = cancel.clone();
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancel_for_serve.cancelled().await;
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("serve failed: {error}"))?;
+            registry.shutdown().await;
+            pool.shutdown_all().await;
+            Ok::<_, anyhow::Error>(())
+        })
+    });
+
+    match server_handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(anyhow::anyhow!(
+            "workspace HTTP server thread panicked: {error:?}"
+        )),
+    }
+}
+
+fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
+    info!("Starting IDA MCP Server (probe mode)");
+    if let Ok(idadir) = std::env::var("IDADIR") {
+        info!("IDADIR={}", idadir);
+    }
+    info!("Initializing IDA library on main thread");
+    let _init_state = ida::init_ida_library(allow_lumina)
+        .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
+    info!("IDA library initialized successfully");
+    if let Ok(ver) = idalib::version() {
+        info!(
+            "IDA version {}.{}.{}",
+            ver.major(),
+            ver.minor(),
+            ver.build()
+        );
+    }
+    if args.ida_console {
+        idalib::enable_console_messages(true)
+            .map_err(|e| anyhow::anyhow!("failed to enable console messages: {e}"))?;
+        info!("IDA console messages enabled");
+    }
+
+    let path = expand_path(&args.path);
+    info!("Opening database: {}", path.display());
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_clone = done.clone();
+    let path_display = path.display().to_string();
+    let ticker = thread::spawn(move || {
+        let start = Instant::now();
+        loop {
+            thread::sleep(Duration::from_secs(10));
+            if done_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            info!(
+                path = %path_display,
+                elapsed = start.elapsed().as_secs(),
+                "Still opening database..."
+            );
+        }
+    });
+
+    let open_start = Instant::now();
+    let db = open_db_for_probe(&path, &args);
+    done.store(true, Ordering::Relaxed);
+    let _ = ticker.join();
+    let db =
+        db.map_err(|e| anyhow::anyhow!("Failed to open database: {}: {}", path.display(), e))?;
+
+    let info = ida::handlers::database::build_db_info(&db, &path.display().to_string(), None);
+    info!("Database opened in {}s", open_start.elapsed().as_secs());
+    println!("{}", serde_json::to_string_pretty(&info)?);
+
+    if let Some(limit) = args.list {
+        let list = list_functions(&db, 0, limit);
+        println!("{}", serde_json::to_string_pretty(&list)?);
+    }
+
+    if let Some(name) = args.resolve.as_deref() {
+        let func = resolve_function(&db, name)?;
+        println!("{}", serde_json::to_string_pretty(&func)?);
+    }
+
+    if let Some(name) = args.disasm_by_name.as_deref() {
+        let text = disasm_by_name(&db, name, args.count)?;
+        println!("{}", text);
+    }
+
+    if let Some(addr_str) = args.disasm_addr.as_deref() {
+        let addr = parse_address(addr_str)?;
+        let text = disasm_at(&db, addr, args.count)?;
+        println!("{}", text);
+    }
+
+    if let Some(addr_str) = args.decompile_addr.as_deref() {
+        let addr = parse_address(addr_str)?;
+        let func = db
+            .function_at(addr)
+            .ok_or_else(|| anyhow::anyhow!("Function not found at address {:#x}", addr))?;
+        if !db.decompiler_available() {
+            return Err(anyhow::anyhow!("Decompiler not available"));
+        }
+        let cfunc = db
+            .decompile(&func)
+            .map_err(|e| anyhow::anyhow!("Decompile failed: {}", e))?;
+        println!("{}", cfunc.pseudocode());
+    }
+
+    info!("Probe completed");
+    Ok(())
+}
+
+fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::IDAError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_idb = ext == "i64" || ext == "idb" || ext == "id0";
+    let init_args = probe_init_database_args();
+
+    if is_idb {
+        let mut opts = IDBOpenOptions::new();
+        opts.auto_analyse(args.auto_analyse).save(true);
+        for arg in &init_args {
+            opts.arg(arg);
+        }
+        if args.auto_analyse {
+            info!("Opening existing IDB with auto-analysis enabled");
+        }
+        opts.open(path)
+    } else {
+        let mut opts = IDBOpenOptions::new();
+        opts.auto_analyse(true);
+        let out_path = if let Some(out) = args.idb_out.as_deref() {
+            PathBuf::from(out)
+        } else {
+            idb_path_for_raw_binary(path)
+        };
+        info!(
+            "Opening raw binary with auto-analysis (idb_out={})",
+            out_path.display()
+        );
+        for arg in &init_args {
+            opts.arg(arg);
+        }
+        opts.idb(&out_path).save(true).open(path)
+    }
+}
+
+fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
+    let mut raw_idb = OsString::from(path.as_os_str());
+    raw_idb.push(".i64");
+    PathBuf::from(raw_idb)
+}
+
+fn probe_init_database_args() -> Vec<String> {
+    vec!["-A".to_string()]
+}
+
+fn parse_address(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.starts_with("0x") || s.starts_with("0X") {
+        u64::from_str_radix(&s[2..], 16)
+            .map_err(|_| anyhow::anyhow!("Invalid address format: {}", s))
+    } else {
+        s.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("Invalid address format: {}", s))
+    }
+}
+
+fn list_functions(db: &IDB, offset: usize, limit: usize) -> ida_mcp::FunctionListResult {
+    let total = db.function_count();
+    let mut functions = Vec::with_capacity(limit.min(total.saturating_sub(offset)));
+
+    for (idx, (_id, func)) in db.functions().enumerate() {
+        if idx < offset {
+            continue;
+        }
+        if functions.len() >= limit {
+            break;
+        }
+
+        let addr = func.start_address();
+        let name = func.name().unwrap_or_else(|| format!("sub_{:x}", addr));
+        let size = func.len();
+
+        functions.push(FunctionInfo {
+            address: format!("{:#x}", addr),
+            name,
+            size,
+        });
+    }
+
+    let next_offset = if offset + functions.len() < total {
+        Some(offset + functions.len())
+    } else {
+        None
+    };
+
+    ida_mcp::FunctionListResult {
+        functions,
+        total,
+        next_offset,
+    }
+}
+
+fn resolve_function(db: &IDB, name: &str) -> anyhow::Result<FunctionInfo> {
+    for (_id, func) in db.functions() {
+        if let Some(func_name) = func.name()
+            && (func_name == name || func_name.contains(name))
+        {
+            let addr = func.start_address();
+            let size = func.len();
+            return Ok(FunctionInfo {
+                address: format!("{:#x}", addr),
+                name: func_name,
+                size,
+            });
+        }
+    }
+
+    Err(anyhow::anyhow!("Function not found: {}", name))
+}
+
+fn disasm_by_name(db: &IDB, name: &str, count: usize) -> anyhow::Result<String> {
+    let func = resolve_function(db, name)?;
+    let addr = parse_address(&func.address)?;
+    disasm_at(db, addr, count)
+}
+
+fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
+    let mut lines = Vec::with_capacity(count);
+    let mut current_addr: Address = addr;
+
+    for _ in 0..count {
+        if let Some(line) = generate_disasm_line(db, current_addr) {
+            lines.push(format!("{:#x}:\t{}", current_addr, line));
+        } else {
+            break;
+        }
+
+        if let Some(insn) = db.insn_at(current_addr) {
+            current_addr += insn.len() as u64;
+        } else if let Some(next) = db.next_head(current_addr) {
+            if next <= current_addr {
+                break;
+            }
+            current_addr = next;
+        } else {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        return Err(anyhow::anyhow!("Address out of range: {:#x}", addr));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{shutdown_supervised, Cli, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
+    use clap::Parser;
+    use ida_mcp::ida::pool::{WorkerPool, WorkerPoolConfig};
+    use ida_mcp::server::task::TaskRegistry;
+    use std::ffi::OsString;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_request_drain_leaves_time_to_save() {
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            max_workers: 1,
+            min_workers: 0,
+            worker_idle_timeout: Duration::ZERO,
+            worker_op_timeout: Duration::from_secs(1800),
+            exe_path: std::env::current_exe().expect("test executable"),
+            worker_args: Vec::new(),
+        });
+        let tasks = TaskRegistry::new();
+        let started = tokio::time::Instant::now();
+        let mut saved = false;
+        shutdown_supervised(&pool, &tasks, std::future::pending(), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            saved = true;
+            Ok(())
+        })
+        .await;
+        assert!(saved, "the request drain used the entire save budget");
+        assert_eq!(started.elapsed(), Duration::from_secs(95));
+    }
+
+    #[test]
+    fn http_session_keep_alive_default_is_thirty_minutes() {
+        let cli = Cli::parse_from(["ida-mcp", "serve-http"]);
+        let crate::Command::ServeHttp(args) = cli.command.expect("subcommand") else {
+            panic!("expected serve-http")
+        };
+        assert_eq!(
+            args.session_keep_alive_secs,
+            DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS
+        );
+        assert_eq!(DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS, 1800);
+    }
+
+    #[test]
+    fn lumina_access_is_disabled_by_default() {
+        let cli = Cli::parse_from(["ida-mcp", "serve"]);
+
+        assert!(!cli.ida_network.allow_lumina);
+        assert!(cli.ida_network.worker_args().is_empty());
+    }
+
+    #[test]
+    fn lumina_access_can_be_enabled_globally() {
+        let before_subcommand = Cli::parse_from(["ida-mcp", "--allow-lumina", "worker"]);
+        let after_subcommand = Cli::parse_from(["ida-mcp", "worker", "--allow-lumina"]);
+
+        assert!(before_subcommand.ida_network.allow_lumina);
+        assert!(after_subcommand.ida_network.allow_lumina);
+        let worker_args = vec![OsString::from("--allow-lumina")];
+        assert_eq!(before_subcommand.ida_network.worker_args(), worker_args);
+    }
+
+    #[test]
+    fn debugger_opt_in_is_forwarded_to_private_workers() {
+        let default = Cli::parse_from(["ida-mcp", "worker"]);
+        assert!(!default.debugger.enable_debugger);
+        assert!(default.debugger.worker_args().is_empty());
+
+        let enabled = Cli::parse_from(["ida-mcp", "worker", "--enable-debugger"]);
+        assert!(enabled.debugger.enable_debugger);
+        assert_eq!(
+            enabled.debugger.worker_args(),
+            vec![OsString::from("--enable-debugger")]
+        );
+    }
+}
