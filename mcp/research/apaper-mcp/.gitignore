@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+*.log
+.idea/
+.vscode/
+__pycache__/
+.pytest_cache/
+.venv/
+/downloads
+/.claude/worktrees
+/downloaded_files

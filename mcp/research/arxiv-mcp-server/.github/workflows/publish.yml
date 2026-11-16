@@ -1,0 +1,80 @@
+name: Publish Distribution
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.11.30"
+          enable-cache: true
+
+      - name: Verify release tag and metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          expected = f"v{version}"
+          actual = os.environ["RELEASE_TAG"]
+          if actual != expected:
+              raise SystemExit(f"Release tag {actual!r} does not match {expected!r}")
+          print(f"Validated release {actual}")
+          PY
+
+      - name: Install locked validation environment
+        run: uv sync --locked --extra test --extra dev
+
+      - name: Run release gates
+        run: |
+          uv run black --check .
+          uv run pytest
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Validate distributions
+        run: uv run --with twine twine check dist/*
+
+      - name: Smoke-test built wheel over MCP
+        run: uv run python scripts/smoke_installed_wheel.py
+
+      - name: Install MCP Registry publisher
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.0/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Validate MCP Registry metadata
+        run: ./mcp-publisher validate
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish

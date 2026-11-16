@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Build an MCPB bundle for arxiv-mcp-server.
+# Outputs: mcpb-build/arxiv-mcp-server-darwin-<arch>-<version>.mcpb
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON_BIN="${PYTHON:-python3}"
+BUILD_DIR="$ROOT/mcpb-build"
+
+"$PYTHON_BIN" - <<'PYEOF'
+import sys
+if sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 11):
+    raise SystemExit(
+        "CPython 3.11.x is required to build the MCPB bundle because its "
+        f"vendored native dependencies target that ABI; got "
+        f"{sys.implementation.name} {sys.version.split()[0]}"
+    )
+if sys.platform != "darwin":
+    raise SystemExit(
+        "macOS is required to build this MCPB bundle because its output is "
+        f"labeled for Darwin; got {sys.platform}"
+    )
+PYEOF
+
+VERSION="$($PYTHON_BIN - "$ROOT/pyproject.toml" <<'PYEOF'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+if not match:
+    raise SystemExit('Could not find project version in pyproject.toml')
+print(match.group(1))
+PYEOF
+)"
+
+echo "Building arxiv-mcp-server v$VERSION MCPB bundle..."
+
+# Clean and create structure
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR/server/vendor"
+
+# Generate a 512x512 teal icon (pure Python, no deps)
+"$PYTHON_BIN" - "$BUILD_DIR/icon.png" <<'PYEOF'
+import struct, zlib, sys
+
+def make_png(width, height, r, g, b):
+    def chunk(name, data):
+        c = name + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xFFFFFFFF)
+    scanline = b'\x00' + bytes([r, g, b] * width)
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+        + chunk(b'IDAT', zlib.compress(scanline * height))
+        + chunk(b'IEND', b'')
+    )
+
+with open(sys.argv[1], 'wb') as f:
+    f.write(make_png(512, 512, 20, 108, 148))
+print("Generated icon.png")
+PYEOF
+
+# Copy manifest and stamp version
+"$PYTHON_BIN" - "$ROOT/manifest.json" "$BUILD_DIR/manifest.json" "$VERSION" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    manifest = json.load(f)
+manifest['version'] = sys.argv[3]
+with open(sys.argv[2], 'w') as f:
+    json.dump(manifest, f, indent=2)
+    f.write('\n')
+print(f"Stamped manifest version: {sys.argv[3]}")
+PYEOF
+
+# Copy server source
+cp -R "$ROOT/src/arxiv_mcp_server" "$BUILD_DIR/server/arxiv_mcp_server"
+"$PYTHON_BIN" - "$BUILD_DIR/server/arxiv_mcp_server/_bundle_version.py" "$VERSION" <<'PYEOF'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(
+    f'"""Generated MCPB package version; do not edit."""\n\nVERSION = {sys.argv[2]!r}\n',
+    encoding="utf-8",
+)
+PYEOF
+echo "Copied server source and generated bundle version metadata"
+
+# Vendor the locked base and PDF-extra dependencies. Exporting from uv.lock keeps
+# the bundle aligned with the package release instead of maintaining a second
+# handwritten dependency set.
+echo "Vendoring locked dependencies..."
+REQUIREMENTS_FILE="$BUILD_DIR/mcpb-requirements.txt"
+uv export \
+  --quiet \
+  --locked \
+  --no-dev \
+  --extra pdf \
+  --no-emit-project \
+  --format requirements-txt \
+  --output-file "$REQUIREMENTS_FILE"
+
+PIP_ARGS=(
+  --target "$BUILD_DIR/server/vendor"
+  --no-user
+  --quiet
+)
+
+if [[ "$(uname -m)" == "x86_64" ]]; then
+  # onnxruntime 1.24.x no longer publishes Intel macOS wheels. Keep the bundle
+  # on the last CPython 3.11 Intel build while installing the remaining locked
+  # dependency closure without re-resolving transitive requirements.
+  "$PYTHON_BIN" - "$REQUIREMENTS_FILE" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines(keepends=True)
+out = []
+skipping = False
+found = False
+for line in lines:
+    if not skipping and line.startswith("onnxruntime=="):
+        skipping = True
+        found = True
+    if skipping:
+        if not line.rstrip().endswith("\\"):
+            skipping = False
+        continue
+    out.append(line)
+if not found:
+    raise SystemExit("Could not find locked onnxruntime requirement")
+path.write_text("".join(out))
+PYEOF
+  ONNXRUNTIME_REQUIREMENT="$BUILD_DIR/onnxruntime-intel.txt"
+  printf '%s\n' \
+    'onnxruntime==1.23.2 --hash=sha256:87d8b6eaf0fbeb6835a60a4265fde7a3b60157cf1b2764773ac47237b4d48612' \
+    'coloredlogs==15.0.1 --hash=sha256:612ee75c546f53e92e70049c9dbfcc18c935a2b9a53b66085ce9ef6a6e5c0934' \
+    'humanfriendly==10.0 --hash=sha256:1697e1a8a8f550fd43c2865cd84542fc175a61dcb779b6fee18cf6b6ccba1477' \
+    > "$ONNXRUNTIME_REQUIREMENT"
+  "$PYTHON_BIN" -m pip install "${PIP_ARGS[@]}" \
+    --no-deps \
+    --requirement "$ONNXRUNTIME_REQUIREMENT"
+  "$PYTHON_BIN" -m pip install "${PIP_ARGS[@]}" \
+    --no-deps \
+    --requirement "$REQUIREMENTS_FILE"
+  rm -f "$ONNXRUNTIME_REQUIREMENT"
+else
+  "$PYTHON_BIN" -m pip install "${PIP_ARGS[@]}" \
+    --requirement "$REQUIREMENTS_FILE"
+fi
+rm -f "$REQUIREMENTS_FILE"
+echo "Dependencies vendored"
+
+# Avoid shipping generated bytecode from local source copies or import-time validation.
+find "$BUILD_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "$BUILD_DIR" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
+# Pack with mcpb
+if ! command -v npx >/dev/null 2>&1; then
+  echo "ERROR: npx is required to run @anthropic-ai/mcpb" >&2
+  exit 1
+fi
+
+echo "Packing..."
+cd "$BUILD_DIR"
+npx --yes @anthropic-ai/mcpb@2.1.2 pack
+
+ARTIFACT=$(find "$BUILD_DIR" -maxdepth 1 -name '*.mcpb' -print -quit)
+if [[ -z "$ARTIFACT" ]]; then
+  echo "ERROR: no .mcpb file found after packing" >&2
+  exit 1
+fi
+
+ARCH="$(uname -m)"
+FINAL_ARTIFACT="$BUILD_DIR/arxiv-mcp-server-darwin-$ARCH-$VERSION.mcpb"
+if [[ "$ARTIFACT" != "$FINAL_ARTIFACT" ]]; then
+  mv "$ARTIFACT" "$FINAL_ARTIFACT"
+fi
+
+echo "Built: $FINAL_ARTIFACT"

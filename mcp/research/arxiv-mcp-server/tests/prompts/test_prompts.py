@@ -1,0 +1,149 @@
+"""Unit tests for prompt handlers."""
+
+import pytest
+from typing import Dict
+from arxiv_mcp_server.prompts.handlers import list_prompts, get_prompt
+from mcp.types import GetPromptResult, PromptMessage, TextContent
+
+
+@pytest.mark.asyncio
+async def test_list_prompts():
+    """Test listing available prompts."""
+    prompts = await list_prompts()
+    assert len(prompts) == 7
+
+    prompt_names = {p.name for p in prompts}
+    expected_names = {
+        "research-discovery",
+        "deep-paper-analysis",
+        "summarize_paper",
+        "compare_papers",
+        "literature_review",
+        "literature-synthesis",
+        "research-question",
+    }
+    assert expected_names == prompt_names
+
+
+@pytest.mark.asyncio
+async def test_get_paper_analysis_prompt():
+    """Test getting paper analysis prompt."""
+    result = await get_prompt("deep-paper-analysis", {"paper_id": "2401.00123"})
+
+    assert isinstance(result, GetPromptResult)
+    assert len(result.messages) == 1
+    message = result.messages[0]
+
+    assert isinstance(message, PromptMessage)
+    assert message.role == "user"
+    assert isinstance(message.content, TextContent)
+    assert "2401.00123" in message.content.text
+
+
+@pytest.mark.asyncio
+async def test_prompt_calls_do_not_share_paper_context():
+    """Prompt generation is stateless across clients and calls."""
+    from arxiv_mcp_server.prompts import handlers
+
+    await handlers.get_prompt(
+        "deep-paper-analysis", {"paper_id": "2401.00001"}, session_id="client-a"
+    )
+    result = await handlers.get_prompt(
+        "deep-paper-analysis", {"paper_id": "2401.00002"}, session_id="client-b"
+    )
+
+    content = result.messages[0].content
+    assert isinstance(content, TextContent)
+    assert "2401.00001" not in content.text
+    assert not hasattr(handlers, "_research_context")
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_with_invalid_name():
+    """Test getting prompt with invalid name."""
+    with pytest.raises(ValueError, match="Prompt not found"):
+        await get_prompt("invalid-prompt", {})
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_with_no_arguments():
+    """Test getting prompt with no arguments."""
+    with pytest.raises(ValueError, match="No arguments provided"):
+        await get_prompt("deep-paper-analysis", None)
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_with_missing_required_argument():
+    """Test getting prompt with missing required argument."""
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await get_prompt("deep-paper-analysis", {})
+
+
+@pytest.mark.asyncio
+async def test_get_compare_papers_prompt():
+    """Test getting compare papers prompt."""
+    result = await get_prompt("compare_papers", {"paper_ids": "2401.00123,2401.00999"})
+    assert "Compare papers: 2401.00123,2401.00999" in result.messages[0].content.text
+
+
+@pytest.mark.asyncio
+async def test_get_literature_review_prompt():
+    """Test getting literature review prompt."""
+    result = await get_prompt("literature_review", {"topic": "agentic systems"})
+    assert "topic: agentic systems" in result.messages[0].content.text
+
+
+@pytest.mark.asyncio
+async def test_get_research_discovery_prompt_uses_all_arguments():
+    result = await get_prompt(
+        "research-discovery",
+        {
+            "topic": "mechanistic interpretability",
+            "expertise_level": "expert",
+            "time_period": "2024-present",
+            "domain": "computer_science",
+        },
+    )
+
+    text = result.messages[0].content.text
+    assert "mechanistic interpretability" in text
+    assert "expert" in text
+    assert "2024-present" in text
+    assert "computer_science" in text
+    assert "research discovery plan" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_literature_synthesis_prompt_uses_all_arguments():
+    result = await get_prompt(
+        "literature-synthesis",
+        {
+            "paper_ids": "2401.00123,2401.00999",
+            "synthesis_type": "gaps",
+            "domain": "computer_science",
+        },
+    )
+
+    text = result.messages[0].content.text
+    assert "2401.00123,2401.00999" in text
+    assert "gaps" in text
+    assert "computer_science" in text
+    assert "synthesize" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_research_question_prompt_uses_all_arguments():
+    result = await get_prompt(
+        "research-question",
+        {
+            "paper_ids": "2401.00123,2401.00999",
+            "topic": "agentic systems",
+            "domain": "computer_science",
+        },
+    )
+
+    text = result.messages[0].content.text
+    assert "2401.00123,2401.00999" in text
+    assert "agentic systems" in text
+    assert "computer_science" in text
+    assert "research questions" in text.lower()

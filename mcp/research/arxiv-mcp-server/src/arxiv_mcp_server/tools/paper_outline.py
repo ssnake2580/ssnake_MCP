@@ -1,0 +1,1428 @@
+"""Outline, section, and bounded passage retrieval for downloaded markdown papers.
+
+Section IDs use hierarchical counters (``1``, ``1.1``, ``1.1.1``), matching the
+LaTeX outline tools. Missing heading levels insert ``0`` placeholders (e.g. an
+``h3`` after an ``h1`` becomes ``1.0.1``). Duplicate titles remain distinct via
+those counters. Papers with no recognized headings (ATX, arabic/IEEE-roman numbered, or
+common bare arXiv section titles) expose a synthetic section ``1``.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import mcp.types as types
+from mcp.types import ToolAnnotations
+
+from ..config import Settings
+from .arxiv_ids import (
+    arxiv_version_suffix,
+    bare_arxiv_id,
+    normalize_arxiv_id,
+    parse_arxiv_id,
+)
+from .content import add_content_payload, CONTENT_WARNING
+from .list_papers import _sidecar_arxiv_version, resolve_stored_stem
+
+settings = Settings()
+
+MAX_PAPER_ID_CHARS = 40
+MAX_SECTION_ID_CHARS = 200
+MAX_QUERY_CHARS = 200
+DEFAULT_MAX_SECTIONS = 100
+MAX_RETURNED_SECTIONS = 200
+DEFAULT_MAX_PASSAGES = 8
+MAX_RETURNED_PASSAGES = 25
+DEFAULT_PASSAGE_CHARS = 800
+MAX_PASSAGE_CHARS = 2000
+MAX_SECTION_COUNT = 2000
+
+# Heading styles seen in arXiv markdown (ATX, numbered, bare HTML titles).
+_ATX_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$")
+_NUMBERED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+){0,5})[ \t]+(.+?)[ \t]*$")
+# HTML→text often emits the section number alone ("3." / "3.1." / "2.2") then the title.
+_NUMBER_ONLY_RE = re.compile(r"^(\d+(?:\.\d+){0,5})\.?[ \t]*$")
+# IEEE/latexml HTML often splits roman section tags onto their own line:
+# ``I`` / ``Introduction``, ``II-A`` / ``Related Work``. Longer numerals first.
+_ROMAN_NUMERAL = (
+    r"(?:XX|XIX|XVIII|XVII|XVI|XV|XIV|XIII|XII|XI|X|" r"IX|VIII|VII|VI|V|IV|III|II|I)"
+)
+_ROMAN_MARKER_RE = re.compile(rf"^({_ROMAN_NUMERAL}(?:-[A-Z])*)$")
+_ROMAN_INLINE_RE = re.compile(rf"^({_ROMAN_NUMERAL}(?:-[A-Z])*)[ \t]+(.+?)$")
+_FENCE_RE = re.compile(r"^```")
+_MAX_BARE_TITLE_CHARS = 80
+# Stop collecting headings once References/Bibliography is seen (ref-line pollution).
+_OUTLINE_TERMINATORS = frozenset({"references", "bibliography"})
+# Post-References whitelist: exact standalone titles allowed after References/Bibliography
+_POST_REFERENCES_ALLOWLIST = frozenset(
+    {
+        "acknowledgment",
+        "acknowledgments",
+        "acknowledgement",
+        "acknowledgements",
+        "author contributions",
+        "supplementary material",
+        "supplementary materials",
+        "appendix",
+        "appendices",
+    }
+)
+# Pattern for lettered appendix (A, B, C, etc.) or numbered (A.1, A.2, B.1, etc.)
+_APPENDIX_LETTER_RE = re.compile(r"^([A-H])(?:\.(\d+(?:\.\d+)*))?$")
+# Pattern for "Appendix X" where X is A-H
+_APPENDIX_PREFIX_RE = re.compile(r"^(Appendix|Supplementary)\s+([A-H])$", re.IGNORECASE)
+# Top-level section indices stay small; years like 2023 USENIX… are common FPs.
+_MAX_SECTION_INDEX = 99
+# Minor words allowed lowercase inside otherwise Title-Case headings.
+_TITLE_CASE_MINOR_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "nor",
+        "but",
+        "so",
+        "yet",
+        "of",
+        "for",
+        "to",
+        "in",
+        "on",
+        "at",
+        "by",
+        "as",
+        "per",
+        "via",
+        "vs",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "over",
+        "than",
+        "that",
+        "upon",
+        "de",
+        "von",
+        "van",
+        "der",
+        "la",
+        "le",
+    }
+)
+
+# Common standalone section titles from arXiv HTML→md conversions.
+_BARE_SECTION_TITLES = frozenset(
+    {
+        "abstract",
+        "introduction",
+        "background",
+        "related work",
+        "related works",
+        "method",
+        "methods",
+        "methodology",
+        "approach",
+        "experiment",
+        "experiments",
+        "experimental setup",
+        "experimental results",
+        "result",
+        "results",
+        "discussion",
+        "discussions",
+        "conclusion",
+        "conclusions",
+        "future work",
+        "limitations",
+        "reference",
+        "references",
+        "appendix",
+        "appendices",
+        "acknowledgement",
+        "acknowledgements",
+        "acknowledgment",
+        "acknowledgments",
+        "bibliography",
+        "notation",
+        "preliminaries",
+        "problem formulation",
+        "problem statement",
+    }
+)
+
+
+@dataclass(frozen=True)
+class MdSection:
+    """One markdown heading span with stable hierarchical ID."""
+
+    section_id: str
+    level: int
+    title: str
+    start: int
+    end: int
+
+
+def _error(message: str, paper_id: str | None = None) -> list[types.TextContent]:
+    payload: dict[str, Any] = {"status": "error", "message": message}
+    if paper_id:
+        payload["paper_id"] = paper_id
+    return [types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _paper_id_property() -> dict[str, Any]:
+    return {
+        "type": "string",
+        "maxLength": MAX_PAPER_ID_CHARS,
+        "description": "Validated modern or legacy arXiv paper ID",
+    }
+
+
+def _page_properties() -> dict[str, Any]:
+    return {
+        "start": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Zero-based character offset within this section",
+        },
+        "max_chars": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum section characters to return (default 12,000)",
+        },
+        "return_full_text": {
+            "type": "boolean",
+            "description": "If true, return the entire remaining section from start",
+        },
+    }
+
+
+def _mask_fenced_code(content: str) -> str:
+    """Space-out non-newline chars inside fenced code blocks."""
+    chars = list(content)
+    lines_meta: list[tuple[int, int, str]] = []
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        lines_meta.append((offset, offset + len(line), line))
+        offset += len(line)
+
+    in_fence = False
+    for start, end, line in lines_meta:
+        stripped = line.lstrip(" \t")
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            for i in range(start, end):
+                if chars[i] not in "\r\n":
+                    chars[i] = " "
+    return "".join(chars)
+
+
+def _normalize_heading_title(title: str) -> str:
+    """Strip trailing section punctuation common in HTML→text titles."""
+    cleaned = title.strip().rstrip(":.").strip()
+    return cleaned or title.strip()
+
+
+def _is_plausible_section_number(numbering: str) -> bool:
+    """Reject years and other non-outline numbers (e.g. ``2023 USENIX…``)."""
+    parts = numbering.split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        return False
+    return all(1 <= int(part) <= _MAX_SECTION_INDEX for part in parts)
+
+
+def _is_outline_terminator(title: str) -> bool:
+    return _normalize_heading_title(title).casefold() in _OUTLINE_TERMINATORS
+
+
+def _is_title_case_phrase(title: str) -> bool:
+    """True when the phrase looks Title Case, not sentence-case body prose."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’.-]*", title)
+    if not words:
+        return False
+    for word in words[1:]:
+        core = word.rstrip(".")
+        if not core:
+            continue
+        # Allow ALLCAPS / Title Case tokens; reject sentence-case content words.
+        if core[0].islower() and core.casefold() not in _TITLE_CASE_MINOR_WORDS:
+            return False
+    return True
+
+
+def _title_looks_like_heading(
+    title: str,
+    *,
+    line_len: int,
+    allow_sentence_case: bool = False,
+    apply_content_guards: bool = True,
+) -> bool:
+    """Shared capitalization / length / venue guards for numbered headings.
+
+    Rejects numbered body-list items (e.g. Future Work ``4.`` / ``5.`` prose)
+    that HTML→text otherwise promotes to fake L1 sections. Does not use fuzzy
+    title matching against known section names.
+
+    Args:
+        title: The heading title text to check.
+        line_len: Length of the full line including the number.
+        allow_sentence_case: If True, skip Title Case check (for split numbers).
+        apply_content_guards: If True, apply % / = / : guards (for split numbers only).
+    """
+    title = title.strip()
+    if not title or line_len > _MAX_BARE_TITLE_CHARS:
+        return False
+    # Section titles are capitalized; reject mid-sentence prose joins.
+    if not re.match(r"[A-Z]", title):
+        return False
+    # Citation venues often look like "USENIX ATC 23" after a year number.
+    if re.search(r"\b(?:19|20)\d{2}\b", title):
+        return False
+    # Reject table/figure/data lines (regression #284 blocker 2).
+    # Data lines have % or =, or : followed by digits/special chars.
+    # Only apply these guards to split numbers, not inline numbered headings.
+    if apply_content_guards:
+        if re.search(r"[%=]", title):
+            return False
+        if re.search(r":\s*[\d.-]", title):
+            return False
+        # Reject model names with common ML naming patterns.
+        # Examples: "Mixtral 8x7B", "Llama-3.1-405B", "GPT-4", "Claude 3.5", "Phi-3.5 MoE"
+        # Pattern 1: NxM (expert notation like 8x7B)
+        if re.search(r"\d+x\d+[BM]?", title, re.IGNORECASE):
+            return False
+        # Pattern 2: Ends with B or M (parameter count like 405B, 7B)
+        if re.search(r"\d+[BM]\b", title):
+            return False
+        # Pattern 3: Name-digits.digits pattern (like "Phi-3.5", "GPT-4.5", "Claude-3.5")
+        if re.search(r"[A-Z][a-z]*-\d+\.\d+", title):
+            return False
+        # Pattern 4: Bare model architecture acronyms as titles (MoE, GPT, LLM alone)
+        if re.match(r"^(?:MoE|GPT|LLM|BERT|T5)$", title):
+            return False
+        # Pattern 5: Table comparison labels (Ours, Theirs, Baseline, Previous)
+        if re.match(r"^(?:Ours|Theirs|Baseline|Previous)$", title, re.IGNORECASE):
+            return False
+        # Reject very short tokens that look like table cells or model names.
+        if len(title) < 3:
+            return False
+    # Reject common table/figure/algorithm prefixes.
+    if re.match(
+        r"^(?:Table|Figure|Fig\.|Algorithm|Eq\.|Equation|Appendix)\s+\d",
+        title,
+        re.IGNORECASE,
+    ):
+        return False
+    normalized = _normalize_heading_title(title)
+    # Full-sentence list items end with ``.``; allow only known bare titles
+    # such as ``Abstract.`` / ``Introduction.``.
+    if title.endswith(".") and normalized.casefold() not in _BARE_SECTION_TITLES:
+        return False
+    # Headings are Title Case noun phrases; body lists are sentence case.
+    # For split numbers (e.g. "2.2\nKAN architecture"), allow sentence case.
+    if not allow_sentence_case and not _is_title_case_phrase(normalized):
+        return False
+    return True
+
+
+def _numbered_heading(
+    numbering: str,
+    title: str,
+    *,
+    line_len: int,
+    allow_sentence_case: bool = False,
+    apply_content_guards: bool = True,
+) -> tuple[int, str] | None:
+    """Return (level, title) for a plausible numbered heading, else None.
+
+    Args:
+        numbering: The section number (e.g. "2.2").
+        title: The heading title text.
+        line_len: Length of the full line including the number.
+        allow_sentence_case: If True, skip Title Case check (for split numbers).
+        apply_content_guards: If True, apply % / = / : guards (for split numbers only).
+    """
+    if not _title_looks_like_heading(
+        title,
+        line_len=line_len,
+        allow_sentence_case=allow_sentence_case,
+        apply_content_guards=apply_content_guards,
+    ):
+        return None
+    if not _is_plausible_section_number(numbering):
+        return None
+    level = min(6, numbering.count(".") + 1)
+    return level, _normalize_heading_title(title.strip())
+
+
+def _roman_heading(marker: str, title: str, *, line_len: int) -> tuple[int, str] | None:
+    """Return (level, title) for an IEEE roman section marker, else None."""
+    if _ROMAN_MARKER_RE.match(marker.strip()) is None:
+        return None
+    if not _title_looks_like_heading(title, line_len=line_len):
+        return None
+    level = min(6, 1 + marker.strip().count("-"))
+    return level, _normalize_heading_title(title.strip())
+
+
+def _match_heading_line(line: str) -> tuple[int, str] | None:
+    """Return (level, title) for a heading line, or None if not a heading.
+
+    Preference: ATX > arabic-numbered > IEEE roman > bare known section titles.
+    Bare titles must be short standalone lines that exactly match a known
+    section name (optional trailing period only — trailing colon is rejected
+    so algorithm ``Result:`` / ``Data:`` lines are not outlines).
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    atx = _ATX_HEADING_RE.match(stripped)
+    if atx:
+        title = atx.group(2).strip()
+        if title:
+            return len(atx.group(1)), title
+        return None
+
+    numbered = _NUMBERED_HEADING_RE.match(stripped)
+    if numbered:
+        matched = _numbered_heading(
+            numbered.group(1),
+            numbered.group(2),
+            line_len=len(stripped),
+            apply_content_guards=False,
+        )
+        if matched is not None:
+            return matched
+
+    roman_inline = _ROMAN_INLINE_RE.match(stripped)
+    if roman_inline:
+        matched = _roman_heading(
+            roman_inline.group(1),
+            roman_inline.group(2),
+            line_len=len(stripped),
+        )
+        if matched is not None:
+            return matched
+
+    if len(stripped) <= _MAX_BARE_TITLE_CHARS:
+        # Algorithm listings use ``Result:`` / ``Data:``; do not treat as sections.
+        if stripped.endswith(":"):
+            return None
+        candidate = _normalize_heading_title(stripped)
+        # Exact known title only — no extra tokens (tightens bare heuristics).
+        if candidate.casefold() in _BARE_SECTION_TITLES:
+            remainder = stripped
+            if remainder.endswith("."):
+                remainder = remainder[:-1]
+            if remainder.strip().casefold() == candidate.casefold():
+                # Reject lowercase "reference"/"references" - only capitalized versions
+                # are valid section headings (regression blocker: DeepSeek-R1 2501.12948)
+                if candidate.casefold() in ("reference", "references"):
+                    if not candidate[0].isupper():
+                        return None
+                # Reject bare, all-lowercase, single-word lines (e.g., prompt template
+                # text like "conclusion"). Only applies to bare titles, not numbered,
+                # split-number, Appendix X, or capitalized lines.
+                if candidate.islower() and " " not in candidate:
+                    return None
+                return 1, candidate
+
+    return None
+
+
+def _logical_line(line: str) -> str:
+    logical = line[:-1] if line.endswith("\n") else line
+    if logical.endswith("\r"):
+        logical = logical[:-1]
+    return logical
+
+
+def _section_continues_sequence(
+    numbering: str, last_section: tuple[int, ...] | None
+) -> bool:
+    """Check if a section number continues the current outline sequence.
+
+    Valid continuations:
+    - First numbered section: 1 (when last_section is None)
+    - Next sibling: 2.1 → 2.2+ (same level, last part increases; top-level capped at +2)
+    - Descendant: 2 → 2.x (go deeper, any positive child, allowing skips like 2→2.2)
+    - Next ancestor: 2.3.1 → 3+ (go up, that level increases; top-level capped at +2)
+
+    Rejects table numbers (12, 16, 64) by capping top-level to last_top + 1.
+    Allows up to 5 skipped numbers at nested levels (real papers occasionally skip).
+    Prevents table-row labels like "RoBERTa base/large" under split "1" from
+    becoming fake sections (regression #284 round 2).
+
+    Args:
+        numbering: The section number string (e.g. "2.2").
+        last_section: The last accepted section number as a tuple (e.g. (2,1)),
+            or None if no numbered section has been accepted yet.
+    """
+    parts = tuple(int(p) for p in numbering.split("."))
+    if not parts or any(p < 1 for p in parts):
+        return False
+
+    # First numbered section: must be 1
+    if last_section is None:
+        return parts == (1,)
+
+    # Cap nested jumps to 5 (allow some skipping in real papers)
+    # Top-level capped at 2 (tolerate at most one skipped number) to reject table numbers
+    MAX_TOP_LEVEL_JUMP = 2
+    MAX_NESTED_JUMP = 5
+
+    # Next sibling: same prefix, last part increases
+    if len(parts) == len(last_section) and parts[:-1] == last_section[:-1]:
+        jump = parts[-1] - last_section[-1]
+        if len(parts) == 1:
+            # Top-level: allow up to one skipped number (jump of 2 max)
+            # This accepts 1→2, 1→3, but rejects 1→12
+            return jump > 0 and jump <= MAX_TOP_LEVEL_JUMP
+        else:
+            # Nested: allow up to 5 skipped numbers
+            return jump > 0 and jump <= MAX_NESTED_JUMP
+
+    # Descendant: prefix matches, go deeper (allow any positive child, e.g. 2→2.2)
+    if len(parts) > len(last_section) and parts[: len(last_section)] == last_section:
+        return True
+
+    # Next ancestor: pop levels, last part increases
+    if len(parts) < len(last_section):
+        # parts must match last_section prefix up to its length
+        if parts[:-1] == last_section[: len(parts) - 1]:
+            jump = parts[-1] - last_section[len(parts) - 1]
+            if len(parts) == 1:
+                # Top-level: allow up to one skipped number
+                return jump > 0 and jump <= MAX_TOP_LEVEL_JUMP
+            else:
+                # Nested: allow up to 5 skipped numbers
+                return jump > 0 and jump <= MAX_NESTED_JUMP
+
+    return False
+
+
+def _match_split_numbered_heading(
+    number_line: str,
+    title_line: str,
+    last_section: tuple[int, ...] | None = None,
+) -> tuple[int, str] | None:
+    """Join HTML→text ``3.`` / ``Title`` or ``II-A`` / ``Title`` pairs.
+
+    Split-number headings allow sentence case when they continue the outline
+    sequence. This prevents table-row labels from becoming fake sections
+    (regression #284 blocker 1 round 2).
+
+    Args:
+        number_line: Line with just the section number.
+        title_line: Line with the title text.
+        last_section: The last accepted section number tuple, for sequence validation.
+    """
+    stripped = number_line.strip()
+    title_stripped = title_line.strip()
+    if not title_stripped:
+        return None
+    # Do not join onto ATX / inline-numbered headings or another number marker.
+    # Bare known titles (e.g. Method) *should* join with the preceding number.
+    if _ATX_HEADING_RE.match(title_stripped):
+        return None
+    if _NUMBERED_HEADING_RE.match(title_stripped):
+        return None
+    if _NUMBER_ONLY_RE.match(title_stripped):
+        return None
+    if _ROMAN_MARKER_RE.match(title_stripped):
+        return None
+    if _ROMAN_INLINE_RE.match(title_stripped):
+        return None
+
+    line_len = len(stripped) + 1 + len(title_stripped)
+    num_only = _NUMBER_ONLY_RE.match(stripped)
+    if num_only is not None:
+        numbering = num_only.group(1)
+        # Check sequence for all split numbers to avoid promoting table-row labels
+        # or body-list items ("1. Load the model") to headings.
+        if last_section is not None and not _section_continues_sequence(
+            numbering, last_section
+        ):
+            return None
+        # Period-form headings (e.g. "2.\nBaseline") are assumed real headings and
+        # require Title Case. Period-less headings (e.g. "2\nKAN architecture") allow
+        # sentence case and apply content guards to filter table cells.
+        has_trailing_period = stripped.rstrip().endswith(".")
+        return _numbered_heading(
+            numbering,
+            title_stripped,
+            line_len=line_len,
+            allow_sentence_case=not has_trailing_period,
+            apply_content_guards=not has_trailing_period,
+        )
+    if _ROMAN_MARKER_RE.match(stripped):
+        return _roman_heading(stripped, title_stripped, line_len=line_len)
+    return None
+
+
+def _is_bare_section_title_line(line: str) -> bool:
+    """True when the line is only a known bare section title (not numbered)."""
+    stripped = line.strip()
+    if not stripped or stripped.endswith(":"):
+        return False
+    if _ATX_HEADING_RE.match(stripped):
+        return False
+    if _NUMBERED_HEADING_RE.match(stripped):
+        return False
+    if _ROMAN_INLINE_RE.match(stripped):
+        return False
+    candidate = _normalize_heading_title(stripped)
+    if candidate.casefold() not in _BARE_SECTION_TITLES:
+        return False
+    remainder = stripped[:-1] if stripped.endswith(".") else stripped
+    return remainder.strip().casefold() == candidate.casefold()
+
+
+def _is_post_references_accepted(
+    title: str,
+    logical_line: str,
+    opened_appendices: set[str],
+) -> bool:
+    """Check if a heading is accepted in post-References mode (strict whitelist).
+
+    Args:
+        title: The normalized heading title.
+        logical_line: The original line (for checking ATX/numbered patterns).
+        opened_appendices: Set of appendix letters (A-H) already opened.
+
+    Returns:
+        True if the heading passes the post-References whitelist.
+    """
+    normalized = title.casefold()
+
+    # (c) Exact standalone title from allowlist
+    if normalized in _POST_REFERENCES_ALLOWLIST:
+        return True
+
+    # (a) "Appendix X" + title (inline, will be checked in two-line pattern separately)
+    # Check if title starts with "Appendix X " or "Supplementary X " or "Appendix X" (no trailing space)
+    appendix_prefix_match = re.match(
+        r"^(appendix|supplementary)\s+([a-h])(?:\s+|$)", normalized
+    )
+    if appendix_prefix_match:
+        letter = appendix_prefix_match.group(2).upper()
+        opened_appendices.add(letter)
+        return True
+
+    # (b) Dotted number X.n[.m] where X is an already-opened appendix letter
+    # OR opening a new appendix letter with a dotted subsection (e.g., A.1.1)
+    # Extract first token of title to check if it's a dotted appendix subsection
+    first_token = title.split()[0] if title.split() else ""
+    dotted_match = re.match(r"^([A-H])\.(\d+(?:\.\d+)*)$", first_token, re.IGNORECASE)
+    if dotted_match:
+        letter = dotted_match.group(1).upper()
+        # Allow opening a new appendix letter with a dotted subsection
+        opened_appendices.add(letter)
+        return True
+
+    return False
+
+
+def _match_two_line_appendix(
+    first_line: str,
+    second_line: str,
+    opened_appendices: set[str],
+) -> tuple[int, str] | None:
+    """Match two-line appendix pattern: 'Appendix B' followed by title.
+
+    Returns (level, combined_title) or None.
+    Level 1 for 'Appendix B Title', level 2 for 'B.1 Title'.
+
+    Args:
+        first_line: First line (e.g. "Appendix B" or "A.1").
+        second_line: Second line (title text).
+        opened_appendices: Set of appendix letters already opened (updated in place).
+    """
+    first = first_line.strip()
+    second = second_line.strip()
+
+    if not first or not second:
+        return None
+
+    # Second line should not be another heading marker or look like a table cell
+    if _ATX_HEADING_RE.match(second):
+        return None
+    if _NUMBERED_HEADING_RE.match(second):
+        return None
+
+    # Reject if second line is a numbered appendix marker or "Appendix X" pattern
+    # But allow bare keywords like "Acknowledgments" since they can be titles
+    if _APPENDIX_PREFIX_RE.match(second) or _APPENDIX_LETTER_RE.match(second):
+        return None
+
+    # Second line should look like a title (Title Case or known phrase)
+    # Reject punctuation-only or empty titles (regression: DeepSeek-R1 bibliography back-refs)
+    if not second or re.match(r"^[.,;:!?\s]+$", second):
+        return None
+    if not _title_looks_like_heading(
+        second,
+        line_len=len(second),
+        allow_sentence_case=False,
+        apply_content_guards=True,
+    ):
+        return None
+
+    # Check first line patterns - be strict about bare letters
+    # "Appendix B" / "Supplementary A" -> accept
+    prefix_match = _APPENDIX_PREFIX_RE.match(first)
+    if prefix_match:
+        prefix = prefix_match.group(1)
+        letter = prefix_match.group(2)
+        opened_appendices.add(letter)
+        title = f"{prefix} {letter} {second}"
+        return 1, _normalize_heading_title(title)
+
+    # Bare "Appendix" / "Supplementary" + title
+    normalized = _normalize_heading_title(first)
+    if normalized.casefold() in _POST_REFERENCES_ALLOWLIST:
+        title = f"{first} {second}"
+        return 1, _normalize_heading_title(title)
+
+    # Dotted letter patterns (A.1, B.2, C.3) - these look like subsections
+    letter_match = _APPENDIX_LETTER_RE.match(first)
+    if letter_match:
+        letter = letter_match.group(1)
+        subsection = letter_match.group(2)
+        # Only accept dotted forms (A.1, not bare A)
+        # Bare letters require "Appendix" prefix
+        if subsection:
+            # Allow opening a new appendix letter with a dotted subsection
+            opened_appendices.add(letter)
+            # A.1, B.2 -> level 2
+            level = min(6, 1 + subsection.count(".") + 1)
+            title = f"{first} {second}"
+            return level, _normalize_heading_title(title)
+
+    return None
+
+
+def _is_post_references_mode(raw: list[tuple[int, str, str, int]]) -> bool:
+    """True if we've seen References/Bibliography as a real section heading."""
+    if not raw:
+        return False
+    # Check if the last section added was References/Bibliography
+    last_title = raw[-1][2]
+    return _is_outline_terminator(last_title)
+
+
+def _bare_title_has_section_body(
+    lines_meta: list[tuple[int, str]], after_index: int
+) -> bool:
+    """Reject bare titles whose next line looks like a table cell, not a body.
+
+    Real HTML→text sections are followed by prose, another heading, or a
+    split number marker. Table column headers are followed by another short
+    single-token cell (e.g. ``Method`` then ``HellaS``).
+    """
+    peek = after_index
+    while peek < len(lines_meta):
+        _, peek_line = lines_meta[peek]
+        peek_logical = _logical_line(peek_line)
+        if not peek_logical.strip():
+            peek += 1
+            continue
+        if peek_logical.lstrip(" \t").startswith("```"):
+            return True
+        if _match_heading_line(peek_logical) is not None:
+            return True
+        stripped = peek_logical.strip()
+        if _NUMBER_ONLY_RE.match(stripped) or _ROMAN_MARKER_RE.match(stripped):
+            return True
+        # Identifier-like neighbor (Model / Method / HellaS) ⇒ table chrome.
+        # Sentence fragments like ``Body.`` keep the bare title.
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", stripped):
+            return False
+        return True
+    return True
+
+
+def parse_markdown_sections(content: str) -> list[MdSection]:
+    """Parse ATX, numbered, and bare arXiv headings into hierarchical sections.
+
+    Section body runs from the heading start through the character before the
+    next heading of the same or higher level (lower or equal level number).
+
+    After References/Bibliography, enters post-References mode where only explicit
+    appendix-style headings are accepted (Appendix X + title, lettered subsections,
+    or exact allowlist keywords). This filters out table cells and bibliography
+    entry lines that would otherwise become fake sections.
+    """
+    if len(content) == 0:
+        return [MdSection("1", 1, "(document)", 0, 0)]
+
+    masked = _mask_fenced_code(content)
+    raw: list[tuple[int, str, str, int]] = []
+    counters = [0, 0, 0, 0, 0, 0]
+    last_section: tuple[int, ...] | None = None
+    opened_appendices: set[str] = set()  # Track opened appendix letters (A-H)
+
+    lines_meta: list[tuple[int, str]] = []
+    offset = 0
+    for line in masked.splitlines(keepends=True):
+        lines_meta.append((offset, line))
+        offset += len(line)
+
+    in_fence = False
+    index = 0
+    post_references = False  # Track if we're after References/Bibliography
+
+    while index < len(lines_meta):
+        if len(raw) >= MAX_SECTION_COUNT:
+            break
+        start_offset, line = lines_meta[index]
+        stripped = line.lstrip(" \t")
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            index += 1
+            continue
+        if in_fence:
+            index += 1
+            continue
+
+        logical = _logical_line(line)
+        matched = _match_heading_line(logical)
+        consumed = 1
+        is_split_numbered = False
+        is_two_line_appendix = False
+
+        # Check for two-line appendix pattern ONLY after References
+        # Look ahead, skipping blank lines
+        if matched is None and post_references:
+            peek = index + 1
+            while peek < len(lines_meta):
+                _, peek_line = lines_meta[peek]
+                peek_logical = _logical_line(peek_line)
+                if not peek_logical.strip():
+                    peek += 1
+                    continue
+                if peek_logical.lstrip(" \t").startswith("```"):
+                    break
+                # Try two-line appendix pattern
+                appendix_match = _match_two_line_appendix(
+                    logical, peek_logical, opened_appendices
+                )
+                if appendix_match is not None:
+                    matched = appendix_match
+                    consumed = peek - index + 1
+                    is_two_line_appendix = True
+                break
+
+        if matched is None:
+            # Peek across blank lines for a title after a lone section number.
+            # Skip this check in post-References mode (use two-line appendix instead).
+            if not post_references:
+                peek = index + 1
+                while peek < len(lines_meta):
+                    _, peek_line = lines_meta[peek]
+                    peek_logical = _logical_line(peek_line)
+                    if not peek_logical.strip():
+                        peek += 1
+                        continue
+                    if peek_logical.lstrip(" \t").startswith("```"):
+                        break
+                    matched = _match_split_numbered_heading(
+                        logical, peek_logical, last_section
+                    )
+                    if matched is not None:
+                        consumed = peek - index + 1
+                        is_split_numbered = True
+                    break
+
+        if matched is not None:
+            level, title = matched
+
+            # Belt and braces: even in post-References mode, a real capitalized
+            # References/Bibliography heading starts its own section
+            if post_references and _is_outline_terminator(title):
+                # Allow it through - it closes the previous appendix
+                pass
+            # In post-References mode, apply strict whitelist for other headings
+            elif post_references and not is_two_line_appendix:
+                # Use strict whitelist: only accept explicit appendix patterns
+                if not _is_post_references_accepted(title, logical, opened_appendices):
+                    # Reject everything else after References
+                    index += consumed
+                    continue
+
+            # Numbered prefix wins over keyword: "A.1.1 Acknowledgments" stays at level 3
+            # Count dots in the title prefix to determine actual level
+            title_parts = title.split()
+            if title_parts:
+                first_part = title_parts[0]
+                # Check if first part is a dotted number (A.1, A.1.1, etc.)
+                dotted_match = re.match(r"^([A-H])\.(\d+(?:\.\d+)*)$", first_part)
+                if dotted_match:
+                    # Level = 1 (A) + number of dots in subsection
+                    subsection = dotted_match.group(2)
+                    level = min(6, 1 + subsection.count(".") + 1)
+
+            # Drop table-header false positives: bare ``Method`` between short
+            # single-token cells (Model / Method / HellaS) is not a section.
+            # Keep References/Bibliography even when the next line is ``[1]``.
+            if (
+                _is_bare_section_title_line(logical)
+                and not _is_outline_terminator(title)
+                and not is_two_line_appendix
+                and not _bare_title_has_section_body(lines_meta, index + consumed)
+            ):
+                index += 1
+                continue
+
+            counters[level - 1] += 1
+            for counter_index in range(level, 6):
+                counters[counter_index] = 0
+            section_id = ".".join(str(value) for value in counters[:level])
+            raw.append((level, section_id, title, start_offset))
+
+            # Enter post-References mode after seeing References/Bibliography
+            # ONLY if it was accepted as a real section heading
+            if _is_outline_terminator(title):
+                post_references = True
+
+            # Track the paper's numbered sections (for sequence validation)
+            # Extract the actual section number from inline/split numbered headings
+            is_inline_numbered = _NUMBERED_HEADING_RE.match(logical.strip()) is not None
+            if is_split_numbered:
+                # For split headings, the number is on the logical line
+                num_match = _NUMBER_ONLY_RE.match(logical.strip())
+                if num_match:
+                    paper_numbering = num_match.group(1)
+                    last_section = tuple(int(p) for p in paper_numbering.split("."))
+            elif is_inline_numbered:
+                # For inline headings, extract the number from the line
+                inline_match = _NUMBERED_HEADING_RE.match(logical.strip())
+                if inline_match:
+                    paper_numbering = inline_match.group(1)
+                    last_section = tuple(int(p) for p in paper_numbering.split("."))
+        index += consumed
+
+    if not raw:
+        return [MdSection("1", 1, "(document)", 0, len(content))]
+
+    sections: list[MdSection] = []
+    for index, (level, section_id, title, start) in enumerate(raw):
+        end = len(content)
+        for next_level, _nid, _ntitle, next_start in raw[index + 1 :]:
+            if next_level <= level:
+                end = next_start
+                break
+        sections.append(MdSection(section_id, level, title, start, end))
+    return sections
+
+
+def _find_section(sections: list[MdSection], section_id: str) -> MdSection | None:
+    needle = section_id.strip()
+    if not needle:
+        return None
+    for section in sections:
+        if section.section_id == needle:
+            return section
+    # Case-insensitive title fallback (exact title match after normalize).
+    title_needle = re.sub(r"\s+", " ", needle).casefold()
+    matches = [
+        s for s in sections if re.sub(r"\s+", " ", s.title).casefold() == title_needle
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    # If multiple exact matches, reject with None (error will be raised by caller)
+    if len(matches) > 1:
+        return None
+
+    # Try matching without "Appendix X " prefix for appendix sections
+    # Allows lookup by bare title: "DPO Implementation Details" matches "Appendix B DPO Implementation Details"
+    appendix_prefix_pattern = re.compile(r"^appendix\s+[a-h]\s+", re.IGNORECASE)
+    bare_matches = []
+    for section in sections:
+        section_title_lower = section.title.casefold()
+        # Check if section title starts with "Appendix X "
+        if appendix_prefix_pattern.match(section_title_lower):
+            # Extract bare title without prefix
+            bare_title = appendix_prefix_pattern.sub("", section_title_lower)
+            bare_title = re.sub(r"\s+", " ", bare_title)
+            if bare_title == title_needle:
+                bare_matches.append(section)
+        # Also try matching without dotted prefix like "A.1 " or "C.2 "
+        dotted_prefix = re.match(r"^[a-h]\.\d+(\.\d+)*\s+", section_title_lower)
+        if dotted_prefix:
+            bare_title = section_title_lower[dotted_prefix.end() :]
+            bare_title = re.sub(r"\s+", " ", bare_title)
+            if bare_title == title_needle:
+                bare_matches.append(section)
+
+    if len(bare_matches) == 1:
+        return bare_matches[0]
+
+    # Multiple bare matches means ambiguous, return None
+    if len(bare_matches) > 1:
+        return None
+
+    return None
+
+
+def _section_for_offset(sections: list[MdSection], offset: int) -> MdSection | None:
+    """Return the deepest section whose span contains offset."""
+    best: MdSection | None = None
+    for section in sections:
+        if section.start <= offset < section.end:
+            if best is None or section.level > best.level:
+                best = section
+    return best
+
+
+def _load_paper(
+    raw_id: Any,
+) -> tuple[str, str | None, str | None, str] | list[types.TextContent]:
+    """Return (bare_id, version, versioned_id, content) or an error TextContent list."""
+    paper_id = parse_arxiv_id(raw_id) if isinstance(raw_id, str) else None
+    if paper_id is None and isinstance(raw_id, str):
+        paper_id = normalize_arxiv_id(raw_id)
+    if (
+        paper_id is None
+        or not isinstance(paper_id, str)
+        or len(paper_id) > MAX_PAPER_ID_CHARS
+    ):
+        return _error("invalid arXiv ID")
+
+    resolved = resolve_stored_stem(paper_id, Path(settings.STORAGE_PATH))
+    if resolved is None:
+        return _error(
+            f"Paper {paper_id} not found in storage. "
+            "You may need to download it first using download_paper.",
+            paper_id,
+        )
+
+    content = Path(settings.STORAGE_PATH, f"{resolved}.md").read_text(encoding="utf-8")
+    bare = bare_arxiv_id(resolved)
+    version = _sidecar_arxiv_version(
+        resolved, Path(settings.STORAGE_PATH)
+    ) or arxiv_version_suffix(resolved)
+    versioned = f"{bare}{version}" if version else None
+    return bare, version, versioned, content
+
+
+def _coerce_max_sections(value: Any) -> int:
+    try:
+        return min(MAX_RETURNED_SECTIONS, max(1, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_SECTIONS
+
+
+def _coerce_start(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_max_passages(value: Any) -> int:
+    try:
+        return min(MAX_RETURNED_PASSAGES, max(1, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_PASSAGES
+
+
+def _coerce_passage_chars(value: Any) -> int:
+    try:
+        return min(MAX_PASSAGE_CHARS, max(64, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_PASSAGE_CHARS
+
+
+# Near-duplicate passages: windows shifted by ~80–160 chars share most text.
+PASSAGE_OVERLAP_THRESHOLD = 0.5
+# Cap candidate scan so pathological queries (e.g. single letter) stay cheap.
+MAX_PASSAGE_CANDIDATES = 500
+
+
+def _passage_overlap_ratio(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
+    """Fraction of the shorter window that overlaps the other (0..1)."""
+    overlap = max(0, min(a_end, b_end) - max(a_start, b_start))
+    if overlap == 0:
+        return 0.0
+    shorter = min(a_end - a_start, b_end - b_start)
+    return overlap / shorter if shorter else 0.0
+
+
+def _passages_heavily_overlap(
+    candidate: dict[str, Any], selected: list[dict[str, Any]]
+) -> bool:
+    for prior in selected:
+        if (
+            _passage_overlap_ratio(
+                candidate["start"],
+                candidate["end"],
+                prior["start"],
+                prior["end"],
+            )
+            > PASSAGE_OVERLAP_THRESHOLD
+        ):
+            return True
+    return False
+
+
+def _select_diverse_passages(
+    candidates: list[dict[str, Any]], max_passages: int
+) -> list[dict[str, Any]]:
+    """Pick up to max_passages preferring new sections, then fill non-overlaps."""
+    if max_passages <= 0 or not candidates:
+        return []
+
+    selected: list[dict[str, Any]] = []
+    seen_sections: set[str] = set()
+
+    # Pass 1: one (non-overlapping) hit per section when possible.
+    for cand in candidates:
+        if len(selected) >= max_passages:
+            break
+        sid = cand.get("section_id")
+        if sid is not None and sid in seen_sections:
+            continue
+        if _passages_heavily_overlap(cand, selected):
+            continue
+        selected.append(cand)
+        if sid is not None:
+            seen_sections.add(sid)
+
+    # Pass 2: fill remaining slots with any non-overlapping later hits.
+    if len(selected) < max_passages:
+        selected_ids = {id(p) for p in selected}
+        for cand in candidates:
+            if len(selected) >= max_passages:
+                break
+            if id(cand) in selected_ids:
+                continue
+            if _passages_heavily_overlap(cand, selected):
+                continue
+            selected.append(cand)
+
+    selected.sort(key=lambda p: (p["match_start"], p["start"]))
+    return selected
+
+
+def search_passages(
+    content: str,
+    sections: list[MdSection],
+    query: str,
+    *,
+    max_passages: int,
+    passage_chars: int,
+) -> list[dict[str, Any]]:
+    """Return bounded case-insensitive substring matches with source coordinates.
+
+    Suppresses high-overlap near-duplicates and prefers section-diverse hits
+    while still respecting ``max_passages``.
+    """
+    if not query:
+        return []
+    haystack = content.casefold()
+    needle = query.casefold()
+    if not needle:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    search_from = 0
+    half = max(32, passage_chars // 2)
+
+    while len(candidates) < MAX_PASSAGE_CANDIDATES:
+        idx = haystack.find(needle, search_from)
+        if idx < 0:
+            break
+        match_end = idx + len(needle)
+        excerpt_start = max(0, idx - half)
+        excerpt_end = min(len(content), match_end + half)
+        # Keep excerpt within passage_chars budget centered on the match.
+        if excerpt_end - excerpt_start > passage_chars:
+            overflow = excerpt_end - excerpt_start - passage_chars
+            left_cut = overflow // 2
+            right_cut = overflow - left_cut
+            excerpt_start += left_cut
+            excerpt_end -= right_cut
+
+        section = _section_for_offset(sections, idx)
+        excerpt = content[excerpt_start:excerpt_end]
+        candidates.append(
+            {
+                "start": excerpt_start,
+                "end": excerpt_end,
+                "match_start": idx,
+                "match_end": match_end,
+                "section_id": section.section_id if section else None,
+                "section_title": section.title if section else None,
+                "excerpt": excerpt,
+                "excerpt_chars": len(excerpt),
+            }
+        )
+        # Advance past this match; nearby later hits become candidates for
+        # overlap/section filtering below.
+        search_from = match_end if match_end > search_from else search_from + 1
+
+    return _select_diverse_passages(candidates, max_passages)
+
+
+outline_tool = types.Tool(
+    name="get_paper_outline",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description=(
+        "Return a paginated heading outline for a downloaded paper (markdown). "
+        "Stable hierarchical section IDs; use read_paper_section to fetch one."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "paper_id": _paper_id_property(),
+            "start": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based section index (default 0)",
+            },
+            "max_sections": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_RETURNED_SECTIONS,
+                "description": f"Maximum headings to return (default {DEFAULT_MAX_SECTIONS})",
+            },
+        },
+        "required": ["paper_id"],
+        "additionalProperties": False,
+    },
+)
+
+read_section_tool = types.Tool(
+    name="read_paper_section",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description=(
+        "Return one bounded markdown section by outline ID (or unique title). "
+        "Does not include sibling or parent sections."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "paper_id": _paper_id_property(),
+            "section_id": {
+                "type": "string",
+                "maxLength": MAX_SECTION_ID_CHARS,
+                "description": "Section ID from get_paper_outline, or unique title",
+            },
+            **_page_properties(),
+        },
+        "required": ["paper_id", "section_id"],
+        "additionalProperties": False,
+    },
+)
+
+search_text_tool = types.Tool(
+    name="search_paper_text",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description=(
+        "Search a downloaded paper for bounded matching passages with "
+        "section/source offsets. Suppresses high-overlap near-duplicates and "
+        "prefers section-diverse hits. Lightweight substring search; no Torch."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "paper_id": _paper_id_property(),
+            "query": {
+                "type": "string",
+                "maxLength": MAX_QUERY_CHARS,
+                "description": "Case-insensitive substring to find",
+            },
+            "max_passages": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_RETURNED_PASSAGES,
+                "description": f"Maximum passages to return (default {DEFAULT_MAX_PASSAGES})",
+            },
+            "passage_chars": {
+                "type": "integer",
+                "minimum": 64,
+                "maximum": MAX_PASSAGE_CHARS,
+                "description": f"Max characters per excerpt (default {DEFAULT_PASSAGE_CHARS})",
+            },
+        },
+        "required": ["paper_id", "query"],
+        "additionalProperties": False,
+    },
+)
+
+
+async def handle_get_paper_outline(
+    arguments: dict[str, Any],
+) -> list[types.TextContent]:
+    """Return a paginated outline of markdown headings for a stored paper."""
+    loaded = _load_paper(arguments.get("paper_id"))
+    if isinstance(loaded, list):
+        return loaded
+    bare, version, versioned, content = loaded
+    try:
+        sections = parse_markdown_sections(content)
+        start = _coerce_start(arguments.get("start", 0))
+        max_sections = _coerce_max_sections(
+            arguments.get("max_sections", DEFAULT_MAX_SECTIONS)
+        )
+        page = sections[start : start + max_sections]
+        next_start = start + len(page)
+        payload = {
+            "status": "success",
+            "paper_id": bare,
+            "arxiv_version": version,
+            "versioned_id": versioned,
+            "total_sections": len(sections),
+            "start": start,
+            "returned_sections": len(page),
+            "next_start": next_start if next_start < len(sections) else None,
+            "is_truncated": next_start < len(sections),
+            "sections": [
+                {
+                    "id": item.section_id,
+                    "level": item.level,
+                    "title": item.title,
+                    "start": item.start,
+                    "end": item.end,
+                }
+                for item in page
+            ],
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+    except Exception:
+        return _error("Paper outline retrieval failed", bare)
+
+
+async def handle_read_paper_section(
+    arguments: dict[str, Any],
+) -> list[types.TextContent]:
+    """Return one bounded markdown section by ID or unique title."""
+    loaded = _load_paper(arguments.get("paper_id"))
+    if isinstance(loaded, list):
+        return loaded
+    bare, version, versioned, content = loaded
+
+    section_id = arguments.get("section_id")
+    if not isinstance(section_id, str) or not section_id.strip():
+        return _error("section_id is required", bare)
+    if len(section_id) > MAX_SECTION_ID_CHARS:
+        return _error(f"section_id exceeds {MAX_SECTION_ID_CHARS} characters", bare)
+
+    try:
+        sections = parse_markdown_sections(content)
+        section = _find_section(sections, section_id)
+        if section is None:
+            # Check if there are multiple matches for better error message
+            title_needle = re.sub(r"\s+", " ", section_id.strip()).casefold()
+
+            # Check for multiple exact title matches
+            exact_matches = [
+                s
+                for s in sections
+                if re.sub(r"\s+", " ", s.title).casefold() == title_needle
+            ]
+
+            # Check for multiple bare title matches (without prefix)
+            appendix_prefix_pattern = re.compile(r"^appendix\s+[a-h]\s+", re.IGNORECASE)
+            bare_matches = []
+            for s in sections:
+                section_title_lower = s.title.casefold()
+                if appendix_prefix_pattern.match(section_title_lower):
+                    bare_title = appendix_prefix_pattern.sub("", section_title_lower)
+                    bare_title = re.sub(r"\s+", " ", bare_title)
+                    if bare_title == title_needle:
+                        bare_matches.append(s)
+                dotted_prefix = re.match(r"^[a-h]\.\d+(\.\d+)*\s+", section_title_lower)
+                if dotted_prefix:
+                    bare_title = section_title_lower[dotted_prefix.end() :]
+                    bare_title = re.sub(r"\s+", " ", bare_title)
+                    if bare_title == title_needle:
+                        bare_matches.append(s)
+
+            candidates = exact_matches or bare_matches
+            if len(candidates) > 1:
+                candidate_list = [f"{s.section_id} ({s.title})" for s in candidates]
+                return _error(
+                    f"Section {section_id!r} is ambiguous. Multiple matches found: {', '.join(candidate_list)}. "
+                    f"Please use a section ID instead.",
+                    bare,
+                )
+
+            return _error(
+                f"Section {section_id!r} not found; call get_paper_outline first",
+                bare,
+            )
+        body = content[section.start : section.end].rstrip()
+        payload: dict[str, Any] = {
+            "status": "success",
+            "paper_id": bare,
+            "arxiv_version": version,
+            "versioned_id": versioned,
+            "section": {
+                "id": section.section_id,
+                "level": section.level,
+                "title": section.title,
+                "start": section.start,
+                "end": section.end,
+            },
+        }
+        add_content_payload(payload, body, arguments, CONTENT_WARNING)
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+    except Exception:
+        return _error("Paper section retrieval failed", bare)
+
+
+async def handle_search_paper_text(
+    arguments: dict[str, Any],
+) -> list[types.TextContent]:
+    """Search stored markdown for bounded passages with source coordinates."""
+    loaded = _load_paper(arguments.get("paper_id"))
+    if isinstance(loaded, list):
+        return loaded
+    bare, version, versioned, content = loaded
+
+    query = arguments.get("query")
+    if not isinstance(query, str):
+        return _error("query is required", bare)
+    if len(query) > MAX_QUERY_CHARS:
+        return _error(f"query exceeds {MAX_QUERY_CHARS} characters", bare)
+
+    try:
+        sections = parse_markdown_sections(content)
+        max_passages = _coerce_max_passages(
+            arguments.get("max_passages", DEFAULT_MAX_PASSAGES)
+        )
+        passage_chars = _coerce_passage_chars(
+            arguments.get("passage_chars", DEFAULT_PASSAGE_CHARS)
+        )
+        passages = search_passages(
+            content,
+            sections,
+            query,
+            max_passages=max_passages,
+            passage_chars=passage_chars,
+        )
+        payload = {
+            "status": "success",
+            "paper_id": bare,
+            "arxiv_version": version,
+            "versioned_id": versioned,
+            "query": query,
+            "returned_passages": len(passages),
+            "max_passages": max_passages,
+            "passage_chars": passage_chars,
+            "passages": passages,
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+    except Exception:
+        return _error("Paper text search failed", bare)

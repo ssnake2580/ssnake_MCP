@@ -1,0 +1,145 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on Keep a Changelog, and this project follows Semantic Versioning.
+
+## [Unreleased]
+
+## [0.3.7] - 2026-11-12
+
+### Fixed
+
+- Fetch IACR search and details over HTTP, bound concurrent detail enrichment to ten seconds, and report blocked searches as tool errors instead of empty results. (@isomoes)
+
+## [0.3.6] - 2026-11-12
+
+### Changed
+
+- Upgrade Scrapling to 0.5.1 and default IACR downloads to its bundled Chromium. (@isomoes)
+
+### Fixed
+
+- Download IACR PDFs through browser download events with the PDF viewer disabled, instead of saving viewer HTML. (@isomoes)
+- Preserve successful PDF downloads when subsequent browser navigation or challenge handling reports errors. (@isomoes)
+
+## [0.3.5] - 2026-10-02
+
+### Changed
+
+- Migrate to MCP Python SDK v2 with updated server APIs and client tests. (@isomoes)
+
+### Fixed
+
+- Preserve actionable IACR download failure messages with MCP v2 tool errors. (@isomoes)
+- Adjust CNKI page sizes to supported values and truncate results to the requested count. (@isomoes)
+
+## [0.3.4] - 2026-08-20
+
+### Changed
+
+- IACR PDF downloads now use Scrapling's stealth browser and Cloudflare solver with configurable Chromium and retry settings. (@isomoes)
+
+### Fixed
+
+- Browser-assisted IACR downloads validate PDFs, publish files atomically, preserve proxy support, and surface actionable failures. (@isomoes)
+
+## [0.3.3] - 2026-07-29
+
+### Changed
+
+- Release instructions now publish the release commit and tag atomically. (@isomoes)
+
+### Fixed
+
+- IACR downloads return completed PDFs before MCP timeouts while browser cleanup continues safely. (@isomoes)
+
+## [0.3.2] - 2026-07-29
+
+### Fixed
+
+- Constrain the MCP SDK to v1 so fresh `uvx` installs use the compatible `FastMCP` API. (@isomoes)
+
+## [0.3.1] - 2026-07-29
+
+### Fixed
+
+- IACR PDF downloads now use SeleniumBase to pass Cloudflare challenges and save valid PDFs. (@isomoes)
+
+## [0.3.0] - 2026-07-28
+
+### Added
+
+- Python 3.12+ package with `uv` project management and an `apaper-mcp` console entry point. (@isomoes)
+- PyPI publishing workflow with GitHub Actions Trusted Publishing support. (@isomoes)
+- MIT license and complete package metadata for distribution on PyPI. (@isomoes)
+
+### Removed
+
+- Legacy TypeScript, Bun, and npm implementation and release artifacts. (@isomoes)
+
+## [0.2.0] - 2026-06-26
+
+### Added
+
+- `SPIDER_PROXY` env var routes outbound requests (arXiv, IACR, DBLP, Google Scholar, and PDF downloads) through a proxy. CNKI is excluded because it authenticates by institutional IP. Accepts `socks5`/`socks4`/`http`/`https` URLs in both the standard `scheme://user:pass@host:port` form and the colon-delimited `scheme://host:port:user:pass` form (e.g. Kookeey), on both the Node and Bun runtimes (under Bun, SOCKS is tunnelled via a local HTTP→SOCKS bridge). Idempotent requests are retried on transient proxy connection failures, and if the proxy is set but invalid or can't be initialised, requests are blocked rather than sent direct so the real IP never leaks. (#2, @isomoes)
+- IACR per-request timeouts are configurable via `IACR_TIMEOUT_MS` (default `30000`) and `IACR_DOWNLOAD_TIMEOUT_MS` (default `60000`), raised from the previous fixed 15s/30s to tolerate slow proxies. (#2, @isomoes)
+
+### Fixed
+
+- IACR requests now detect Cloudflare's bot challenge (which intermittently blocks downloads/searches) and report it with an actionable message and the URL to open in a browser, instead of an opaque `HTTP 403` — and never save a challenge HTML page as a `.pdf`. Requests also send browser-like headers (full User-Agent, `Accept`, `Referer`). (#2, @isomoes)
+
+## [0.1.5] - 2026-06-08
+
+### Added
+
+- arXiv requests are throttled and retried on HTTP 429 / 5xx with exponential backoff honouring `Retry-After`; a persistent block reports the throttled IP and wait time. Tunable via `ARXIV_MIN_INTERVAL_MS`, `ARXIV_MAX_RETRIES`, `ARXIV_BACKOFF_BASE_MS`, `ARXIV_BACKOFF_MAX_MS`, `ARXIV_BACKOFF_JITTER_MS`, and `ARXIV_IP_ECHO_URL`. (#1, @isomoes)
+
+### Fixed
+
+- arXiv tools no longer fail on the first HTTP 429, and the search tool description no longer claims rate-limiting that was not implemented. (#1, @isomoes)
+
+## [0.1.4] - 2026-05-17
+
+### Added
+
+- arXiv search support via the `search_arxiv_papers` tool, with category, date-range, and sort options. (@isomoes)
+- arXiv PDF download support via the `download_arxiv_paper` tool. (@isomoes)
+- `ARXIV_SEARCH_URL`, `ARXIV_ADVANCED_URL`, and `ARXIV_PDF_BASE` env overrides for routing arXiv traffic through a reachable mirror. (@isomoes)
+
+### Changed
+
+- arXiv search scrapes the `arxiv.org/search/` HTML page instead of `export.arxiv.org/api/query` so it works on networks where the Atom API endpoint is blocked or aggressively rate-limited. (@isomoes)
+
+## [0.1.3] - 2026-05-16
+
+### Added
+
+- CNKI (中国知网) search support via the `search_cnki_papers` tool. (@isomoes)
+- CNKI PDF download support via the `download_cnki_paper` tool. (@isomoes)
+- Automatic IP-based CNKI session login on whitelisted institutional networks; no manual cookie management required. (@isomoes)
+
+## [0.1.2] - 2026-03-26
+
+### Added
+
+- Test release to verify tag-triggered GitHub Actions publishing now that the workflow is active. (@isomoes)
+
+## [0.1.1] - 2026-03-26
+
+### Added
+
+- npm packaging for `@ai4paper/apaper-mcp`, including the `apaper-mcp` CLI entrypoint. (@isomoes)
+- Tag-driven GitHub Actions release publishing and changelog-backed release notes. (@isomoes)
+- README updates covering npm installation and local release verification workflow. (@isomoes)
+
+## [0.1.0] - 2026-03-26
+
+### Added
+
+- Initial Bun + TypeScript MCP server for academic paper research. (@isomoes)
+- IACR ePrint search support with optional detail fetching and year filters. (@isomoes)
+- IACR PDF download support. (@isomoes)
+- DBLP search support with year filtering, venue filtering, and optional BibTeX output. (@isomoes)
+- Google Scholar search support with year filtering. (@isomoes)
+- Text formatters for MCP tool responses and stdio server startup entrypoint. (@isomoes)
