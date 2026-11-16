@@ -1,0 +1,56 @@
+{
+  "name": "gitleaks-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets an AI agent scan code, staged diffs and text for secrets with gitleaks - findings are always redacted.",
+  "type": "module",
+  "bin": {
+    "gitleaks-mcp": "dist/src/index.js"
+  },
+  "main": "dist/src/index.js",
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/src/index.js",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/src/index.js"
+  },
+  "keywords": [
+    "ai-agents",
+    "claude",
+    "gitleaks",
+    "llm",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "secret-scanning",
+    "secrets",
+    "secrets-detection",
+    "security"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "author": "Matias Burni",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matiasburni/gitleaks-mcp.git"
+  },
+  "homepage": "https://github.com/matiasburni/gitleaks-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/matiasburni/gitleaks-mcp/issues"
+  },
+  "mcpName": "io.github.matiasburni/gitleaks-mcp"
+}

@@ -1,0 +1,18 @@
+node_modules/
+build/
+.DS_Store
+coverage/
+.env
+*.log
+.vscode/
+pnpm-lock.yaml
+semgrep.json
+CLAUDE.md
+test_scan/
+semgrep_rules/
+/semgrep-rules
+/.vibecrafted
+*.out
+
+# Loctree internal artifacts (agent context atlas)
+.loctree/

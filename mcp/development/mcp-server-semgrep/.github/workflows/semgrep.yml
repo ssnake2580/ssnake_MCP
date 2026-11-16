@@ -1,0 +1,58 @@
+on:
+  workflow_dispatch: {}
+  pull_request: {}
+  push:
+    branches:
+    - main
+    - master
+    paths:
+    - .github/workflows/semgrep.yml
+  schedule:
+  # random HH:MM to avoid a load spike on GitHub Actions at 00:00
+  - cron: 2 16 * * *
+name: Semgrep
+jobs:
+  semgrep:
+    name: semgrep/ci
+    # Self-hosted runners are persistent machines, so code from a fork must not
+    # run on them: fork pull requests go to a GitHub-hosted runner instead.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'self-hosted' }}
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+    - name: Select Python
+      id: python
+      shell: bash
+      run: |
+        if command -v python3 >/dev/null 2>&1; then
+          PYTHON="$(command -v python3)"
+        elif command -v python >/dev/null 2>&1; then
+          PYTHON="$(command -v python)"
+        else
+          echo "Python is required to install Semgrep on this self-hosted runner." >&2
+          exit 1
+        fi
+        "$PYTHON" --version
+        echo "python=$PYTHON" >> "$GITHUB_OUTPUT"
+    - name: Install Semgrep
+      run: |
+        # Install into a venv so PEP 668 externally-managed system Pythons on
+        # self-hosted runners don't reject the install (and we don't pollute
+        # the runner's system site-packages).
+        VENV="${RUNNER_TEMP:-/tmp}/semgrep-venv"
+        "${{ steps.python.outputs.python }}" -m venv "$VENV" \
+          || "${{ steps.python.outputs.python }}" -m ensurepip --upgrade && "${{ steps.python.outputs.python }}" -m venv "$VENV"
+        "$VENV/bin/python" -m pip install --upgrade pip semgrep
+        echo "$VENV/bin" >> "$GITHUB_PATH"
+    - name: Run Semgrep
+      env:
+        SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      run: |
+        if [ -n "${SEMGREP_APP_TOKEN:-}" ]; then
+          echo "Running semgrep ci with SEMGREP_APP_TOKEN from GitHub Actions secrets."
+          semgrep ci
+        else
+          echo "SEMGREP_APP_TOKEN is not available. Falling back to OSS ruleset."
+          semgrep --config p/ci --error .
+        fi

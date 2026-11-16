@@ -1,0 +1,33 @@
+{
+  "name": "@pipeworx/mcp-censys",
+  "version": "0.2.2",
+  "description": "Censys MCP — internet-scan search over the Censys Platform API (censys.com)",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "mcp-censys": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "censys"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-censys.git"
+  },
+  "mcpName": "io.github.pipeworx-io/censys",
+  "pipeworx": {
+    "mode": "gateway",
+    "slug": "censys",
+    "gatewaySlug": "censys",
+    "sourceHash": "v1-1095dfddcd72f6d1754105997c19eee56454713579899c441b0cb3884233372c",
+    "sourceCommit": "8cc978183948532674e797c429305c9d8ab2a1c3"
+  }
+}

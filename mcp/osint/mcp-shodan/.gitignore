@@ -1,0 +1,12 @@
+node_modules/
+build/
+*.log
+.env
+.env.local
+.env.*.local
+logs/
+projectradar.yaml
+.mcpregistry_*
+.DS_Store
+__pycache__/
+site/

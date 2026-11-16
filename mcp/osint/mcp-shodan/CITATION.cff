@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use mcp-shodan in research or publications, please cite it as below."
+title: "mcp-shodan"
+abstract: "Model Context Protocol server that gives AI agents access to the Shodan API and CVEDB: device search, IP reconnaissance, DNS lookups, and CVE/CPE vulnerability intelligence."
+type: software
+authors:
+  - name: "mcp-shodan contributors"
+license: MIT
+repository-code: "https://github.com/w0h1v/mcp-shodan"
+keywords: [mcp, model-context-protocol, shodan, threat-intelligence, osint, vulnerability-intelligence, dfir, ai-agents]

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exiftool-mcp"
+version = "0.1.6"
+description = "MCP server for reading metadata from files using ExifTool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "model-context-protocol", "exiftool", "metadata", "exif"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = ["mcp>=1.15.0"]
+
+[project.scripts]
+exiftool-mcp = "exiftool_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/joshmsimpson/exiftool_mcp"
+Repository = "https://github.com/joshmsimpson/exiftool_mcp"

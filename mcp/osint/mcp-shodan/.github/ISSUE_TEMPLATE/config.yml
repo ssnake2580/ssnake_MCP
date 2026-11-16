@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/w0h1v/mcp-shodan/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue for them.
+  - name: Problem with Shodan itself
+    url: https://help.shodan.io/
+    about: Query credits, plans, account problems and scan data belong to Shodan. This server only calls the Shodan and CVEDB APIs.

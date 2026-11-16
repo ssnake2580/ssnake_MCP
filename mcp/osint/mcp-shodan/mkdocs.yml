@@ -1,0 +1,52 @@
+site_name: mcp-shodan
+site_description: MCP server that gives AI agents access to the Shodan API and CVEDB
+site_url: https://w0h1v.github.io/mcp-shodan/
+repo_url: https://github.com/w0h1v/mcp-shodan
+repo_name: w0h1v/mcp-shodan
+edit_uri: edit/main/docs/
+copyright: MIT · Independent project, not affiliated with Shodan.
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  # Dark by default (first entry wins); the toggle switches to light and the
+  # choice is remembered per visitor.
+  palette:
+    - scheme: slate
+      primary: teal
+      accent: indigo
+      toggle: {icon: material/weather-sunny, name: Light mode}
+    - scheme: default
+      primary: teal
+      accent: indigo
+      toggle: {icon: material/weather-night, name: Dark mode}
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+hooks:
+  - mkdocs_hooks.py
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc: {permalink: true}
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Overview: index.md
+  - Using it:
+      - Connect a client: clients.md
+      - Tool reference: tools.md
+      - Example workflows: examples.md
+      - Troubleshooting: troubleshooting.md
