@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.complexipy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
+.benchmarks/
+.pyscn/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project-local
+.oneiric_cache/
+.crackerjack/
+.lycheecache
+.lycheecache/
+dist/
+
+# Packet captures (random pcap files stay gitignored; test fixtures
+# in tests/fixtures/*.pcap commit through the negation below)
+*.pcap
+*.pcapng
+!tests/fixtures/*.pcap
+!tests/fixtures/*.pcapng
+# ============================================================================
+# Documentation — image assets
+# ============================================================================
+# Tracked images live under docs/assets/images/. Session scratch outputs
+# (named like "*-v4.png", "*-window.png", or anything dropped in
+# .scratch/) are local-only and must not be committed. The dot-prefix on
+# `.scratch` is load-bearing — the gitignore rule only matches with it.
+docs/assets/images/.scratch/
+docs/assets/images/.scratch/**
+
+
+# >>> bodai-shared-gitignore >>>
+# Source of truth: crackerjack/templates/GITIGNORE_BODAI.md
+# Enforced by: crackerjack check `gitignore-conformance`
+# Fleet list: /Users/les/Projects/mahavishnu/BODAI_REPO_REGISTRY.md
+# Do NOT remove the marker line above — `crackerjack gitignore sync` uses it
+# to detect already-applied state.
+
+# Editor / pre-edit backups (foo.py.backup, foo.py.backup.json)
+*.backup
+*.backup.*
+*.bak
+*.tmpl
+# XDG mistake dirs (env var expansion failed; literal names)
+# Note: both `{` and `}` are escaped (`{` -> `[{]`, `}` -> `[}]`)
+# because gitignore parsers interpret `${...}` as a brace-expansion
+# alternate group; escaping only the open brace leaves a stray `}`.
+~
+[{]HOME[}]
+[{]XDG_DATA_HOME:-$HOME[}]
+# pytest-benchmark autosave cache (sibling of the tracked `benchmarks/` test suite)
+.benchmarks/
+# Vitest config timestamp cache
+vitest.config.js.timestamp-*.mjs
+# Playwright output cruft
+playwright-junit.xml
+playwright-report/
+playwright-results.json
+test-results/
+# <<< bodai-shared-gitignore <<<

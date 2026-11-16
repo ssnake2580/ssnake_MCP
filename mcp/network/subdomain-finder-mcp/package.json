@@ -1,0 +1,54 @@
+{
+  "name": "subdomain-finder-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for passive subdomain enumeration from certificate transparency logs (certspotter, crt.sh) with DNS over HTTPS checks.",
+  "type": "module",
+  "license": "MIT",
+  "author": "theluckystrike",
+  "mcpName": "io.github.theluckystrike/subdomain-finder-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/theluckystrike/subdomain-finder-mcp"
+  },
+  "homepage": "https://bugbountyreality.com/tools/subdomain-finder-real/",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "claude",
+    "subdomain-finder",
+    "subdomain-enumeration",
+    "certificate-transparency",
+    "crt.sh",
+    "certspotter",
+    "recon",
+    "bug-bounty",
+    "dns"
+  ],
+  "bin": {
+    "subdomain-finder-mcp": "dist/stdio.js"
+  },
+  "main": "dist/stdio.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test",
+    "start": "node dist/stdio.js",
+    "deploy": "npx wrangler@4 deploy"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

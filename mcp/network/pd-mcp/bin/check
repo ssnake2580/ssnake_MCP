@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# pd-mcp-standalone — self-test gate (PASS/FAIL).
+# Runs the bun test suite and rejects on any failure.
+# Resolves the REAL bun binary by path so the estate run-fast shim cannot
+# mis-fire a spurious 2s breach on a sub-10ms test run and mask a PASS.
+cd "$(dirname "$0")/.."
+
+echo "== pd-mcp-standalone check: start =="
+bunbin="$(readlink -f "$(command -v bun 2>/dev/null)" 2>/dev/null || true)"
+for cand in /home/toxic/.bun/bin/bun "$bunbin" /usr/local/bin/bun /usr/bin/bun; do
+  [ -x "$cand" ] && { real_bun="$cand"; break; }
+done
+[ -n "${real_bun:-}" ] || { echo "FAIL: bun not found"; exit 1; }
+echo "using bun: $real_bun"
+
+set +e
+res="$("$real_bun" test 2>&1)"
+rc=$?
+set -e
+echo "$res"
+
+[ "$rc" -eq 0 ] || { echo "FAIL: bun test exit=$rc"; exit 1; }
+echo "$res" | grep -qiE "pass" || { echo "FAIL: no passing test output"; exit 1; }
+if echo "$res" | grep -qE " [1-9][0-9]* (fail|error)"; then
+  echo "FAIL: test suite reported failures/errors"; exit 1
+fi
+
+echo "== pd-mcp-standalone check: PASS =="
+exit 0

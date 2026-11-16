@@ -1,0 +1,51 @@
+<!--
+  Evaluation set for securitytrails-mcp.
+
+  Each question is answerable using only this server's tools, is read-only, and has a single
+  short answer suitable for string comparison. Targets are deliberately restricted to
+  IANA-reserved and long-stable infrastructure so the answers do not drift.
+
+  All answers verified against the live SecurityTrails API on 2026-09-18.
+-->
+<evaluation>
+  <qa_pair>
+    <question>Using WHOIS data, in which year was the domain example.com first registered?</question>
+    <answer>1995</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>What registrar name does SecurityTrails report for the domain example.com?</question>
+    <answer>RESERVED-Internet Assigned Numbers Authority</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Which organization is listed as the registrant contact for the IPv4 address 8.8.8.8?</question>
+    <answer>Google LLC</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>What postal code appears on the registrant contact record for the IPv4 address 8.8.8.8?</question>
+    <answer>94043</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In which city is the registrant contact for the IPv4 address 8.8.8.8 located?</question>
+    <answer>Mountain View</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>What two-letter country code is on the registrant contact record for the IPv4 address 8.8.8.8?</question>
+    <answer>US</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Looking at the current DNS records for example.com, what is the full value of its SPF TXT record?</question>
+    <answer>v=spf1 -all</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Which registrar manages the domain iana.org?</question>
+    <answer>CSC Corporate Domains, Inc.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>What is the exact creation date of the domain iana.org, in YYYY-MM-DD format?</question>
+    <answer>1995-06-05</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>The domains example.com and iana.org were both registered in 1995. Compare their WHOIS creation dates: which of the two was registered first?</question>
+    <answer>iana.org</answer>
+  </qa_pair>
+</evaluation>

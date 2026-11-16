@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a tool or capability
+labels: ['enhancement']
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The reconnaissance task, not the proposed implementation.
+    validations:
+      required: true
+  - type: input
+    id: endpoint
+    attributes:
+      label: Relevant SecurityTrails API endpoint
+      description: If this maps to an existing endpoint, which one?
+      placeholder: '/v1/domain/{hostname}/subdomains'
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What did you try with the existing tools?

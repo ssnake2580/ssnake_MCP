@@ -1,0 +1,9 @@
+name = "subdomain-finder-mcp"
+main = "src/worker.ts"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+account_id = "dd3f2a29b7707e21a87f26a622c0bb9d"
+
+[observability]
+enabled = true

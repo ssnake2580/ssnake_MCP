@@ -1,0 +1,10 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.theluckystrike/subdomain-finder-mcp",
+  "title": "Subdomain Finder MCP",
+  "description": "Passive subdomain enumeration from certificate transparency (certspotter, crt.sh) with DNS checks.",
+  "version": "1.0.0",
+  "websiteUrl": "https://bugbountyreality.com/tools/subdomain-finder-real/",
+  "repository": { "url": "https://github.com/theluckystrike/subdomain-finder-mcp", "source": "github" },
+  "remotes": [{ "type": "streamable-http", "url": "https://subdomain-finder-mcp.lipmichal.workers.dev/mcp" }]
+}

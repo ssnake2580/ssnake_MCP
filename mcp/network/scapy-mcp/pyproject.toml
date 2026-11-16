@@ -1,0 +1,138 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scapy-mcp"
+version = "0.1.2"
+description = "MCP server wrapping Scapy — packet crafting, dissection, and live capture"
+readme = "README.md"
+license = "BSD-3-Clause"
+authors = [
+    { name = "Les Leslie", email = "les@wedgwoodwebworks.com" },
+]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "fastmcp>=2.12.0",
+    "mcp-common>=0.30.0",
+    "oneiric>=0.16.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "scapy>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.9.0",
+    "bandit>=1.7.9",
+    "crackerjack>=0.30.0",
+    "hatchling>=1.25.0",
+    "httpx2>=0.28.1",
+]
+
+[project.scripts]
+scapy-mcp = "scapy_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/lesleslie/scapy-mcp"
+Repository = "https://github.com/lesleslie/scapy-mcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scapy_mcp"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.venv",
+    "/.pytest_cache",
+    "/.mypy_cache",
+    "/.ruff_cache",
+    "/dist",
+    "/tests",
+    "/.cache",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "TCH"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pydantic v2 + `from __future__ import annotations` + TYPE_CHECKING is a latent
+# bug class: the `auth: AuthConfig | None` field annotation must be resolvable
+# at runtime so pydantic can build the model, so the third-party `AuthConfig`
+# import has to be a real runtime import — TC002 cannot apply here. Mirror
+# the same exemption for the local `AuthConfig | None` annotation in server.py
+# since `auth_cfg` is also used at runtime (not just as a type annotation).
+# See project memory `pydantic-future-annotations-forward-ref.md`.
+"scapy_mcp/config/settings.py" = ["TC002"]
+"scapy_mcp/server.py" = ["TC002"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["requires_bpf: requires /dev/bpf* access (capture tests)"]
+addopts = "--cov=scapy_mcp --cov-report=term --cov-report=html --cov-fail-under=85"
+
+[tool.coverage.run]
+source = ["scapy_mcp"]
+branch = true
+omit = ["*/tests/*", "*/__main__.py"]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.codespell]
+# htmlcov/ is generated coverage output (gitignored) and trips on truncated
+# identifiers in its HTML; .venv/ and dist/ are likewise not our source.
+skip = "./.venv,./htmlcov,./dist,./uv.lock,./.git,./tests/fixtures"
+# Networking terms codespell mistakes for typos:
+#   nd  -> IPv6 Neighbor Discovery (as in "ARP/ND/RAW frames")
+ignore-words-list = "nd"
+
+[tool.creosote]
+# Flat layout: the package lives at the repo root, not under src/.
+paths = ["scapy_mcp"]
+deps-file = "pyproject.toml"
+sections = ["project.dependencies"]
+
+[[tool.refurb.amend]]
+# The settings tests assert the *exact* closed-position defaults for the
+# transmit controls. `x is False` and `x == []` are deliberately stricter than
+# the truthiness forms refurb suggests: `not x` would also pass for 0, "",
+# None, or [], which would let a mistyped default slip through a security gate.
+path = "tests"
+ignore = ["FURB115", "FURB149", "FURB184"]
+
+[tool.uv]
+constraint-dependencies = [
+    "aiohttp>=3.14.3",
+    "cryptography>=50.0.0",
+]
+# Pick up mcp-common from the sibling mcp-common checkout (contains the
+# BearerTokenMiddleware + AuthHealth + JWTIdentityProvider surface that
+# scapy-mcp's Runtime wires in). Without this override uv installs the
+# published PyPI 0.24.5 wheel, which lacks the auth package.
+sources = { mcp-common = { path = "../mcp-common", editable = true } }
+
+[dependency-groups]
+dev = [
+    "crackerjack>=0.80.8",
+]

@@ -1,0 +1,21 @@
+snmp-mcp
+Copyright 2026 snmp-mcp contributors
+
+This product includes software developed by the snmp-mcp project
+contributors (https://github.com/acato/snmp-mcp).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+---
+
+This project is an independent integration of the IETF SNMP standard
+(RFC 3411-3418, RFC 3805, RFC 2863, RFC 2790, and related MIBs). It is
+not affiliated with, endorsed by, or sponsored by any vendor whose
+devices it polls.
+
+---
+
+Third-party dependencies:
+  - mcp (Anthropic Model Context Protocol SDK, MIT)
+  - pysnmp (BSD-2-Clause)
+  - pydantic (MIT)

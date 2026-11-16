@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/aqhmal/securitytrails-mcp/security/advisories/new
+    about: Please report security issues privately, not as a public issue.
+  - name: SecurityTrails API or plan question
+    url: https://securitytrails.com/contact
+    about: Questions about API limits, plan tiers or data coverage belong with SecurityTrails.

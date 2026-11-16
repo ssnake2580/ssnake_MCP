@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Never commit real API keys
+.env
+.env.local
+*.key
+
+# Logs / editor / OS
+npm-debug.log*
+*.log
+.DS_Store
+.idea/
+.vscode/

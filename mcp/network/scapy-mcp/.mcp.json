@@ -1,0 +1,6 @@
+{
+  "scapy": {
+    "type": "http",
+    "url": "http://localhost:3056/mcp"
+  }
+}

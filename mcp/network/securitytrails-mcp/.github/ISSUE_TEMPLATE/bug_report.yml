@@ -1,0 +1,55 @@
+name: Bug report
+description: Something does not work as documented
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste your SecurityTrails API key**, or any log line containing it.
+        Redact it as `REDACTED` before pasting anything here.
+  - type: input
+    id: version
+    attributes:
+      label: securitytrails-mcp version
+      placeholder: '1.0.0'
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: Output of `node -v`
+      placeholder: 'v22.11.0'
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: MCP host
+      placeholder: 'Claude Code / Claude Desktop / Cursor / VS Code / other'
+    validations:
+      required: true
+  - type: input
+    id: tool
+    attributes:
+      label: Which tool
+      placeholder: 'securitytrails_subdomains'
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Arguments that reproduce it
+      description: The tool arguments, with any sensitive target redacted.
+      render: json
+  - type: checkboxes
+    id: plan
+    attributes:
+      label: Checks
+      options:
+        - label: I confirmed this is not a plan-tier restriction (the error does not mention my subscription package)
+        - label: I confirmed I have remaining quota via `securitytrails_usage`
