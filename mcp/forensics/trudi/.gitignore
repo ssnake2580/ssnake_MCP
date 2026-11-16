@@ -1,0 +1,36 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# case outputs — never commit investigation artifacts (root-level only)
+/analysis/
+/exports/
+/reports/
+*.log
+*.csv
+# exclude generated/trace JSON but keep config JSON in the repo
+*_trace.json
+mft*.json
+
+# OS
+.DS_Store
+
+# Keep the committed case-study bundle for judges + the installer (overrides the
+# *_trace.json / *.log / *.csv ignores above). Evidence is never committed.
+!cases/**
+cases/**/evidence/
+# Per-case exports are run output (carved/extracted files), never part of the bundle.
+cases/*/exports/
+# Locally generated demo authentication keys.
+/demo/live-monitoring/secrets/

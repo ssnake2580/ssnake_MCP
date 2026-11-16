@@ -1,0 +1,42 @@
+// Copyright 2026 hdyrawan
+//
+// Minimal, hand-authored mirror of the health-check messages Velociraptor
+// servers expose. Field names, numbers, and the package name below are
+// copied from the upstream Velociraptor project's own proto definitions
+// so that this message is wire-compatible with a real
+// `www.velocidex.com/golang/velociraptor` server:
+//
+//   - api/proto/health.proto (HealthCheckRequest, HealthCheckResponse)
+//   - api/health.go (server-side handler: ignores the request entirely
+//     and returns SERVING unconditionally once a call authenticates)
+//
+// This project deliberately does NOT import the upstream
+// Velocidex/velociraptor Go module (it is a full DFIR server, not a thin
+// client library, and pulls in a large, unrelated dependency tree). This
+// file (together with visibility.proto and api.proto) instead defines
+// only the messages/RPCs this project actually calls, so the generated
+// client stub is small, auditable, and has no other capability. No VQL
+// execution, collection, hunt, or other RPC is defined here — see
+// docs/security-model.md and PROJECT_PLAN.md for why those remain out of
+// scope.
+//
+// Regenerate with (from the repository root):
+//   buf generate internal/velociraptor/veloapi
+syntax = "proto3";
+
+package proto;
+
+option go_package = "github.com/hdyrawan/agentic-velociraptor-mcp/internal/velociraptor/veloapi";
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+}

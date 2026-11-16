@@ -1,0 +1,313 @@
+"""Background job runner for carve-class forensic tools.
+
+A full-pcap tcpxtract carve (or bulk_extractor / foremost / photorec) runs for
+tens of minutes. Run synchronously it blocks the driving agent's whole turn and,
+on a client whose MCP call is time-bounded, invites a mid-run cancellation that
+can tear down the connection. A human analyst starts a long carve and keeps
+working other artifacts; `start_job` gives the agent the same option.
+
+`start_job` spawns the command detached (its own session, an exit-code sentinel
+file) and returns a `job_id` immediately. `job_status(job_id)` polls: while
+running it reports elapsed time and files-so-far; on completion it records the
+underlying command as a normal, citable `tool_call` (carrying the full stdout
+sidecar) exactly once, so a finding cites the job's collection the same way it
+would a synchronous run — the audit trail is identical. Partial output from a
+timed-out carve remains in `output_dir` and is surfaced as usable evidence.
+
+Stdlib only — nothing here drags a heavy import into the PreToolUse guard.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+from core.paths import trudi_cache_dir
+
+# Overridable in tests. One JSON state file per job: JOBS_DIR/<job_id>.json.
+JOBS_DIR = os.path.join(trudi_cache_dir(), "jobs")
+
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+
+def _new_job_id(tool: str) -> str:
+    stem = (tool or "job").replace("/", "_").replace(".", "_")
+    return f"{stem}-{os.urandom(6).hex()}"
+
+
+def _count_outputs(output_dir: str) -> int:
+    """Files produced in a carve's output dir so far (patchable in tests)."""
+    try:
+        return sum(1 for _ in os.scandir(output_dir))
+    except OSError:
+        return 0
+
+
+def start_job(cmd: list[str], tool: str, timeout: int, output_dir: str,
+              needs_sudo: bool = False, partial_ok: bool = False) -> dict:
+    """Spawn `cmd` detached under a hard `timeout` budget; return immediately
+    with a running-job handle. Never blocks.
+
+    partial_ok: a carve-style tool whose files are usable as produced. A run
+    that hits the budget after producing output is then a TRUNCATED success
+    (no absence claim may rest on it), not a failed tool needing closure."""
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    job_id = _new_job_id(tool)
+    jdir = os.path.join(JOBS_DIR, f"{job_id}.d")
+    os.makedirs(jdir, exist_ok=True)
+    stdout_file = os.path.join(jdir, "stdout")
+    stderr_file = os.path.join(jdir, "stderr")
+    exit_file = os.path.join(jdir, "exit")
+
+    import shlex
+    # `timeout` (coreutils) enforces the budget and exits 124 on expiry; run it
+    # under sudo so it can signal a root-owned carve child. The sentinel write
+    # (`echo $? > exit`) is what job_status polls for completion.
+    inner = " ".join(shlex.quote(c) for c in cmd)
+    prefix = ("sudo timeout" if needs_sudo else "timeout") + f" {int(timeout)}"
+    script = (f"{prefix} {inner} > {shlex.quote(stdout_file)} "
+              f"2> {shlex.quote(stderr_file)}; echo $? > {shlex.quote(exit_file)}")
+    proc = subprocess.Popen(
+        ["sh", "-c", script], stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+
+    state = {
+        "job_id": job_id, "tool": tool, "cmd": inner, "timeout": int(timeout),
+        "output_dir": output_dir, "pid": proc.pid,
+        "stdout_file": stdout_file, "stderr_file": stderr_file,
+        "exit_file": exit_file, "started": time.time(),
+        "status": "running", "collected": False, "call_id": None,
+        "partial_ok": bool(partial_ok),
+    }
+    with open(_job_path(job_id), "w") as f:
+        json.dump(state, f)
+    return {
+        "success": True, "status": "running", "job_id": job_id,
+        "output_dir": output_dir, "pid": proc.pid,
+        "hint": (f"BACKGROUND JOB STARTED (job_id={job_id}). This returned "
+                 f"immediately — the carve runs detached. Poll "
+                 f"misc.job_status(job_id='{job_id}') and keep investigating "
+                 f"other artifacts meanwhile; carved files appear in "
+                 f"{output_dir or '(stdout)'} and the finished job_status "
+                 f"result is the citable record."),
+    }
+
+
+def _read(path: str, cap: int = 8 * 1024 * 1024) -> str:
+    try:
+        with open(path, "rb") as f:
+            return f.read(cap).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def job_status(job_id: str) -> dict:
+    """Poll a job. Running → progress; finished → the collected tool result
+    (logged once with a citable _trudi_call_id)."""
+    path = _job_path(job_id)
+    if not os.path.exists(path):
+        return {"success": False, "status": "unknown",
+                "error": f"unknown job_id {job_id!r}"}
+    with open(path) as f:
+        state = json.load(f)
+    elapsed = round(time.time() - state["started"], 1)
+
+    if state.get("collected"):
+        return _finished_result(state, elapsed, cached=True)
+
+    if not os.path.exists(state["exit_file"]):
+        return {"success": True, "status": "running", "job_id": job_id,
+                "elapsed_seconds": elapsed,
+                "output_files_so_far": _count_outputs(state["output_dir"]),
+                "output_dir": state["output_dir"]}
+
+    # Completed — collect once.
+    rc_text = _read(state["exit_file"]).strip()
+    try:
+        rc = int(rc_text)
+    except ValueError:
+        rc = -1
+    timed_out = rc == 124
+    ok = _job_ok(state, rc, timed_out)
+    stdout = _read(state["stdout_file"])
+    stderr = _read(state["stderr_file"])
+    if timed_out:
+        stderr = (f"Command timed out after {state['timeout']}s"
+                  + (f"\n{stderr}" if stderr else ""))
+
+    # Log the underlying command as a normal, citable tool_call (once).
+    res = {
+        "success": ok, "stdout": stdout[:2000], "stderr": stderr[:2000],
+        "exit_code": rc, "truncated": len(stdout) > 2000 or (ok and timed_out), "retries": 0,
+        "elapsed_seconds": elapsed, "timed_out": timed_out,
+        "cmd": state["cmd"], "output_path": state["output_dir"],
+        "_stdout_full": stdout, "_stdout_chars": len(stdout),
+    }
+    try:
+        from core.executor import _log_tool
+        _log_tool(res)
+        cid = res.get("_trudi_call_id")
+    except Exception:
+        cid = None
+
+    state["status"] = "finished"
+    state["collected"] = True
+    state["call_id"] = cid
+    state["stdout_excerpt"] = stdout[:2000]
+    state["stderr_final"] = stderr[:2000]
+    state["exit_code"] = rc
+    state["timed_out"] = timed_out
+    with open(path, "w") as f:
+        json.dump(state, f)
+    return _finished_result(state, elapsed, cached=False)
+
+
+def _job_ok(state: dict, rc: int, timed_out: bool) -> bool:
+    """Exit 0 — or, for a partial_ok carve, a timeout that produced files."""
+    return rc == 0 or (bool(state.get("partial_ok")) and timed_out
+                       and _count_outputs(state.get("output_dir") or "") > 0)
+
+
+def _finished_result(state: dict, elapsed: float, cached: bool) -> dict:
+    n = _count_outputs(state["output_dir"])
+    out = {
+        "success": _job_ok(state, state["exit_code"], state["timed_out"]),
+        "status": "finished",
+        "job_id": state["job_id"], "exit_code": state["exit_code"],
+        "elapsed_seconds": elapsed, "timed_out": state["timed_out"],
+        "stdout": state.get("stdout_excerpt", ""),
+        "stderr": state.get("stderr_final", ""),
+        "output_files": n, "output_dir": state["output_dir"],
+        "_trudi_call_id": state.get("call_id"),
+        "note": ("already collected — cite _trudi_call_id for findings from "
+                 "this carve" if cached else
+                 "collected. Cite _trudi_call_id for findings from this carve; "
+                 "read specific carved files with read.output."),
+    }
+    if state["timed_out"]:
+        out["partial_output"] = (
+            f"{n} files already produced in {state['output_dir']} — usable "
+            f"despite the timeout")
+    return out
+
+
+def list_jobs() -> dict:
+    out = []
+    try:
+        for name in sorted(os.listdir(JOBS_DIR)):
+            if name.endswith(".json"):
+                with open(os.path.join(JOBS_DIR, name)) as f:
+                    s = json.load(f)
+                out.append({"job_id": s["job_id"], "status": s["status"],
+                            "cmd": s["cmd"][:80], "output_dir": s["output_dir"]})
+    except OSError:
+        pass
+    return {"success": True, "jobs": out, "count": len(out)}
+
+
+# ── In-process tool jobs (long-running MCP tools) ─────────────────────────────
+# Tools that measured > ~30 s across the recorded runs run as background tasks
+# inside the server: the whole tool call (wrapper parsing, self-logging, trace
+# identity) runs unchanged, it just no longer blocks the agent's turn. Jobs do
+# not survive a server restart; job_status then reports them as lost.
+
+# Always long (p50 over 30 s in the recorded traces): return a job_id at once.
+BACKGROUND_ALWAYS = frozenset({
+    "ewf_verify", "misc_clamscan_directory", "ez_recmd_dir",
+    "plaso_create_timeline", "plaso_create_targeted", "plaso_export_csv",
+    "plaso_export_json", "plaso_filter_incident_window",
+    "carve_bulk_extractor_scan", "carve_bulk_extractor_unallocated",
+    "carve_foremost_carve", "carve_scalpel_carve", "img_photorec_carve", "tsk_recover",
+    "yara_scan_directory", "yara_scan_memory_image",
+})
+# Long depending on input scope: run inline, become a job past INLINE_WAIT.
+BACKGROUND_IF_SLOW = frozenset({
+    "tsk_fls", "ez_evtxecmd", "ez_lecmd", "ez_jlecmd", "ez_pecmd", "ez_recmd_batch",
+    "ez_mftecmd", "ez_mftecmd_dir", "ez_sqlecmd", "misc_evtx_dump", "misc_evtx_filter",
+    "misc_chainsaw_hunt", "misc_hindsight_chrome", "misc_pff_export",
+    "misc_readpst_extract", "misc_usnparser_parse", "misc_usbdeviceforensics",
+    "misc_sqlite_recover", "strings_png_acropalypse",
+    # Phone parsers: ~20 s on a small extraction, tens of minutes on a full phone.
+    "mobile_aleapp", "mobile_mvt_ios_check_fs", "mobile_mvt_ios_check_backup",
+    "mobile_mvt_ios_decrypt_backup", "mobile_ios_apt",
+})
+INLINE_WAIT = float(os.environ.get("TRUDI_JOB_INLINE_WAIT") or "30")
+MAX_CONCURRENT = int(os.environ.get("TRUDI_JOB_SLOTS") or "3")
+
+_TASK_JOBS: dict = {}
+_SLOTS = None                    # asyncio.Semaphore, created in the server loop
+
+
+def background_mode(tool_name: str) -> str:
+    """'always' | 'if_slow' | '' for a mounted tool name."""
+    if tool_name in BACKGROUND_ALWAYS:
+        return "always"
+    if tool_name in BACKGROUND_IF_SLOW or tool_name.startswith("vol_"):
+        return "if_slow"
+    return ""
+
+
+def slots():
+    import asyncio
+    global _SLOTS
+    if _SLOTS is None:
+        _SLOTS = asyncio.Semaphore(MAX_CONCURRENT)
+    return _SLOTS
+
+
+def register_task(tool: str, task, args_summary: str) -> str:
+    job_id = _new_job_id(tool)
+    _TASK_JOBS[job_id] = {"job_id": job_id, "tool": tool, "args": args_summary[:300],
+                          "task": task, "started": time.time(), "status": "running"}
+    return job_id
+
+
+def mark_state(job_id: str, status: str) -> None:
+    if job_id in _TASK_JOBS:
+        _TASK_JOBS[job_id]["status"] = status
+
+
+def task_job_status(job_id: str) -> dict | None:
+    """None when job_id is not an in-process job (file-based carve jobs are
+    handled by job_status)."""
+    j = _TASK_JOBS.get(job_id)
+    if j is None:
+        return None
+    elapsed = round(time.time() - j["started"], 1)
+    task = j["task"]
+    if not task.done():
+        return {"success": True, "status": j["status"], "job_id": job_id, "tool": j["tool"],
+                "elapsed_seconds": elapsed}
+    base = {"status": "finished", "job_id": job_id, "tool": j["tool"], "elapsed_seconds": elapsed}
+    if task.cancelled():
+        return {**base, "success": False, "status": "cancelled", "error": "job was cancelled"}
+    exc = task.exception()
+    if exc is not None:
+        return {**base, "success": False, "error": f"{type(exc).__name__}: {exc}"}
+    res = task.result()
+    payload = res if isinstance(res, dict) else getattr(res, "structured_content", None)
+    if not isinstance(payload, dict):
+        # A tool whose result has only text content: keep the text.
+        blocks = getattr(res, "content", None) or []
+        text = "".join(getattr(b, "text", "") for b in blocks)
+        try:
+            import json as _json
+            payload = _json.loads(text)
+            if not isinstance(payload, dict):
+                payload = {"result": payload}
+        except Exception:
+            payload = {"result": text or str(res)}
+    return {**payload, **base, "success": payload.get("success", True) is not False}
+
+
+def active_task_jobs() -> list:
+    return [{"job_id": j["job_id"], "tool": j["tool"], "status": j["status"],
+             "elapsed_seconds": round(time.time() - j["started"], 1)}
+            for j in _TASK_JOBS.values() if not j["task"].done()]

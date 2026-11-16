@@ -1,0 +1,1832 @@
+"""Tests for tools/misc.py."""
+import os
+from core.readiness import state_fingerprint
+import pytest
+from unittest.mock import patch
+
+
+@pytest.fixture(autouse=True)
+def mock_run(run_ok):
+    # Optional binaries resolve as installed unless a test says otherwise, so
+    # argv tests do not depend on what this host has installed.
+    with patch("tools.misc.run", return_value=run_ok) as m, \
+         patch("tools.misc._bin_or_warn",
+               side_effect=lambda n: n if n.startswith("/") else f"/usr/bin/{n}"):
+        yield m
+
+
+class TestEvtxTools:
+    def test_evtx_dump(self, mock_run):
+        from tools.misc import evtx_dump
+        evtx_dump("/mnt/wkstn01/Windows/System32/winevt/Logs/Security.evtx")
+        assert mock_run.called
+
+    # ── legacy EVT detection (python-evtx silently returns <Events/> on EVT) ──
+    def test_sniff_event_log_formats(self, tmp_path):
+        from tools.misc import _sniff_event_log
+        evtx = tmp_path / "Security.evtx"; evtx.write_bytes(b"ElfFile\x00" + b"\x00" * 64)
+        evt = tmp_path / "SecEvent.Evt"; evt.write_bytes(b"\x30\x00\x00\x00LfLe" + b"\x00" * 64)
+        other = tmp_path / "x.bin"; other.write_bytes(b"MZ" + b"\x00" * 64)
+        assert _sniff_event_log(str(evtx)) == "evtx"
+        assert _sniff_event_log(str(evt)) == "evt"
+        assert _sniff_event_log(str(other)) == "unknown"
+        assert _sniff_event_log(str(tmp_path / "missing.evt")) == "unknown"
+
+    def test_evtx_dump_routes_legacy_evt_to_evtexport(self, mock_run, tmp_path):
+        from tools.misc import evtx_dump
+        evt = tmp_path / "SecEvent.Evt"; evt.write_bytes(b"\x30\x00\x00\x00LfLe" + b"\x00" * 64)
+        r = evtx_dump(str(evt))
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "evtexport" and cmd[-1] == str(evt) and "-m" in cmd
+        assert r["log_format"] == "evt" and "evtexport" in r["note"]
+
+    def test_evtx_dump_keeps_python_evtx_for_evtx(self, mock_run, tmp_path):
+        from tools.misc import evtx_dump
+        evtx = tmp_path / "Security.evtx"; evtx.write_bytes(b"ElfFile\x00" + b"\x00" * 64)
+        r = evtx_dump(str(evtx))
+        assert mock_run.call_args[0][0][0].endswith("evtx_dump.py")
+        assert r["log_format"] == "evtx"
+
+    def test_evtx_filter_refuses_legacy_evt(self, mock_run, tmp_path):
+        from tools.misc import evtx_filter
+        evt = tmp_path / "SysEvent.Evt"; evt.write_bytes(b"\x30\x00\x00\x00LfLe" + b"\x00" * 64)
+        with patch("subprocess.Popen") as p:
+            r = evtx_filter(str(evt), "4624,4625")
+        p.assert_not_called()
+        assert r["success"] is False and r["log_format"] == "evt"
+        assert "evtexport" in r["hint"] and r["matches"] == []
+
+    def test_evtx_dump_output_path(self, mock_run, tmp_path):
+        from tools.misc import evtx_dump
+        from unittest.mock import MagicMock
+        out = str(tmp_path / "security.xml")
+        # evtx_dump with output_path redirects stdout to a file via subprocess.run directly
+        mock_proc = MagicMock(returncode=0, stderr=b"")
+        with patch("subprocess.run", return_value=mock_proc):
+            r = evtx_dump("/logs/Security.evtx", output_path=out)
+        assert r["success"] is True
+
+    def _fake_popen(self, stdout_text: str, stderr_text: str = "",
+                    returncode: int = 0):
+        """Build a Popen stand-in whose stdout iterates the given text and
+        whose wait/terminate are inert. Used so evtx_filter's streaming
+        loop can be exercised without spawning a real subprocess."""
+        import io
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.stdout = io.StringIO(stdout_text)
+        m.stderr = io.StringIO(stderr_text)
+        m.returncode = returncode
+        m.terminate = MagicMock()
+        m.kill = MagicMock()
+        m.wait = MagicMock(return_value=returncode)
+        return m
+
+    def test_evtx_filter_streams_matches(self):
+        """Happy path: stream emits 3 events with different IDs; filter keeps
+        the requested one."""
+        from tools.misc import evtx_filter
+        xml = (
+            '<?xml version="1.1" encoding="utf-8" standalone="yes" ?>\n'
+            '<Events>\n'
+            '<Event xmlns="ns"><System><EventID>4624</EventID></System><Data>a</Data></Event>\n'
+            '\n'
+            '<Event xmlns="ns"><System><EventID>4625</EventID></System><Data>b</Data></Event>\n'
+            '\n'
+            '<Event xmlns="ns"><System><EventID>4624</EventID></System><Data>c</Data></Event>\n'
+            '</Events>\n'
+        )
+        with patch("subprocess.Popen", return_value=self._fake_popen(xml)):
+            r = evtx_filter("/logs/Security.evtx", event_ids="4625")
+        assert r["success"] is True
+        assert r["events_scanned"] == 3
+        assert r["matches_found"] == 1
+        assert "4625" in r["events"][0]
+        assert "4624" not in r["events"][0]
+        assert r["cap_hit"] is False
+        assert r["wall_clock_timed_out"] is False
+
+    def test_evtx_filter_persists_matched_events(self):
+        # F-2: the matched events must be fetchable by the reviewer — logging
+        # stdout "" made the call an empty COMPLETE source (absence by default).
+        from core.execution_log import log
+        from tools.misc import evtx_filter
+        xml = ('<Event xmlns="ns"><System><EventID>4720</EventID></System>'
+               '<Data Name="TargetUserName">defaultprinter</Data></Event>\n')
+        with patch("subprocess.Popen", return_value=self._fake_popen(xml)):
+            r = evtx_filter("/logs/Security.evtx", event_ids="4720")
+        assert r["matches_found"] == 1
+        e = [x for x in log._entries if x.get("type") == "tool_call" and "evtx_dump" in (x.get("cmd") or "")][-1]
+        assert e["stdout_chars"] > 0 and "defaultprinter" in e["stdout_excerpt"]
+
+    def test_evtx_filter_respects_max_results(self):
+        """Once max_results is reached, the streamer breaks early — cap_hit
+        is reported so the caller knows there may be more."""
+        from tools.misc import evtx_filter
+        events = "\n".join(
+            f'<Event xmlns="ns"><System><EventID>4625</EventID></System><Data>{i}</Data></Event>'
+            for i in range(10)
+        )
+        xml = f'<Events>\n{events}\n</Events>\n'
+        with patch("subprocess.Popen", return_value=self._fake_popen(xml)):
+            r = evtx_filter("/logs/Security.evtx", event_ids="4625",
+                            max_results=3)
+        assert r["matches_found"] == 3
+        assert r["cap_hit"] is True
+
+    def test_evtx_filter_rejects_empty_ids(self):
+        from tools.misc import evtx_filter
+        r = evtx_filter("/logs/Security.evtx", event_ids=" , ")
+        assert r["success"] is False
+        assert "no valid event_ids" in r["error"]
+
+    def test_evtx_filter_handles_oversized_event(self):
+        """A single Event larger than EVENT_BYTE_CAP must be dropped and the
+        streamer must resync — it must NOT buffer unboundedly."""
+        from tools.misc import evtx_filter
+        huge = "<Data>" + ("x" * 250_000) + "</Data>"
+        xml = (
+            '<Events>\n'
+            f'<Event xmlns="ns"><System><EventID>4625</EventID></System>{huge}</Event>\n'
+            '<Event xmlns="ns"><System><EventID>4625</EventID></System><Data>ok</Data></Event>\n'
+            '</Events>\n'
+        )
+        with patch("subprocess.Popen", return_value=self._fake_popen(xml)):
+            r = evtx_filter("/logs/Security.evtx", event_ids="4625")
+        assert r["oversized_events_dropped"] == 1
+        assert r["matches_found"] == 1
+        assert "ok" in r["events"][0]
+
+
+class TestRegripper:
+    def test_regripper_hive(self, mock_run):
+        from tools.misc import regripper_hive
+        regripper_hive("/mnt/wkstn01/Windows/System32/config/SYSTEM")
+        cmd = mock_run.call_args[0][0]
+        assert "rip" in " ".join(cmd) or "regripper" in " ".join(cmd)
+
+    def test_regripper_list_plugins(self, mock_run):
+        from tools.misc import regripper_list_plugins
+        regripper_list_plugins()
+        assert mock_run.called
+
+
+class TestClamScan:
+    def test_clamscan_file(self, mock_run):
+        from tools.misc import clamscan_file
+        clamscan_file("/malware/sample.exe")
+        cmd = mock_run.call_args[0][0]
+        assert "clamscan" in cmd
+
+    def test_clamscan_directory(self, mock_run, tmp_path):
+        from tools.misc import clamscan_directory
+        clamscan_directory(str(tmp_path))
+        cmd = mock_run.call_args[0][0]
+        assert "clamscan" in cmd
+        assert "-r" in cmd
+
+    def test_clamscan_declares_exit_policy(self, mock_run):
+        # clamscan exit 1 = infected — a result, not a failure.
+        from tools.misc import clamscan_file
+        clamscan_file("/malware/sample.exe")
+        kw = mock_run.call_args[1]
+        assert 1 in kw["success_codes"] and 2 not in kw["success_codes"]
+        assert "infected" in kw["exit_meanings"][1]
+
+
+class TestPdfTools:
+    def test_pdfid_scan(self, mock_run):
+        from tools.misc import pdfid_scan
+        pdfid_scan("/evidence/malicious.pdf")
+        assert mock_run.called
+
+    def test_pdf_parser_analyze(self, mock_run):
+        from tools.misc import pdf_parser_analyze
+        pdf_parser_analyze("/evidence/malicious.pdf")
+        assert mock_run.called
+
+    def test_pdf_parser_with_object_id(self, mock_run):
+        from tools.misc import pdf_parser_analyze
+        pdf_parser_analyze("/evidence/malicious.pdf", object_id=5)
+        assert mock_run.called
+
+
+class TestPeTools:
+    def test_pe_scanner(self, mock_run):
+        from tools.misc import pe_scanner
+        pe_scanner("/malware/sample.exe")
+        # pe-scanner requires -f/--file (a bare positional is an argparse error)
+        assert mock_run.call_args[0][0] == [
+            "/usr/local/bin/pe-scanner", "-f", "/malware/sample.exe"]
+
+    def test_pe_carver(self, mock_run, tmp_path):
+        from tools.misc import pe_carver
+        pe_carver("/malware/blob.bin", str(tmp_path / "carved"))
+        assert mock_run.called
+
+    def test_packerid(self, mock_run):
+        from tools.misc import packerid
+        packerid("/malware/sample.exe")
+        assert mock_run.called
+
+
+class TestScheduledTasks:
+    def test_parse_scheduled_tasks(self, tmp_path):
+        from tools.misc import parse_scheduled_tasks
+        tasks_dir = tmp_path / "Tasks"
+        tasks_dir.mkdir()
+        (tasks_dir / "evil_task.xml").write_text(
+            '<?xml version="1.0"?><Task><Actions><Exec>'
+            '<Command>powershell.exe</Command>'
+            '</Exec></Actions></Task>'
+        )
+        r = parse_scheduled_tasks(str(tasks_dir))
+        assert r["success"] is True
+        assert r["task_count"] == 1
+
+    def test_parse_scheduled_tasks_missing_dir(self):
+        from tools.misc import parse_scheduled_tasks
+        from unittest.mock import patch
+        from core.execution_log import ExecutionLog
+        import tempfile, os
+        # A nonexistent Tasks dir is a FAILED enumeration (N): it must not
+        # silently pass as "0 tasks examined" and satisfy the look-duty.
+        fn = getattr(parse_scheduled_tasks, "fn", parse_scheduled_tasks)
+        l = ExecutionLog(); l.configure("PST", os.path.join(tempfile.mkdtemp(), "t.json"), save_session=False)
+        with patch("core.execution_log.log", l):
+            r = fn("/nonexistent/Tasks")
+        assert r["success"] is False and "not a directory" in r["error"]
+
+
+class TestUsnParser:
+    def test_usnparser(self, mock_run):
+        from tools.misc import usnparser_parse
+        usnparser_parse("/mnt/wkstn01/$UsnJrnl")
+        assert mock_run.called
+
+
+class TestHindsight:
+    def test_hindsight_chrome(self, mock_run, tmp_path):
+        from tools.misc import hindsight_chrome
+        hindsight_chrome("/mnt/wkstn01/Users/mhill/AppData/Local/Google/Chrome/User Data/Default", str(tmp_path))
+        assert mock_run.called
+
+    def _hs_fmt(self, mock_run):
+        cmd = mock_run.call_args[0][0]
+        return cmd[cmd.index("-f") + 1]
+
+    def test_hindsight_default_format_is_valid(self, mock_run, tmp_path):
+        from tools.misc import hindsight_chrome
+        hindsight_chrome("/p", str(tmp_path))
+        assert self._hs_fmt(mock_run) == "jsonl"   # not the old invalid 'json'
+
+    def test_hindsight_json_alias_mapped_to_jsonl(self, mock_run, tmp_path):
+        from tools.misc import hindsight_chrome
+        r = hindsight_chrome("/p", str(tmp_path), output_format="json")
+        assert self._hs_fmt(mock_run) == "jsonl" and r["output_format"] == "jsonl"
+
+    def test_hindsight_invalid_format_falls_back(self, mock_run, tmp_path):
+        from tools.misc import hindsight_chrome
+        hindsight_chrome("/p", str(tmp_path), output_format="csv")   # csv unsupported → xlsx
+        assert self._hs_fmt(mock_run) == "xlsx"
+
+    def test_hindsight_garbage_format_falls_back_to_jsonl(self, mock_run, tmp_path):
+        from tools.misc import hindsight_chrome
+        hindsight_chrome("/p", str(tmp_path), output_format="pdf")
+        assert self._hs_fmt(mock_run) == "jsonl"
+
+    def test_hindsight_env_carries_py310_utc_shim(self, mock_run, tmp_path, monkeypatch):
+        # /opt/pyhindsight is Python 3.10; pyhindsight uses datetime.UTC (3.11+).
+        import subprocess, sys
+        from tools.misc import hindsight_chrome
+        monkeypatch.setenv("PYTHONPATH", "/prior")
+        hindsight_chrome("/p", str(tmp_path))
+        cmd, kw = mock_run.call_args[0][0], mock_run.call_args[1]
+        assert cmd[0] == "/usr/local/bin/hindsight.py" and cmd[cmd.index("-i") + 1] == "/p"
+        shim, prior = kw["env"]["PYTHONPATH"].split(os.pathsep)
+        assert prior == "/prior" and kw["env"]["PATH"] == os.environ["PATH"]
+        assert os.path.isfile(os.path.join(shim, "sitecustomize.py"))
+        # the shim really defines datetime.UTC in a child interpreter
+        out = subprocess.run(
+            [sys.executable, "-c", "import datetime; print(datetime.UTC is datetime.timezone.utc)"],
+            env={**os.environ, "PYTHONPATH": shim}, capture_output=True, text=True)
+        assert out.stdout.strip() == "True"
+
+    def test_hindsight_valid_format_passthrough(self, mock_run, tmp_path):
+        from tools.misc import hindsight_chrome
+        hindsight_chrome("/p", str(tmp_path), output_format="sqlite")
+        assert self._hs_fmt(mock_run) == "sqlite"
+
+
+def _seed_log_with_dair(tmp_path):
+    """Helper: configure log + seed a dair_call so finding gates can be exercised."""
+    from core.execution_log import ExecutionLog
+    l = ExecutionLog()
+    l.configure("TEST", str(tmp_path / "trace.json"))
+    l.record_dair_call("Triage", "", False, "", "", "stay", "")
+    return l
+
+
+def _seed_log_ready_for_confirmed(tmp_path, description: str = ""):
+    """Seed log with dair_call + tool_call + reason_hypothesize +
+    reason_confidence_score + reason_cite_check + reason_evaluate_finding
+    so all gates (dair_required / confirmed_requires_supported_evaluate /
+    confidence_and_citation / hypothesize_required) are satisfied for
+    CONFIRMED-tier findings.
+
+    description: if provided, the seeded reason_confidence_score and
+    reason_cite_check entries carry inputs.user_message containing the
+    description string so the confidence_and_citation gate's substring match
+    succeeds. Pass the exact description the test will record; the helper
+    normalizes it.
+    """
+    from core.execution_log import ExecutionLog
+    l = ExecutionLog()
+    l.configure("TEST", str(tmp_path / "trace.json"))
+    l.record_dair_call("Triage", "", False, "", "", "stay", "")
+    tool_id = l.record_tool_call("vol.psscan", True, False, 0, 0)
+    # hypothesize_required satisfaction (only matters when description
+    # contains a keyword from _HYPOTHESIZE_KEYWORDS).
+    l.record_reason_call("reason_hypothesize", True, "hypothesis OK", {})
+    # confidence_and_citation satisfaction: matching user_message.
+    _inputs = {"user_message": (description or "")[:200].lower()} if description else None
+    l.record_reason_call(
+        "reason_confidence_score",
+        True,
+        'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED", "score": 0.95}',
+        {},
+        inputs=_inputs,
+    )
+    l.record_reason_call(
+        "reason_cite_check",
+        True,
+        'CITE_CHECK:\n{"verdict": "ALL_CITED"}',
+        {},
+        inputs=_inputs,
+    )
+    # confirmed_requires_supported_evaluate satisfaction.
+    l.record_reason_call(
+        "reason_evaluate_finding", True,
+        "EVIDENCE SUPPORT: confirmed.\nVERDICT: SUPPORTED — evidence sound.",
+        {},
+    )
+    return l, tool_id
+
+
+class TestRecordFinding:
+    def test_record_finding_returns_success(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "perfsvc.exe timestomped")
+        with patch("core.execution_log.log", l):
+            r = record_finding("PerfSvc.exe timestomped", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+        assert r["confidence"] == "CONFIRMED"
+
+    def test_record_finding_stores_linked_call_id(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "perfsvc.exe timestomped")
+        with patch("core.execution_log.log", l):
+            record_finding("PerfSvc.exe timestomped", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        finding_entries = [e for e in l._entries if e["type"] == "finding"]
+        assert finding_entries[0]["linked_call_id"] == tid
+
+    def test_record_finding_default_linked_call_id_zero(self, tmp_path):
+        # SUSPECTED is the looser tier — no confidence_and_citation /
+        # hypothesize_required checks. Documents
+        # that linked_call_id defaults to 0 when omitted.
+        from tools.misc import record_finding
+        l = _seed_log_with_dair(tmp_path)
+        with patch("core.execution_log.log", l):
+            record_finding("test finding", "SUSPECTED", "vol.netscan", input_call_ids=[1])
+        finding_entries = [e for e in l._entries if e["type"] == "finding"]
+        assert finding_entries[0]["linked_call_id"] == 0
+
+
+class TestRecordFindingLinkedCallIdGate:
+    """confirmed_requires_linked_call_id: CONFIRMED needs a non-zero linked_call_id.
+    linked_call_id_must_exist: the id must point at a real trace entry."""
+
+    def test_confirmed_with_zero_linked_call_id_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, _ = _seed_log_ready_for_confirmed(tmp_path, "malicious .exe")
+        with patch("core.execution_log.log", l):
+            r = record_finding("malicious .exe", "CONFIRMED", "ez.mftecmd", linked_call_id=0, input_call_ids=[1])
+        assert r["success"] is False
+        assert "linked_call_id" in r["error"]
+
+    def test_confirmed_with_unknown_linked_call_id_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, _ = _seed_log_ready_for_confirmed(tmp_path, "malicious .exe")
+        with patch("core.execution_log.log", l):
+            r = record_finding("malicious .exe", "CONFIRMED", "ez.mftecmd", linked_call_id=99999, input_call_ids=[1])
+        assert r["success"] is False
+        assert "99999" in r["error"]
+        assert "not found" in r["error"]
+
+    def test_confirmed_with_valid_linked_call_id_succeeds(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "malicious .exe")
+        with patch("core.execution_log.log", l):
+            r = record_finding("malicious .exe", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+
+    def test_suspected_with_zero_linked_call_id_allowed(self, tmp_path):
+        # confirmed_requires_linked_call_id only restricts CONFIRMED; the
+        # loosest tier may omit linked_call_id.
+        from tools.misc import record_finding
+        l = _seed_log_with_dair(tmp_path)
+        with patch("core.execution_log.log", l):
+            r = record_finding("possible anomaly", "SUSPECTED", "vol.netscan", linked_call_id=0, input_call_ids=[1])
+        assert r["success"] is True
+
+    def test_suspected_with_unknown_linked_call_id_refused(self, tmp_path):
+        # linked_call_id_must_exist applies to any tier when linked_call_id != 0.
+        from tools.misc import record_finding
+        l = _seed_log_with_dair(tmp_path)
+        with patch("core.execution_log.log", l):
+            r = record_finding("possible anomaly", "SUSPECTED", "vol.netscan", linked_call_id=42, input_call_ids=[1])
+        assert r["success"] is False
+        assert "42" in r["error"]
+
+
+class TestRecordFindingEvaluateVerdictGate:
+    """confirmed_requires_supported_evaluate: CONFIRMED refused if most recent
+    reason.evaluate_finding verdict is CHALLENGED."""
+
+    def test_confirmed_with_recent_challenged_evaluate_refused(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        l.record_reason_call(
+            "reason_evaluate_finding", True,
+            "EVIDENCE SUPPORT: weak.\nVERDICT: CHALLENGED — YARA-only evidence.",
+            {},
+        )
+        with patch("core.execution_log.log", l):
+            r = record_finding("attacker tool", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert "CHALLENGED" in r["error"]
+        assert r.get("evaluate_verdict") == "CHALLENGED"
+
+    def test_confirmed_with_recent_supported_evaluate_succeeds(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "attacker tool")
+        with patch("core.execution_log.log", l):
+            r = record_finding("attacker tool", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+
+    def test_most_recent_supported_wins_over_older_challenged(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        # hypothesize_required + confidence_and_citation satisfaction
+        # (description has no keyword but CONFIRMED still needs confidence
+        # + cite_check).
+        _ins = {"user_message": "attacker tool"}
+        l.record_reason_call("reason_hypothesize", True, "hypothesis OK", {})
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=_ins)
+        # Older CHALLENGED followed by newer SUPPORTED — should succeed.
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: CHALLENGED", {})
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        with patch("core.execution_log.log", l):
+            r = record_finding("attacker tool", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+
+    def test_most_recent_challenged_refuses_even_with_older_supported(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: CHALLENGED", {})
+        with patch("core.execution_log.log", l):
+            r = record_finding("attacker tool", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert "CHALLENGED" in r["error"]
+
+    def test_uncertain_verdict_blocks_confirmed(self, tmp_path):
+        # VERDICT: UNCERTAIN is insufficient for CONFIRMED — it means the
+        # reviewer could not confirm, not that they supported the claim.
+        # The gate now requires an explicit SUPPORTED verdict.
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: UNCERTAIN", {})
+        with patch("core.execution_log.log", l):
+            r = record_finding("attacker tool", "CONFIRMED", "ez.mftecmd",
+                               linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert r["gate"] == "evidence_strength"
+        assert r["detail_gate"] == "confirmed_requires_supported_evaluate"
+        assert "UNCERTAIN" in r["evaluate_verdict"]
+        # Auto-emits self_correction just like CHALLENGED
+        sc = [e for e in l._entries if e["type"] == "self_correction"]
+        assert sc
+
+    def test_evaluate_matched_by_description_not_cross_contaminated(self, tmp_path):
+        # Bug A regression: with two findings reviewed in one batch, a DIFFERENT
+        # finding's CHALLENGED verdict (more recent) must NOT block this finding
+        # whose own evaluate_finding was SUPPORTED. The gate matches the
+        # evaluate by description, not by 'most recent'.
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        a_ins = {"user_message": "cron persistence root crontab evil.sh"}
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=a_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=a_ins)
+        # A's evaluate (SUPPORTED, echoes A's description)
+        l.record_reason_call("reason_evaluate_finding", True,
+                             "FINDING: cron persistence root crontab evil.sh\nVERDICT: SUPPORTED",
+                             {}, inputs=a_ins)
+        # B's evaluate (CHALLENGED, more recent, a DIFFERENT finding)
+        l.record_reason_call("reason_evaluate_finding", True,
+                             "FINDING: injection marker pid 488\nVERDICT: CHALLENGED",
+                             {}, inputs={"user_message": "injection marker pid 488"})
+        with patch("core.execution_log.log", l):
+            r = record_finding("Cron persistence root crontab evil.sh", "CONFIRMED",
+                               "ez.mftecmd", linked_call_id=tid,
+                               tested_hypothesis_id="H0001", input_call_ids=[tid])
+        assert r["success"] is True
+
+    def test_challenged_refusal_auto_emits_self_correction(self, tmp_path):
+        # Self-correction auto-emit: when CONFIRMED is refused due to CHALLENGED verdict,
+        # a self_correction entry should be appended automatically.
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: CHALLENGED", {})
+        with patch("core.execution_log.log", l):
+            r = record_finding("overclaimed", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        sc = [e for e in l._entries if e["type"] == "self_correction"]
+        assert len(sc) == 1
+        # The gate uses a distinct trigger so it's distinguishable from the
+        # auto-emit inside reason.evaluate_finding (which uses
+        # "evaluate_challenged"). This one specifically captures "agent
+        # attempted to push CONFIRMED through despite CHALLENGED verdict".
+        assert sc[0]["trigger"] == "evaluate_challenged_gate_refused"
+
+
+class TestRecordFindingDairGate:
+    """Any finding (any tier) requires a recent dair_call."""
+
+    def test_finding_without_any_dair_refused(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_reason_call("reason_evaluate_finding", True, "ok", {})
+        with patch("core.execution_log.log", l):
+            r = record_finding("CONFIRMED claim", "CONFIRMED", "ez.mftecmd", input_call_ids=[1])
+        assert r["success"] is False
+        assert "dair_assess" in r["error"]
+        assert all(e["type"] != "finding" for e in l._entries)
+
+    def test_suspected_without_dair_also_refused(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        with patch("core.execution_log.log", l):
+            r = record_finding("anomaly", "SUSPECTED", "vol.netscan", input_call_ids=[1])
+        assert r["success"] is False
+        assert "dair_assess" in r["error"]
+
+    def test_dair_engaged_anywhere_passes_dair_required(self, tmp_path):
+        # dair_required checks the whole trace, not a window — a long batch that
+        # pushes the dair_call far back must NOT trip it (a different gate may
+        # still refuse for its own reasons, but not dair_required).
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        for _ in range(31):
+            l.record_reason_call("reason_hypothesize", True, "ok", {})
+        with patch("core.execution_log.log", l):
+            r = record_finding("anomaly", "SUSPECTED", "vol.netscan", input_call_ids=[1])
+        # SUSPECTED skips the confidence/evaluate gates; with DAIR engaged it records.
+        assert r.get("gate") != "dair_required"
+
+
+class TestRecordFindingEvaluateGate:
+    """CONFIRMED tier additionally requires a recent reason.evaluate_finding."""
+
+    def test_confirmed_without_recent_evaluate_refused(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        with patch("core.execution_log.log", l):
+            r = record_finding("malicious .exe", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert "reason.evaluate_finding" in r["error"]
+        assert all(e["type"] != "finding" for e in l._entries)
+
+    def test_confirmed_with_recent_evaluate_succeeds(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "malicious .exe")
+        with patch("core.execution_log.log", l):
+            r = record_finding("malicious .exe", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+
+    def test_suspected_with_dair_does_not_require_evaluate(self, tmp_path):
+        # SUSPECTED is the loose tier — only dair_required is checked.
+        from tools.misc import record_finding
+        l = _seed_log_with_dair(tmp_path)
+        with patch("core.execution_log.log", l):
+            r = record_finding("anomaly observed", "SUSPECTED", "vol.netscan", input_call_ids=[1])
+        assert r["success"] is True
+
+    def test_stale_evaluate_beyond_30_entries_refused(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("TEST", str(tmp_path / "trace.json"))
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        # 31 dair_calls push the evaluate call out of the 30-entry window
+        for _ in range(31):
+            l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        with patch("core.execution_log.log", l):
+            r = record_finding("malicious .exe", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert "reason.evaluate_finding" in r["error"]
+
+
+# ── New tool wrappers ─────────────────────────────────────────────────────────
+
+class TestPffExport:
+    def test_pffexport_missing_binary_returns_error(self, tmp_path, monkeypatch):
+        from tools.misc import pff_export
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        out_dir = tmp_path / "exports"
+        out_dir.mkdir()
+        r = pff_export("/tmp/fake.pst", str(out_dir))
+        assert r["success"] is False
+        assert "pffexport not installed" in r["error"]
+
+    def test_pffexport_calls_binary_when_available(self, tmp_path, monkeypatch):
+        from tools.misc import pff_export
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: "/usr/bin/pffexport")
+        captured = {}
+        monkeypatch.setattr("tools.misc.run", lambda cmd, **kw: captured.setdefault("cmd", cmd) or {"success": True})
+        out_dir = tmp_path / "exports"
+        out_dir.mkdir()
+        pff_export("/tmp/x.pst", str(out_dir), mode="all")
+        assert captured["cmd"][0] == "/usr/bin/pffexport"
+        assert "-m" in captured["cmd"]
+        assert "all" in captured["cmd"]
+        assert "-q" in captured["cmd"]  # quiet: no progress banner in the trace excerpt
+
+    def test_pffexport_refuses_evidence_output_path(self):
+        from tools.misc import pff_export
+        import pytest
+        with pytest.raises(ValueError):
+            pff_export("/tmp/x.pst", "/mnt/rd01/extract")
+
+
+class TestReadpstExtract:
+    def test_readpst_missing_binary(self, tmp_path, monkeypatch):
+        from tools.misc import readpst_extract
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        out_dir = tmp_path / "exports"
+        out_dir.mkdir()
+        r = readpst_extract("/tmp/x.pst", str(out_dir))
+        assert r["success"] is False
+
+    def test_readpst_invokes_binary(self, tmp_path, monkeypatch):
+        from tools.misc import readpst_extract
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: "/usr/bin/readpst")
+        captured = {}
+        monkeypatch.setattr("tools.misc.run", lambda cmd, **kw: captured.setdefault("cmd", cmd) or {"success": True})
+        out_dir = tmp_path / "exports"
+        out_dir.mkdir()
+        readpst_extract("/tmp/x.pst", str(out_dir))
+        assert "/usr/bin/readpst" == captured["cmd"][0]
+        assert "-o" in captured["cmd"]
+        assert "-q" in captured["cmd"]  # quiet: only errors, no progress banner
+
+
+class TestDensityscout:
+    def test_densityscout_missing_binary(self, monkeypatch):
+        from tools.misc import densityscout_scan
+        import os
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        # Also ensure the fallback path doesn't exist
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        r = densityscout_scan("/tmp/x.exe")
+        assert r["success"] is False
+
+
+class TestChainsawHunt:
+    def test_chainsaw_missing_binary(self, monkeypatch):
+        from tools.misc import chainsaw_hunt
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        r = chainsaw_hunt("/tmp/evtx_dir")
+        assert r["success"] is False
+        assert "chainsaw not installed" in r["error"]
+
+
+class TestCapaAnalyze:
+    def test_capa_missing_binary(self, monkeypatch):
+        from tools.misc import capa_analyze
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        r = capa_analyze("/tmp/x.exe")
+        assert r["success"] is False
+        assert "flare-capa" in r["error"]
+
+
+class TestOlevbaScan:
+    def test_olevba_missing_binary(self, monkeypatch):
+        from tools.misc import olevba_scan
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        r = olevba_scan("/tmp/x.docx")
+        assert r["success"] is False
+        assert "oletools" in r["error"]
+
+
+class TestMraptorScan:
+    def test_mraptor_missing_binary(self, monkeypatch):
+        from tools.misc import mraptor_scan
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        r = mraptor_scan("/tmp/x.docx")
+        assert r["success"] is False
+
+
+class TestUsbDeviceForensics:
+    """-r is walked recursively and every file loaded as a hive 3x: the wrapper
+    stages symlinks to SYSTEM + SOFTWARE (+ INF/setupapi.dev.log) only."""
+
+    @staticmethod
+    def _capture(mock_run):
+        seen = {}
+
+        def _side(cmd, **kw):
+            stage = cmd[cmd.index("-r") + 1]
+            seen["cmd"], seen["kw"] = list(cmd), kw
+            seen["files"] = {n: os.readlink(os.path.join(stage, n))
+                             for n in os.listdir(stage)} if os.path.isdir(stage) else None
+            seen["stage"] = stage
+            return {"success": True, "stdout": "", "stderr": "", "exit_code": 0,
+                    "truncated": False, "cmd": " ".join(cmd)}
+        mock_run.side_effect = _side
+        return seen
+
+    def _win(self, tmp_path):
+        cfg = tmp_path / "Windows" / "System32" / "config"
+        cfg.mkdir(parents=True)
+        for n in ("SYSTEM", "SOFTWARE", "COMPONENTS", "SAM"):
+            (cfg / n).write_bytes(b"regf")
+        (cfg / "RegBack").mkdir()
+        (cfg / "RegBack" / "SYSTEM").write_bytes(b"regf")
+        inf = tmp_path / "Windows" / "INF"
+        inf.mkdir()
+        (inf / "setupapi.dev.log").write_text("x")
+        return cfg, inf
+
+    def test_config_dir_staged_with_timeout_and_output(self, mock_run, tmp_path):
+        from tools.misc import usbdeviceforensics
+        cfg, inf = self._win(tmp_path)
+        seen = self._capture(mock_run)
+        out = str(tmp_path / "exports" / "usb.tsv")
+        r = usbdeviceforensics(str(cfg), output_path=out)
+        cmd = seen["cmd"]
+        assert cmd[:2] == ["/usr/local/bin/usbdeviceforensics", "-r"]
+        assert seen["stage"] != str(cfg)
+        assert seen["files"] == {"SYSTEM": str(cfg / "SYSTEM"),
+                                 "SOFTWARE": str(cfg / "SOFTWARE"),
+                                 "setupapi.dev.log": str(inf / "setupapi.dev.log")}
+        assert seen["kw"]["timeout"] >= 600
+        r0 = {"stdout": "x", "_stdout_full": "x"}
+        seen["kw"]["classify"](r0, "x", "")        # names the evidence read
+        assert r0["_stdout_full"].startswith(f"Staged input: {cfg / 'SYSTEM'}\n")
+        assert cmd[cmd.index("-o") + 1] == out and cmd[cmd.index("-f") + 1] == "tsv"
+        assert r["output_path"] == out and len(r["staged_inputs"]) == 3
+        assert not os.path.exists(seen["stage"])          # scratch cleaned up
+        assert (cfg / "SYSTEM").exists()                  # never the targets
+
+    def test_hive_file_staged(self, mock_run, tmp_path):
+        from tools.misc import usbdeviceforensics
+        cfg, _ = self._win(tmp_path)
+        seen = self._capture(mock_run)
+        usbdeviceforensics(str(cfg / "SYSTEM"))
+        assert set(seen["files"]) == {"SYSTEM", "SOFTWARE", "setupapi.dev.log"}
+
+    def test_directory_without_system_passed_through(self, mock_run, tmp_path):
+        from tools.misc import usbdeviceforensics
+        usbdeviceforensics(str(tmp_path))
+        assert mock_run.call_args[0][0] == ["/usr/local/bin/usbdeviceforensics", "-r", str(tmp_path)]
+        assert mock_run.call_args[1]["timeout"] >= 600
+
+    def test_runs_as_background_job_when_slow(self):
+        from core.jobs import background_mode
+        assert background_mode("misc_usbdeviceforensics") == "if_slow"
+
+    def test_output_into_evidence_refused(self):
+        from tools.misc import usbdeviceforensics
+        with pytest.raises(ValueError):
+            usbdeviceforensics("/mnt/x/SYSTEM", output_path="/mnt/x/usb.tsv")
+
+
+class TestToolUnavailable:
+    """A missing optional binary fails fast with a typed status and the tool
+    is dropped from the manifest DAIR prescribes from."""
+
+    @pytest.mark.parametrize("fn,args", [
+        ("chainsaw_hunt", ("/tmp/evtx",)), ("capa_analyze", ("/tmp/x.exe",)),
+        ("olevba_scan", ("/tmp/x.doc",)), ("mraptor_scan", ("/tmp/x.doc",)),
+        ("densityscout_scan", ("/tmp/x.exe",)), ("usnparser_parse", ("/tmp/$J",)),
+    ])
+    def test_typed_failure_without_running(self, mock_run, monkeypatch, fn, args):
+        import tools.misc as misc
+        monkeypatch.setattr("tools.misc._bin_or_warn", lambda name: None)
+        r = getattr(misc, fn)(*args)
+        assert r["success"] is False and r["status"] == "tool_unavailable"
+        assert "not installed" in r["error"]
+        assert not mock_run.called
+
+    def test_uninstalled_tools_excluded_from_manifest(self, monkeypatch):
+        import tools.tool_capabilities as tc
+        monkeypatch.setattr(tc.shutil, "which",
+                            lambda n: None if n == "chainsaw" else f"/usr/bin/{n}")
+        assert "misc.chainsaw_hunt" in tc.unavailable_tools()
+        assert "misc.chainsaw_hunt" not in tc.allowed_tool_names()
+        assert "misc.chainsaw_hunt" in tc.unknown_priority_tools(["misc.chainsaw_hunt"])
+        text = tc.format_tool_manifest_for_prompt(max_tools_per_capability=50)
+        assert "misc.chainsaw_hunt" not in text and "ez.evtxecmd" in text
+        monkeypatch.setattr(tc.shutil, "which", lambda n: f"/usr/bin/{n}")
+        assert "misc.chainsaw_hunt" in tc.allowed_tool_names()
+
+
+class TestSrumExport:
+    def test_esedbexport_argv_and_tables(self, monkeypatch, tmp_path):
+        from tools.misc import srum_export
+        out = tmp_path / "exports" / "srum"
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"], captured["kw"] = cmd, kw
+            exp = out / "srudb.export"
+            exp.mkdir(parents=True)
+            for t in ("{973F5D5C-1D90-4944-BE8E-24B94231A174}.7",
+                      "{D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}.9", "SruDbIdMapTable.4"):
+                (exp / t).write_text("a\tb\n")
+            return {"success": True, "stdout": "", "stderr": "", "exit_code": 0,
+                    "_trudi_call_id": 5}
+        monkeypatch.setattr("tools.misc.run", fake_run)
+        r = srum_export("/mnt/x/Windows/System32/sru/SRUDB.dat", str(out))
+        assert captured["cmd"] == ["/usr/bin/esedbexport", "-t", str(out / "srudb"),
+                                   "/mnt/x/Windows/System32/sru/SRUDB.dat"]
+        assert r["success"] is True and r["output_path"] == str(out / "srudb.export")
+        assert len(r["tables"]) == 3
+        net = [v for k, v in r["key_tables"].items() if k.startswith("network_usage")]
+        assert net and net[0].endswith("{973F5D5C-1D90-4944-BE8E-24B94231A174}.7")
+        assert any(k.startswith("app_resource_usage") for k in r["key_tables"])
+
+    def test_output_into_evidence_refused(self):
+        from tools.misc import srum_export
+        with pytest.raises(ValueError):
+            srum_export("/mnt/x/SRUDB.dat", "/mnt/x/out")
+
+    def test_no_tables_is_failure(self, monkeypatch, tmp_path):
+        from tools.misc import srum_export
+        monkeypatch.setattr("tools.misc.run", lambda cmd, **kw: {"success": True})
+        r = srum_export("/tmp/SRUDB.dat", str(tmp_path / "exports"))
+        assert r["success"] is False and "no tables" in r["error"]
+
+
+class TestBatchRun:
+    def test_batch_run_empty(self):
+        from tools.misc import batch_run
+        r = batch_run([])
+        assert r["success"] is True
+        assert r["results"] == []
+
+    def test_batch_run_runs_commands_concurrently(self, monkeypatch):
+        from tools.misc import batch_run
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return {"success": True, "cmd": cmd}
+
+        monkeypatch.setattr("tools.misc.run", fake_run)
+        r = batch_run([{"cmd": ["echo", "a"]}, {"cmd": ["echo", "b"]}], max_concurrent=2)
+        assert r["success"] is True
+        assert len(r["results"]) == 2
+        # Order preserved by index, even with concurrency
+        assert r["results"][0]["cmd"] == ["echo", "a"]
+        assert r["results"][1]["cmd"] == ["echo", "b"]
+
+    def test_batch_run_rejects_invalid_cmd(self, monkeypatch):
+        from tools.misc import batch_run
+        # No-op fake run so the runner doesn't try real subprocess
+        monkeypatch.setattr("tools.misc.run", lambda cmd, **kw: {"success": True})
+        r = batch_run([{"timeout": 5}])  # missing cmd
+        assert r["results"][0]["success"] is False
+        assert "missing or invalid 'cmd'" in r["results"][0]["error"]
+
+
+class TestRecordAgentMessageWithFindings:
+    """record_agent_message accepts an optional structured findings list and
+    writes each as a finding entry through the same gate as record_finding."""
+
+    def _seed(self, tmp_path, descriptions=None):
+        """Trace seeded with all checkpoints so CONFIRMED findings pass the
+        gate (dair_required + confirmed_requires_supported_evaluate +
+        confidence_and_citation + hypothesize_required).
+
+        descriptions: optional list of normalized description substrings to
+        seed into the user_message of confidence_score / cite_check entries
+        so the confidence_and_citation per-finding substring match succeeds.
+        """
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("RAM-001", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.netscan", True, False, 0, 0,
+                                  stdout_excerpt="PID 7092 -> 192.0.2.10:8080")
+        l.record_reason_call("reason_hypothesize", True, "hypothesis OK", {})
+        # Pack every description into the user_message so a single seeded call
+        # satisfies every distinct finding's substring match.
+        _msg = " | ".join(d.lower() for d in (descriptions or []))
+        _ins = {"user_message": _msg} if _msg else None
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=_ins)
+        l.record_reason_call(
+            "reason_evaluate_finding", True,
+            "VERDICT: SUPPORTED — corroborated by multiple sources.", {},
+        )
+        return l, tid
+
+    def test_without_findings_matches_legacy(self, tmp_path):
+        from tools.misc import record_agent_message
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("RAM-002", str(tmp_path / "trace.json"))
+        with patch("core.execution_log.log", l):
+            r = record_agent_message(content="just analysis")
+        assert r["success"] is True
+        assert "findings" not in r
+        narr = [e for e in l._entries if e["type"] == "investigation_narration"]
+        assert len(narr) == 1
+        assert narr[0]["content"] == "just analysis"
+
+    def test_with_confirmed_findings_writes_atomic(self, tmp_path):
+        from tools.misc import record_agent_message
+        desc = "ngentask.exe (PID 7092) is CS Beacon on BASE-FILE"
+        l, tid = self._seed(tmp_path, descriptions=[desc])
+        with patch("core.execution_log.log", l):
+            r = record_agent_message(
+                content="BASE-FILE memory shows CS Beacon on ngentask.exe.",
+                input_call_ids=[tid],
+                findings=[
+                    {"description": desc,
+                     "confidence": "CONFIRMED",
+                     "linked_call_id": tid,
+                     "source": "vol.netscan"},
+                ],
+            )
+        assert r["success"] is True
+        assert r["any_finding_refused"] is False
+        assert len(r["findings"]) == 1
+        assert r["findings"][0]["success"] is True
+        # Narration + 1 finding entry in the trace
+        narrs = [e for e in l._entries if e["type"] == "investigation_narration"]
+        finds = [e for e in l._entries if e["type"] == "finding"]
+        assert len(narrs) == 1
+        assert len(finds) == 1
+        assert finds[0]["confidence"] == "CONFIRMED"
+
+    def test_gate_failures_return_per_finding(self, tmp_path):
+        from tools.misc import record_agent_message
+        # Seed inputs covering only the valid finding's description; the
+        # invalid one fails confirmed_requires_linked_call_id before
+        # confidence_and_citation anyway.
+        l, tid = self._seed(tmp_path, descriptions=["valid finding"])
+        with patch("core.execution_log.log", l):
+            r = record_agent_message(
+                content="some analysis",
+                input_call_ids=[tid],
+                findings=[
+                    # Valid CONFIRMED — inherits input_call_ids from the message
+                    {"description": "valid finding", "confidence": "CONFIRMED",
+                     "linked_call_id": tid, "source": "vol.netscan"},
+                    # Invalid: CONFIRMED without linked_call_id → gate refuses
+                    {"description": "no link", "confidence": "CONFIRMED",
+                     "linked_call_id": 0, "source": "vol.netscan"},
+                ],
+            )
+        assert r["any_finding_refused"] is True
+        assert r["findings"][0]["success"] is True
+        assert r["findings"][1]["success"] is False
+        # Narration still written
+        narrs = [e for e in l._entries if e["type"] == "investigation_narration"]
+        assert len(narrs) == 1
+        # Only the valid finding ended up in the trace
+        finds = [e for e in l._entries if e["type"] == "finding"]
+        assert len(finds) == 1
+
+    def test_suspected_finding_no_evaluate_required(self, tmp_path):
+        # SUSPECTED tier skips confirmed_requires_supported_evaluate /
+        # confidence_and_citation / hypothesize_required — only dair_required.
+        from tools.misc import record_agent_message
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("RAM-003", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        with patch("core.execution_log.log", l):
+            r = record_agent_message(
+                content="possible anomaly",
+                findings=[
+                    {"description": "weak signal", "confidence": "SUSPECTED",
+                     "source": "vol.netscan"},
+                ],
+            )
+        assert r["findings"][0]["success"] is True
+
+
+# ── MCP routing enforcement ──────────────────────────────────────────────────
+
+class TestRecordFindingMcpRoutingGate:
+    """mcp_routing: findings whose linked_call_id points to a raw-bash forensic-binary
+    invocation are refused. The architectural-guardrail story requires
+    forensic execution to flow through the typed MCP layer, not the host shell.
+    """
+
+    def _append_bash_tool_call(self, l, cmd: str) -> int:
+        """Mimic the PostToolUse hook: append a tool_call entry with
+        source='claude_code_bash' directly, bypassing record_tool_call (which
+        doesn't accept a `source` kwarg — that field is only set by the hook).
+        """
+        cid = l._next_id()
+        l._entries.append({
+            "call_id": cid,
+            "type": "tool_call",
+            "ts": "2026-05-22T07:00:00Z",
+            "cmd": cmd,
+            "success": True,
+            "truncated": False,
+            "retries": 0,
+            "exit_code": 0,
+            "elapsed_seconds": 0.0,
+            "stderr": "",
+            "source": "claude_code_bash",
+        })
+        return cid
+
+    def _seed_with_bash_call(self, tmp_path, cmd: str, description: str = ""):
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("MCP-ROUTE", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        cid = self._append_bash_tool_call(l, cmd)
+        # confirmed_requires_supported_evaluate + confidence_and_citation +
+        # hypothesize_required satisfied — only mcp_routing should refuse.
+        _ins = {"user_message": description.lower()} if description else None
+        l.record_reason_call("reason_hypothesize", True, "hypothesis OK", {})
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_evaluate_finding", True,
+                             "VERDICT: SUPPORTED", {})
+        return l, cid
+
+    def test_bash_vol_invocation_refuses_finding(self, tmp_path):
+        from tools.misc import record_finding
+        desc = "p.exe is cs beacon"
+        l, cid = self._seed_with_bash_call(
+            tmp_path,
+            cmd="/usr/local/bin/vol -f /evidence/mem.img windows.psscan",
+            description=desc,
+        )
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "CONFIRMED", "vol.psscan", linked_call_id=cid, input_call_ids=[1])
+        assert r["success"] is False
+        assert r.get("gate") == "mcp_routing"
+        assert "MCP routing" in r["error"]
+        assert "vol." in r.get("suggested_wrapper", "")
+
+    def test_bash_dotnet_eztool_invocation_refuses_finding(self, tmp_path):
+        from tools.misc import record_finding
+        desc = "evtxecmd output anomaly"
+        l, cid = self._seed_with_bash_call(
+            tmp_path,
+            cmd="dotnet /opt/zimmermantools/EvtxECmd/EvtxECmd.dll -f /mnt/sec.evtx",
+            description=desc,
+        )
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "CONFIRMED", "ez.evtxecmd", linked_call_id=cid, input_call_ids=[1])
+        assert r["success"] is False
+        assert r.get("gate") == "mcp_routing"
+        assert "EvtxECmd" in r.get("offending_cmd_excerpt", "")
+        assert "ez.evtxecmd" in r.get("suggested_wrapper", "")
+
+    def test_bash_non_forensic_command_does_not_refuse(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("MCP-ROUTE", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        # Bash command that doesn't run a forensic binary — should not trip mcp_routing.
+        cid = self._append_bash_tool_call(l, "ls /cases/example-case/analysis")
+        l.record_reason_call("reason_hypothesize", True, "OK", {})
+        _ins = {"user_message": "harmless ls"}
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        with patch("core.execution_log.log", l):
+            r = record_finding("harmless ls", "CONFIRMED", "vol.psscan", linked_call_id=cid, input_call_ids=[1])
+        assert r["success"] is True
+
+    def test_mcp_sourced_call_does_not_refuse(self, tmp_path):
+        # An entry without source="claude_code_bash" (i.e. came through an
+        # MCP wrapper) must NOT be refused even if the cmd would match.
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "perfsvc.exe timestomped")
+        with patch("core.execution_log.log", l):
+            r = record_finding("PerfSvc.exe timestomped", "CONFIRMED", "ez.mftecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+
+
+# ── ATT&CK technique ID auto-validation ──────────────────────────────────────
+
+class TestRecordFindingMitreValidateGate:
+    """mitre_technique_validation: T-IDs in description are validated via
+    correlate.mitre_validate."""
+
+    def test_unknown_tid_refuses_finding(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "process beacon t9999.999")
+        with patch("core.execution_log.log", l), \
+             patch("tools.correlate.mitre_validate",
+                   side_effect=lambda x, **kw: {"exists": False, "technique_id": x}):
+            r = record_finding("Process beacon T9999.999", "CONFIRMED",
+                               "vol.netscan", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "mitre_technique_validation"
+        assert "T9999.999" in r.get("unknown_technique_ids", [])
+
+    def test_known_tid_passes_and_records_validation(self, tmp_path):
+        from tools.misc import record_finding
+        desc = "wmi event subscription t1546.003"
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, desc)
+        with patch("core.execution_log.log", l), \
+             patch("tools.correlate.mitre_validate",
+                   side_effect=lambda x, **kw: {
+                       "exists": True, "name": "WMI Subscription",
+                       "tactic": "Persistence", "technique_id": x,
+                   }):
+            r = record_finding("WMI Event Subscription T1546.003", "CONFIRMED",
+                               "ez.evtxecmd", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+        assert {"technique_id": "T1546.003",
+                "name": "WMI Subscription",
+                "tactic": "Persistence"} in r.get("validated_techniques", [])
+
+    def test_no_tid_no_validation_attempted(self, tmp_path):
+        # Findings without any T-ID don't invoke mitre_validate.
+        from tools.misc import record_finding
+        l, tid = _seed_log_ready_for_confirmed(tmp_path, "no technique here")
+        with patch("core.execution_log.log", l), \
+             patch("tools.correlate.mitre_validate") as mv:
+            r = record_finding("No technique here", "CONFIRMED",
+                               "vol.psscan", linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+        assert mv.call_count == 0
+
+
+# ── confidence_score + cite_check coverage ───────────────────────────────────
+
+class TestRecordFindingConfidenceScoreCiteCheckGate:
+    """confidence_and_citation: CONFIRMED/LIKELY require a recent
+    reason.confidence_score AND reason.cite_check that reference this finding."""
+
+    def _base(self, tmp_path):
+        """dair + tool + hypothesize + SUPPORTED evaluate — dair_required /
+        confirmed_requires_supported_evaluate / hypothesize_required all
+        satisfied but confidence_and_citation NOT yet. Tests layer the
+        confidence/cite calls on top per-case."""
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("CONF-CITE", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        l.record_reason_call("reason_hypothesize", True, "OK", {})
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        return l, tid
+
+    def test_confirmed_without_confidence_score_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        # Seed only cite_check; missing confidence_score → refuse.
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}',
+                             {}, inputs={"user_message": "my finding text"})
+        with patch("core.execution_log.log", l):
+            r = record_finding("My finding text", "CONFIRMED", "vol.psscan",
+                               linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "confidence_and_citation"
+        assert r.get("missing_check") == "reason_confidence_score"
+
+    def test_confirmed_without_cite_check_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}',
+                             {}, inputs={"user_message": "my finding text"})
+        with patch("core.execution_log.log", l):
+            r = record_finding("My finding text", "CONFIRMED", "vol.psscan",
+                               linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "confidence_and_citation"
+        assert r.get("missing_check") == "reason_cite_check"
+
+    def test_cite_check_with_uncited_claims_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        _ins = {"user_message": "my finding text"}
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "UNCITED_CLAIMS_PRESENT"}',
+                             {}, inputs=_ins)
+        with patch("core.execution_log.log", l):
+            r = record_finding("My finding text", "CONFIRMED", "vol.psscan",
+                               linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "confidence_and_citation"
+        assert "UNCITED_CLAIMS_PRESENT" in r["error"]
+
+    def test_confidence_score_lower_tier_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        _ins = {"user_message": "my finding text"}
+        # Reviewer assigned SUSPECTED, agent requested CONFIRMED → refuse.
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "SUSPECTED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=_ins)
+        with patch("core.execution_log.log", l):
+            r = record_finding("My finding text", "CONFIRMED", "vol.psscan",
+                               linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "confidence_and_citation"
+        assert r.get("confidence_score_tier") == "SUSPECTED"
+
+    def test_likely_tier_also_requires_g16(self, tmp_path):
+        # LIKELY is strict — confidence_and_citation fires for both CONFIRMED and LIKELY.
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        with patch("core.execution_log.log", l):
+            r = record_finding("My finding text", "LIKELY", "vol.psscan",
+                               linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "confidence_and_citation"
+
+    def test_g16_anti_reuse_blocks_second_finding_with_same_description(self, tmp_path):
+        # A single confidence_score+cite_check pair can satisfy ONE finding.
+        # A second identical-description finding must get fresh checks.
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        _ins = {"user_message": "duplicate finding text"}
+        # Description-matched evaluate so BOTH same-description findings pass the
+        # evaluate gate via the matched path (the single-use fallback only bites
+        # distinct descriptions) — isolating the confidence/cite anti-reuse.
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED",
+                             {}, inputs=_ins)
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=_ins)
+        with patch("core.execution_log.log", l):
+            r1 = record_finding("Duplicate finding text", "CONFIRMED", "vol.psscan",
+                                linked_call_id=tid, input_call_ids=[tid])
+            r2 = record_finding("Duplicate finding text", "CONFIRMED", "vol.psscan",
+                                linked_call_id=tid, input_call_ids=[tid])
+        assert r1["success"] is True
+        assert r2["success"] is False
+        assert r2.get("gate") == "evidence_strength"
+        assert r2.get("detail_gate") == "confidence_and_citation"
+
+
+class TestConfirmedEvaluateSingleUseFallback:
+    """confirmed_requires_supported_evaluate: an un-matched (fallback) evaluate
+    may cover at most ONE finding. A second finding with a DIFFERENT description
+    that shares no evaluate must supply its own — one SUPPORTED verdict cannot
+    wave through an unbounded run of distinct CONFIRMED findings."""
+
+    def _base(self, tmp_path):
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("SINGLE-USE", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        l.record_reason_call("reason_hypothesize", True, "OK", {})
+        return l, tid
+
+    def _cs_cc(self, l, text):
+        ins = {"user_message": text.lower()}
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=ins)
+
+    def test_second_distinct_finding_on_one_fallback_evaluate_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        # ONE un-matched (no user_message) SUPPORTED evaluate for both.
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        self._cs_cc(l, "first distinct finding about a mutex")
+        self._cs_cc(l, "second distinct finding about a service")
+        with patch("core.execution_log.log", l):
+            r1 = record_finding("First distinct finding about a mutex", "CONFIRMED",
+                                "vol.psscan", linked_call_id=tid, input_call_ids=[tid])
+            r2 = record_finding("Second distinct finding about a service", "CONFIRMED",
+                                "vol.psscan", linked_call_id=tid, input_call_ids=[tid])
+        assert r1["success"] is True
+        assert r2["success"] is False
+        assert r2.get("detail_gate") == "confirmed_requires_supported_evaluate"
+
+    def test_own_matched_evaluate_clears_second_finding(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        # Each finding has its OWN description-matched SUPPORTED evaluate.
+        for txt in ("first distinct finding about a mutex",
+                    "second distinct finding about a service"):
+            l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED",
+                                 {}, inputs={"user_message": txt})
+            self._cs_cc(l, txt)
+        with patch("core.execution_log.log", l):
+            r1 = record_finding("First distinct finding about a mutex", "CONFIRMED",
+                                "vol.psscan", linked_call_id=tid, input_call_ids=[tid])
+            r2 = record_finding("Second distinct finding about a service", "CONFIRMED",
+                                "vol.psscan", linked_call_id=tid, input_call_ids=[tid])
+        assert r1["success"] is True
+        assert r2["success"] is True
+
+    def test_single_finding_still_uses_fallback(self, tmp_path):
+        # Legacy single-finding trace (evaluate doesn't echo description) still
+        # passes on the fallback — the change only affects the 2nd+ finding.
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        self._cs_cc(l, "a lone finding")
+        with patch("core.execution_log.log", l):
+            r = record_finding("A lone finding", "CONFIRMED", "vol.psscan",
+                               linked_call_id=tid, input_call_ids=[tid])
+        assert r["success"] is True
+
+
+class TestRecordFindingInlineSupportingEvidence:
+    """R1 fast path: passing supporting_evidence inline runs a DETERMINISTIC
+    citation check and skips the reason.confidence_score + reason.cite_check
+    model round-trips entirely."""
+
+    def _base(self, tmp_path):
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("INLINE", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.netscan", True, False, 0, 0)
+        l.record_reason_call("reason_hypothesize", True, "OK", {})
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        return l, tid
+
+    def test_inline_evidence_satisfies_gate_without_reason_calls(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        # NO confidence_score / cite_check seeded — the inline path replaces them.
+        with patch("core.execution_log.log", l):
+            r = record_finding(
+                "C2 beacon to 203.0.113.10:8080 (T1071.001)", "CONFIRMED",
+                "velo.netstat", linked_call_id=tid, tested_hypothesis_id="H1",
+                input_call_ids=[tid],
+                supporting_evidence="NetstatEnriched: 203.0.113.10:8080 ESTABLISHED. "
+                                    "Technique T1071.001 web protocols.")
+        assert r["success"] is True
+        # provenance recorded
+        finding = [e for e in l._entries if e["type"] == "finding"][-1]
+        assert finding.get("citation_mode") == "deterministic"
+
+    def test_inline_uncited_claim_refused(self, tmp_path):
+        from tools.misc import record_finding
+        l, tid = self._base(tmp_path)
+        with patch("core.execution_log.log", l):
+            r = record_finding(
+                "Beacon to 8.8.8.8 with hash deadbeefdeadbeefdeadbeefdeadbeef",
+                "CONFIRMED", "velo.netstat", linked_call_id=tid,
+                tested_hypothesis_id="H1", input_call_ids=[tid],
+                supporting_evidence="NetstatEnriched: 203.0.113.10:8080 ESTABLISHED.")
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "confidence_and_citation"
+        # both the uncited IP and hash are surfaced
+        uncited = " ".join(r.get("uncited_claims", []))
+        assert "8.8.8.8" in uncited
+        assert "deadbeef" in uncited.lower()
+
+    def test_likely_inline_evidence_still_needs_supported_evaluate(self, tmp_path):
+        # LIKELY needs no confidence/cite when evidence is inline, but it DOES
+        # need a SUPPORTED reviewer verdict (Phase E: no citation-only tier).
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("INLINE", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.netscan", True, False, 0, 0)
+        desc = "Masquerade /tmp/.kworkerd is a copy of /bin/sleep"
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "LIKELY", "sha256sum", linked_call_id=tid,
+                               tested_hypothesis_id="H1", input_call_ids=[tid],
+                               supporting_evidence="paths /tmp/.kworkerd and /bin/sleep hash-match.")
+        assert r["success"] is False
+        assert r["detail_gate"] == "confirmed_requires_supported_evaluate"
+        assert r["evaluate_match"] == "none"
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {},
+                             inputs={"user_message": f"FINDING:\n{desc}"})
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "LIKELY", "sha256sum", linked_call_id=tid,
+                               tested_hypothesis_id="H1", input_call_ids=[tid],
+                               supporting_evidence="paths /tmp/.kworkerd and /bin/sleep hash-match.")
+        assert r["success"] is True
+
+    def test_evaluate_matched_by_typed_claim_and_mismatch_refused(self, tmp_path):
+        from tools.misc import record_finding
+        from core.execution_log import ExecutionLog
+        from tools._gates._claims import normalize_claim
+        l = ExecutionLog()
+        l.configure("CLAIMMATCH", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("dotnet EvtxECmd.dll -f Security.evtx", True, False, 0, 0)
+        ev_claim = normalize_claim(claim_kind="positive", category="persistence",
+                                   act="account_creation", entities=["helpsvc"])
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {},
+                             inputs={"user_message": "FINDING:\nA backdoor account was created"},
+                             extra={"claim": ev_claim})
+        with patch("core.execution_log.log", l):
+            # Re-worded finding, same claim → matched by claim.
+            r = record_finding("helpsvc appeared as a covert local admin", "LIKELY", "ez.evtxecmd",
+                               linked_call_id=tid, input_call_ids=[tid], tested_hypothesis_id="H1",
+                               supporting_evidence="4720 helpsvc",
+                               claim_kind="positive", category="persistence",
+                               act="account_creation", entities=["HELPSVC"])
+            assert r["success"] is True, r
+            # Same wording as the evaluate, different act → mismatch refused.
+            r2 = record_finding("A backdoor account was created", "LIKELY", "ez.evtxecmd",
+                                linked_call_id=tid, input_call_ids=[tid], tested_hypothesis_id="H1",
+                                supporting_evidence="4720 helpsvc",
+                                claim_kind="positive", category="persistence",
+                                act="persistence_install", entities=["helpsvc"])
+        assert r2["success"] is False and r2["claim_mismatch"] == ["act"]
+
+
+# ── hypothesize trigger ──────────────────────────────────────────────────────
+
+class TestRecordFindingHypothesizeGate:
+    """hypothesize_required: CONFIRMED/LIKELY findings mentioning process/
+    service/persistence/C2/lateral-movement require a recent
+    reason.hypothesize call."""
+
+    def _base_no_hypothesize(self, tmp_path, desc: str):
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("HYP-REQ", str(tmp_path / "trace.json"))
+        l.record_dair_call("Triage", "", False, "", "", "stay", "")
+        tid = l.record_tool_call("vol.psscan", True, False, 0, 0)
+        # independent corroborating artifacts so the J-1 tier contract reaches
+        # CONFIRMED for c2 (process + network) and presence (process + MFT)
+        self.extra = [l.record_tool_call("/usr/local/bin/vol -f mem.raw windows.netscan", True, False, 0, 0),
+                      l.record_tool_call("dotnet MFTECmd.dll -f $MFT --csv /out", True, False, 0, 0)]
+        _ins = {"user_message": desc.lower()}
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_cite_check", True,
+                             'CITE_CHECK:\n{"verdict": "ALL_CITED"}', {}, inputs=_ins)
+        l.record_reason_call("reason_evaluate_finding", True, "VERDICT: SUPPORTED", {})
+        return l, tid
+
+    def test_distant_hypothesize_satisfies_no_tool_call_inflation(self, tmp_path):
+        # A hypothesize made early, then MANY tool calls, then the finding: the
+        # 30-entry window would have expired, forcing a re-hypothesize. Existence
+        # over the whole trace now satisfies it (no tool-call-inflation churn).
+        from tools.misc import record_finding
+        desc = "rogue process pid 7092 c2 to internal host"
+        l, tid = self._base_no_hypothesize(tmp_path, desc)
+        l.record_reason_call("reason_hypothesize", True, "H", {}, hypothesis_id="H0007")
+        for i in range(40):                                  # blow a 30-entry window
+            l.record_tool_call(f"dotnet EvtxECmd.dll -f log{i}.evtx", True, False, 0, 0)
+        # re-satisfy the tier-contract corroboration after the noise
+        l.record_reason_call("reason_confidence_score", True,
+                             'CONFIDENCE_SCORE:\n{"tier": "CONFIRMED"}', {},
+                             inputs={"user_message": desc.lower()})
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "CONFIRMED", "vol.psscan", linked_call_id=tid,
+                               input_call_ids=[tid], claim_kind="positive", category="other", act="c2")
+        assert r.get("detail_gate") != "hypothesize_required", r
+
+    def test_declared_act_without_hypothesize_refused(self, tmp_path):
+        from tools.misc import record_finding
+        desc = "rogue process pid 7092 c2 to internal host"
+        l, tid = self._base_no_hypothesize(tmp_path, desc)
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "CONFIRMED", "vol.psscan", linked_call_id=tid, input_call_ids=[tid],
+                               claim_kind="positive", category="other", act="c2")
+        assert r["success"] is False
+        assert r.get("gate") == "evidence_strength"
+        assert r.get("detail_gate") == "hypothesize_required"
+
+    def test_tested_hypothesis_id_carve_out(self, tmp_path):
+        # Passing tested_hypothesis_id satisfies hypothesize_required without
+        # a separate hypothesize call (proves the hypothesize→finding loop
+        # completed).
+        from tools.misc import record_finding
+        desc = "rogue process pid 7092 c2 to internal host"
+        l, tid = self._base_no_hypothesize(tmp_path, desc)
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "CONFIRMED", "vol.psscan",
+                               linked_call_id=tid, tested_hypothesis_id="H0001",
+                               input_call_ids=[tid, *self.extra],
+                               claim_kind="positive", category="other", act="c2")
+        assert r["success"] is True, r
+        assert r["tier_achievable"] == "CONFIRMED"
+
+    def test_wording_alone_does_not_require_hypothesize(self, tmp_path):
+        # Keywords in the prose are not read — only the declared claim triggers.
+        from tools.misc import record_finding
+        desc = "rogue process pid 7092 c2 to internal host"
+        l, tid = self._base_no_hypothesize(tmp_path, desc)
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "CONFIRMED", "vol.psscan", linked_call_id=tid,
+                               input_call_ids=[tid, *self.extra],
+                               claim_kind="positive", category="other", act="presence")
+        assert r["success"] is True, r
+
+    def test_declared_category_requires_hypothesize(self, tmp_path):
+        from tools.misc import record_finding
+        desc = "evidence of persistence"
+        l, tid = self._base_no_hypothesize(tmp_path, desc)
+        with patch("core.execution_log.log", l):
+            r = record_finding(desc, "CONFIRMED", "ez.recmd", linked_call_id=tid, input_call_ids=[tid],
+                               claim_kind="positive", category="persistence", act="presence")
+        assert r["success"] is False and r.get("detail_gate") == "hypothesize_required"
+
+
+# ── export_execution_log requires pre_report_check ───────────────────────────
+
+class TestExportRequiresPreReportCheck:
+    """pre_report_check_required: misc.export_execution_log refuses unless reason.pre_report_check
+    returned READY_TO_REPORT: true within the last 50 trace entries."""
+
+    def test_missing_pre_report_check_refused(self, tmp_path, monkeypatch):
+        from tools.misc import export_execution_log
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("EXPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        with patch("core.execution_log.log", l), \
+             patch("tools.misc.assert_output_safe", lambda *a, **kw: None):
+            r = export_execution_log(str(tmp_path / "out"))
+        assert r["success"] is False
+        assert r.get("gate") == "pre_report_check_required"
+        assert r.get("missing_check") == "reason_pre_report_check"
+
+    def test_pre_report_check_not_ready_refused(self, tmp_path):
+        from tools.misc import export_execution_log
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("EXPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        l.record_reason_call("reason_pre_report_check", True,
+                             "READY_TO_REPORT: false\nBLOCKING_ISSUES (1): ...", {},
+                             extra={"ready_to_report": False})
+        with patch("core.execution_log.log", l), \
+             patch("tools.misc.assert_output_safe", lambda *a, **kw: None):
+            r = export_execution_log(str(tmp_path / "out"))
+        assert r["success"] is False
+        assert r.get("gate") == "pre_report_check_required"
+        assert "false" in r.get("pre_report_conclusion", "").lower()
+
+    def test_legacy_entry_without_typed_flag_refused(self, tmp_path):
+        from tools.misc import export_execution_log
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("EXPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        l.record_reason_call("reason_pre_report_check", True,
+                             "READY_TO_REPORT: true\nBLOCKING_ISSUES (0): none", {})
+        with patch("core.execution_log.log", l), \
+             patch("tools.misc.assert_output_safe", lambda *a, **kw: None):
+            r = export_execution_log(str(tmp_path / "out"))
+        assert r["success"] is False and "re-run" in r["error"]
+
+    def test_pre_report_check_ready_passes(self, tmp_path):
+        from tools.misc import export_execution_log
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("EXPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        l.record_reason_call("reason_pre_report_check", True,
+                             "READY_TO_REPORT: true\nBLOCKING_ISSUES (0): none", {},
+                             extra={"ready_to_report": True,
+                                    "readiness_fingerprint": state_fingerprint(l._entries, l._case_id)})
+        with patch("core.execution_log.log", l), \
+             patch("tools.misc.assert_output_safe", lambda *a, **kw: None):
+            r = export_execution_log(str(tmp_path / "out"))
+        assert r["success"] is True
+
+
+class TestWriteFinalReportRequiresPreReportCheck:
+    """Final report writes use the same pre-report gate as trace export."""
+
+    def test_missing_pre_report_check_refused(self, tmp_path):
+        from tools.misc import write_final_report
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("REPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        out = tmp_path / "reports" / "report.md"
+        with patch("core.execution_log.log", l):
+            r = write_final_report(str(out), "# Report\n")
+        assert r["success"] is False
+        assert r.get("gate") == "pre_report_check_required"
+        assert not out.exists()
+
+    def test_pre_report_check_not_ready_refused(self, tmp_path):
+        from tools.misc import write_final_report
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("REPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        l.record_reason_call("reason_pre_report_check", True,
+                             "READY_TO_REPORT: false\nBLOCKING_ISSUES (1): ...", {},
+                             extra={"ready_to_report": False})
+        out = tmp_path / "reports" / "report.md"
+        with patch("core.execution_log.log", l):
+            r = write_final_report(str(out), "# Report\n")
+        assert r["success"] is False
+        assert r.get("gate") == "pre_report_check_required"
+        assert not out.exists()
+
+    def test_pre_report_check_ready_writes(self, tmp_path):
+        from tools.misc import write_final_report
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("REPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        l.record_reason_call("reason_pre_report_check", True,
+                             "READY_TO_REPORT: true\nBLOCKING_ISSUES (0): none", {},
+                             extra={"ready_to_report": True,
+                                    "readiness_fingerprint": state_fingerprint(l._entries, l._case_id)})
+        out = tmp_path / "reports" / "report.md"
+        with patch("core.execution_log.log", l):
+            r = write_final_report(str(out), "# Report\n")
+        assert r["success"] is True
+        assert out.read_text() == "# Report\n"
+        assert r.get("_trudi_call_id")
+
+    def test_adjudicated_limitations_are_appended(self, tmp_path):
+        # Adjudicated evidence limitations ride into the report server-side.
+        from tools.misc import write_final_report
+        from core.execution_log import ExecutionLog
+        l = ExecutionLog()
+        l.configure("REPORT", str(tmp_path / "trace.json"))
+        l.record_dair_call("Report", "", False, "", "", "stay", "")
+        l.record_reason_call("reason_pre_report_check", True, "READY_TO_REPORT: true", {},
+                             extra={"ready_to_report": True,
+                                    "readiness_fingerprint": state_fingerprint(l._entries, l._case_id),
+                                    "synthesize_blockers_unresolved": ["Verification of X needed"]})
+        out = tmp_path / "reports" / "report.md"
+        with patch("core.execution_log.log", l):
+            r = write_final_report(str(out), "# Report\n\nbody\n")
+        text = out.read_text()
+        assert r["limitations_appended"] == 1
+        assert "## Reviewer limitations" in text and "Verification of X needed" in text
+        tc = [e for e in l._entries if (e.get("cmd") or "").startswith("<py>:misc_write_final_report")][-1]
+        assert tc["limitations_appended"] == 1
+
+
+def test_person_username_variants_include_initial_last_initial():
+    from tools.misc import knowns_pattern_generate
+
+    r = knowns_pattern_generate(["Johnny Coach"], "person_username")
+
+    assert r["success"] is True
+    assert "jcoachj" in r["all_terms"]
+
+
+class TestTypedTierAndCiteVerdict:
+    """confidence_and_citation reads the typed `tier` / `cite_verdict` stamped on
+    the reason_call entries before any conclusion-text regex."""
+
+    def _ctx(self, l, desc, tier):
+        from tools._gates import GateContext
+        return GateContext(description=desc, confidence=tier.capitalize(), tier=tier, source="t",
+                           linked_call_id=0, tested_hypothesis_id="", log=l, idx=l.index(),
+                           window=l.last_n_window(30), input_call_ids=[], supporting_evidence="")
+
+    def test_typed_tier_lower_than_requested_refuses(self, tmp_path):
+        from core.execution_log import ExecutionLog
+        from tools._gates import confidence_and_citation as cc
+        l = ExecutionLog(); l.configure("T", str(tmp_path / "t.json"), save_session=False)
+        desc = "svc_backup account created on host X"
+        l.record_reason_call("reason_confidence_score", True, "prose only, no block", {},
+                             inputs={"user_message": f"FINDING:\n{desc}"},
+                             extra={"tier": "SUSPECTED"})
+        l.record_reason_call("reason_cite_check", True, "prose only", {},
+                             inputs={"user_message": f"FINDING:\n{desc}"},
+                             extra={"cite_verdict": "ALL_CITED"})
+        out = cc.check(self._ctx(l, desc, "LIKELY"))
+        assert out is not None and out.get("confidence_score_tier") == "SUSPECTED"
+
+    def test_typed_cite_verdict_uncited_refuses(self, tmp_path):
+        from core.execution_log import ExecutionLog
+        from tools._gates import confidence_and_citation as cc
+        l = ExecutionLog(); l.configure("T", str(tmp_path / "t.json"), save_session=False)
+        desc = "svc_backup account created on host X"
+        l.record_reason_call("reason_confidence_score", True, "prose", {},
+                             inputs={"user_message": f"FINDING:\n{desc}"}, extra={"tier": "LIKELY"})
+        l.record_reason_call("reason_cite_check", True, "prose", {},
+                             inputs={"user_message": f"FINDING:\n{desc}"},
+                             extra={"cite_verdict": "UNCITED_CLAIMS_PRESENT"})
+        out = cc.check(self._ctx(l, desc, "LIKELY"))
+        assert out is not None and out.get("missing_check") == "reason_cite_check"
+        l.record_reason_call("reason_cite_check", True, "prose", {},
+                             inputs={"user_message": f"FINDING:\n{desc}"},
+                             extra={"cite_verdict": "ALL_CITED"})
+        assert cc.check(self._ctx(l, desc, "LIKELY")) is None
+
+
+def test_clear_case_run_clears_hidden_entries_and_spares_evidence(tmp_path, monkeypatch):
+    """Hidden sidecars/locks in the output dirs are cleared (a stale
+    analysis/.tool_output/<cid>.txt would be read by the next run under a
+    reused call id); evidence/, CLAUDE.md and .claude/ are never touched."""
+    from tools.misc import clear_case_run
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "session.json").write_text("{}")
+    monkeypatch.setenv("TRUDI_CACHE_DIR", str(cache))
+    case = tmp_path / "case"
+    sidecars = case / "analysis" / ".tool_output"
+    sidecars.mkdir(parents=True)
+    (sidecars / "42.txt").write_text("previous run")
+    (case / "analysis" / ".FR-abc.lock").write_text("")
+    (case / "analysis" / ".synthesis-x.lock").write_text("")
+    (case / "analysis" / "CASE_trace.json").write_text("{}")
+    (case / "exports").mkdir()
+    (case / "exports" / ".hidden.csv").write_text("x")
+    (case / "reports").mkdir()
+    (case / "reports" / "CASE.md").write_text("x")
+    (case / "evidence").mkdir()
+    (case / "evidence" / "disk.E01").write_bytes(b"\x00")
+    (case / "CLAUDE.md").write_text("case")
+    (case / ".claude").mkdir()
+    (case / ".claude" / "settings.json").write_text("{}")
+
+    r = clear_case_run(str(case))
+
+    assert r["success"], r
+    for sub in ("analysis", "exports", "reports"):
+        assert (case / sub).is_dir()
+        assert os.listdir(case / sub) == []
+    assert (case / "evidence" / "disk.E01").exists()
+    assert (case / "CLAUDE.md").exists()
+    assert (case / ".claude" / "settings.json").exists()
+    assert not (cache / "session.json").exists()

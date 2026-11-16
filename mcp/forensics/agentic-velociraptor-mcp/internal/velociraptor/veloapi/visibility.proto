@@ -1,0 +1,123 @@
+// Copyright 2026 hdyrawan
+//
+// Minimal, hand-authored mirror of the Velociraptor client-search and
+// artifact-catalog messages used by the v0.1.0 read-only visibility
+// tools (velo_search_clients, velo_get_client_info,
+// velo_list_artifact_names, velo_get_artifact_details). Field names and
+// numbers are copied from the upstream Velociraptor project's own proto
+// definitions so these messages are wire-compatible with a real
+// `www.velocidex.com/golang/velociraptor` server:
+//
+//   - api/proto/clients.proto (SearchClientsRequest,
+//     SearchClientsResponse, GetClientRequest, ApiClient,
+//     AgentInformation, Uname)
+//   - artifacts/proto/artifact.proto (Artifact, ArtifactParameter,
+//     ArtifactSource)
+//   - api/proto/artifacts.proto (GetArtifactsRequest, ArtifactDescriptors)
+//
+// Each message here is intentionally a narrow subset of its upstream
+// counterpart: only the fields these tools actually read are declared.
+// Fields are omitted by field number, not renumbered, so the wire
+// format still matches upstream exactly. As of v0.10.3, `Artifact`
+// declares `sources` (field 4) as a minimal `ArtifactSource` carrying
+// only `name` (field 3) — needed to resolve a multi-source artifact's
+// result table (internal/velociraptor/grpcclient_flows.go's
+// GetFlowResults) — but every field carrying an actual VQL query body
+// (`ArtifactSource.query`/`queries`/`precondition`) remains
+// permanently undeclared: a server populating those fields simply
+// arrives as an ignored unknown field — this project's generated Go
+// types have no field to decode them into, so artifact VQL text can
+// never reach a tool response even by accident. See
+// docs/security-model.md.
+//
+// Regenerate with (from the repository root):
+//   buf generate internal/velociraptor/veloapi
+syntax = "proto3";
+
+package proto;
+
+option go_package = "github.com/hdyrawan/agentic-velociraptor-mcp/internal/velociraptor/veloapi";
+
+// --- Clients (api/proto/clients.proto) ---
+
+message SearchClientsRequest {
+  uint64 offset = 1;
+  uint64 limit = 2;
+  string query = 3;
+}
+
+message SearchClientsResponse {
+  repeated ApiClient items = 1;
+  uint64 total = 3;
+}
+
+message GetClientRequest {
+  string client_id = 1;
+}
+
+message AgentInformation {
+  string version = 1;
+}
+
+message Uname {
+  string system = 1;
+  string hostname = 2;
+  repeated string mac_addresses = 11;
+}
+
+// ApiClient deliberately omits every field describing GUI/approval
+// state, VFS state, or in-flight flow bookkeeping: velo_search_clients
+// and velo_get_client_info return endpoint identity/metadata only.
+message ApiClient {
+  string client_id = 1;
+  AgentInformation agent_information = 2;
+  Uname os_info = 3;
+  uint64 last_seen_at = 7;
+  string last_ip = 16;
+  repeated string labels = 18;
+}
+
+// --- Artifacts (artifacts/proto/artifact.proto, api/proto/artifacts.proto) ---
+
+message ArtifactParameter {
+  string name = 1;
+  string default = 2;
+  string description = 3;
+  string type = 4;
+}
+
+// ArtifactSource mirrors upstream's artifacts/proto/artifact.proto
+// ArtifactSource message, declaring only `name` (field 3) — the field
+// this project needs to resolve a named-source artifact's per-source
+// result table (see internal/velociraptor/grpcclient_flows.go's
+// GetFlowResults doc comment). Every other field on the real message
+// (`precondition`, `queries`, `query` — the actual VQL body — and
+// `notebook`) is deliberately omitted so this project's generated Go
+// types have no field to decode VQL text into, even if a real server's
+// response carries it.
+message ArtifactSource {
+  string name = 3;
+}
+
+// Artifact declares `sources` (field 4, matching upstream's field
+// number exactly) as `ArtifactSource` — source *names* only, never a
+// query body (see ArtifactSource above). Every other field carrying VQL
+// text, tool definitions, or precondition expressions remains omitted:
+// this project's artifact catalog tools return name/description/
+// parameter/source-name metadata only, never a VQL body.
+message Artifact {
+  string name = 1;
+  string description = 2;
+  repeated ArtifactParameter parameters = 3;
+  repeated ArtifactSource sources = 4;
+}
+
+message GetArtifactsRequest {
+  string search_term = 3;
+  uint64 number_of_results = 4;
+  repeated string names = 6;
+}
+
+message ArtifactDescriptors {
+  repeated Artifact items = 1;
+}

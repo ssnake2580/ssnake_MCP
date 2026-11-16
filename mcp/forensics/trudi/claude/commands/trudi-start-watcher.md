@@ -1,0 +1,111 @@
+---
+description: "Start the TRUDI live-monitoring watcher (baseline + detectors + sidecar) for a case"
+argument-hint: "[case_id]"
+---
+
+# /trudi-start-watcher
+
+Brings a TRUDI live-monitoring case online: resolves the live
+Velociraptor client, ensures a baseline exists, renders the
+`Custom.TRUDI.*` detectors onto the client event table, and spawns the
+watcher sidecar that drains alerts into `monitoring/alerts/`.
+
+The argument, if supplied, names the case. Otherwise read it from
+`~/cases/.common/active_case`.
+
+## Steps
+
+### 1. Resolve the case
+1. `case_id` = `$ARGUMENTS` if non-empty, else `cat ~/cases/.common/active_case`. Refuse if neither is set.
+2. `case_dir` = `~/cases/<case_id>`. Confirm it exists and looks like a live-monitoring case (has `monitoring/` or a `CLAUDE.md` describing Velociraptor). If it has no `monitoring/` scaffold yet, that's fine — `baseline_capture` creates it.
+
+### 2. Ensure an execution log is active (gate prerequisite)
+`monitor.*` tools are blocked by the DAIR cold-start gate unless a trace
+is configured. If `core.execution_log.log._path` is unset, call:
+```
+misc.start_execution_log(case_id, output_path="<case_dir>/analysis/<case_id>_trace.json")
+```
+This (re)establishes the case-wide orchestration trace, which the
+`/trudi-check-alerts` loop also expects. Surface the returned
+`dashboard_url`.
+
+### 3. Resolve the LIVE client_id (do NOT trust CLAUDE.md)
+The victim re-enrolls and rotates its `C.xxx` id (container restarts,
+`down -v`). Always resolve it fresh:
+```
+velo.list_clients()
+```
+- Pick the client whose `hostname` matches the case's target host
+  (see the **Target host** row in `<case_dir>/CLAUDE.md`, typically
+  `victim`). If several match, prefer the most recent `last_seen_at`.
+- If `velo.list_clients` returns nothing, the stack is down — surface a
+  one-line warning ("Velociraptor has no enrolled clients; bring up the
+  demo stack first") and exit.
+- If the resolved id differs from the **Velociraptor client_id** row in
+  `CLAUDE.md`, update that row (move the old id into its history note).
+
+### 4. Ensure a baseline for THAT client_id
+Check `<case_dir>/monitoring/baselines/<client_id>.json`.
+- If missing (e.g. the client rotated), capture one:
+  ```
+  monitor.baseline_capture(client_id, case_id)
+  ```
+  The baseline is the known-good allowlist; only capture it when the host
+  is in a clean state (a freshly-restarted/clean victim). If the summary
+  shows unexpected `persistence_paths` / `endpoints`, note that the
+  baseline may have absorbed pre-existing artifacts.
+- Optionally remove stale baseline files for dead clients
+  (`baselines/<old_client_id>.json`) so the directory only holds the
+  active client.
+
+### 5. Start the watcher
+```
+monitor.start_watcher(client_id, case_id)            # all four detectors
+# or restrict: monitor.start_watcher(client_id, case_id,
+#               detectors=["Custom.TRUDI.NewNetwork", ...])
+```
+`start_watcher` refuses if no baseline exists, or if a watcher is
+already alive for this `(case, client)` pair — surface either refusal
+verbatim rather than retrying. On success it returns the sidecar `pid`,
+the `pid_file`/`log_file`, the uploaded detector artifacts, and a
+`warnings` list. **Surface every `warnings` entry to the operator
+verbatim.** In particular, restricting `detectors=` to `NewProcess`
+without `NewPersistence` warns of a persistence blind spot: the
+NewProcess scheduled-work exemption suppresses process alerts for
+cron-launched system binaries, and NewPersistence is the file-side
+detector that catches a newly-planted cron job. Keep them enabled
+together unless an operator has explicitly accepted the gap for an
+ephemeral host.
+
+### 5b. Start the external-detection ingest (only if the case uses one)
+If `<case_dir>/monitoring/config.json` has a `cef_ingest` block, the case is
+fed by an external deception/SIEM platform (Acalvio ShadowPlex CEF) in
+addition to — or instead of — the host detectors. Start the ingest sidecar:
+```
+monitor.start_cef_ingest(case_id, listen=<cef_ingest.listen or "0.0.0.0:5514">)
+```
+It receives ShadowPlex CEF over UDP syslog and writes
+`Custom.TRUDI.DecoyTouch` alerts into the same queue, so the
+`/trudi-check-alerts` / `/trudi-watch-alerts` loop consumes them unchanged.
+It registers under `watchers/` as the `cef-ingest` pseudo-client, so
+`monitor.list_watchers` shows it alive. Skip this step for cases with no
+`cef_ingest` block. If the case has NO Velociraptor baseline/watcher (a
+pure external-detection case), steps 3–5 may be skipped — the ingest is the
+only producer — but a baseline on the touching host is still needed before
+`respond.*` will act (the `live_monitoring_scope` gate).
+
+### 6. Confirm + report
+- Confirm the sidecar pid is alive (`ps -p <pid>`).
+- Report: client_id, the detectors registered, the watcher pid, the
+  `cef-ingest` pid if started, and the dashboard URL.
+- For CEF cases, report whether authenticated senders and source/decoy bindings
+  are configured. Raw UDP remains collection-only. Demo key setup and the case
+  `cef_ingest.senders` configuration are documented in `docs/live-monitoring.md`.
+- Remind the operator they can now stage activity on the victim and run
+  `/loop 15s /trudi-check-alerts` to investigate alerts as they fire.
+
+## Notes
+- This is orchestration, not investigation — no `dair_assess` /
+  `reason.*` chain is required, only the active execution log from step 2.
+- One watcher per `(case, client)`. To restart cleanly after a config or
+  detector-template change, run `/trudi-stop-watcher` first, then this.

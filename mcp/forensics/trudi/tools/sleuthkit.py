@@ -1,0 +1,374 @@
+"""The Sleuth Kit — filesystem navigation and timeline tools."""
+import shutil
+from typing import Optional
+from fastmcp import FastMCP
+from core import run, run_with_output_file, output_safe, DEFAULT_TIMEOUT, VOL_TIMEOUT, PLASO_TIMEOUT
+from core.paths import assert_output_safe
+
+mcp = FastMCP("sleuthkit")
+
+# sudo resets the environment, so the host's local zone would leak into
+# printed times (a reviewer then reads a 4-hour offset as a contradiction).
+_UTC = ["env", "TZ=UTC"]
+
+
+@mcp.tool()
+@output_safe
+def tsk_mmls(image: str) -> dict:
+    """Display partition table (MBR and GPT) — get sector offsets for mounting."""
+    return run(["mmls", image], needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_fsstat(image: str, offset_sectors: Optional[int] = None) -> dict:
+    """
+    Filesystem metadata: NTFS version, cluster size, MFT offset, volume ID.
+    offset_sectors: sector offset from mmls output (required for partitioned images).
+    """
+    cmd = ["fsstat"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd.append(image)
+    return run(cmd, needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_fls(
+    image: str,
+    offset_sectors: Optional[int] = None,
+    inode: Optional[int] = None,
+    recursive: bool = True,
+    deleted_only: bool = False,
+    bodyfile: bool = False,
+) -> dict:
+    """
+    List files and directories in a disk image, including deleted entries (marked *).
+    offset_sectors: from mmls output.
+    inode: list a specific directory by inode number.
+    recursive: recurse into subdirectories.
+    bodyfile: output in mactime bodyfile format for timeline creation.
+    deleted_only: show only deleted entries.
+    """
+    cmd = _UTC + ["fls"]
+    if recursive:
+        cmd.append("-r")
+    if bodyfile:
+        cmd += ["-m", "/"]
+    if deleted_only:
+        cmd.append("-d")
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd.append(image)
+    if inode is not None:
+        cmd.append(str(inode))
+    return run(cmd, needs_sudo=True, timeout=VOL_TIMEOUT)
+
+
+@mcp.tool()
+@output_safe
+def tsk_istat(image: str, inode: int, offset_sectors: Optional[int] = None) -> dict:
+    """
+    Display inode metadata: MAC times, size, allocated blocks, file type.
+    offset_sectors: from mmls output.
+    """
+    cmd = _UTC + ["istat"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, str(inode)]
+    return run(cmd, needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_icat(
+    image: str,
+    inode: str,
+    output_path: str,
+    offset_sectors: Optional[int] = None,
+    recover_deleted: bool = False,
+    slack_space: bool = False,
+) -> dict:
+    """
+    Extract file content by inode number to output_path.
+    inode: can be a number or 'number-stream-id' for ADS (e.g. '11-128-4').
+    recover_deleted: attempt recovery of deleted file data.
+    slack_space: extract file slack space.
+    """
+    cmd = ["icat"]
+    if recover_deleted:
+        cmd.append("-r")
+    if slack_space:
+        cmd.append("-s")
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, str(inode)]
+    return run_with_output_file(
+        cmd, output_path=output_path, mode="wb", timeout=120, needs_sudo=True,
+    )
+
+
+@mcp.tool()
+@output_safe
+def tsk_ils(
+    image: str,
+    offset_sectors: Optional[int] = None,
+    orphan_only: bool = False,
+    unallocated_only: bool = False,
+    allocated_only: bool = False,
+) -> dict:
+    """
+    List inodes in a filesystem.
+    orphan_only: unlinked inodes (deleted files with no directory entry).
+    unallocated_only: only unallocated inodes.
+    allocated_only: only allocated inodes.
+    """
+    cmd = _UTC + ["ils"]
+    if orphan_only:
+        cmd.append("-p")
+    elif unallocated_only:
+        cmd.append("-A")
+    elif allocated_only:
+        cmd.append("-a")
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd.append(image)
+    return run(cmd, needs_sudo=True, timeout=DEFAULT_TIMEOUT)
+
+
+@mcp.tool()
+@output_safe
+def tsk_ffind(image: str, inode: int, offset_sectors: Optional[int] = None) -> dict:
+    """Find the filename(s) for a given inode number."""
+    cmd = ["ffind"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, str(inode)]
+    return run(cmd, needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_blkls(
+    image: str,
+    output_path: str,
+    offset_sectors: Optional[int] = None,
+    unallocated_only: bool = True,
+) -> dict:
+    """
+    Extract raw disk blocks for carving.
+    unallocated_only: extract only unallocated blocks (default — for carving).
+    output_path: destination file for raw block data.
+    """
+    cmd = ["blkls"]
+    if unallocated_only:
+        cmd.append("-A")
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd.append(image)
+    return run_with_output_file(
+        cmd, output_path=output_path, mode="wb", timeout=VOL_TIMEOUT, needs_sudo=True,
+    )
+
+
+@mcp.tool()
+@output_safe
+def tsk_recover(
+    image: str,
+    output_dir: str,
+    offset_sectors: Optional[int] = None,
+    include_unallocated: bool = False,
+) -> dict:
+    """
+    Bulk extract files from a disk image.
+    include_unallocated: also recover deleted/unallocated files.
+    """
+    cmd = ["tsk_recover"]
+    if include_unallocated:
+        cmd.append("-e")
+    else:
+        cmd.append("-a")
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, output_dir]
+    return run(cmd, needs_sudo=True, timeout=VOL_TIMEOUT*3, output_dir=output_dir)
+
+
+@mcp.tool()
+@output_safe
+def tsk_mactime(
+    bodyfile: str,
+    output_path: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    csv_output: bool = True,
+) -> dict:
+    """
+    Generate a MAC timeline from a bodyfile (output of fls -m).
+    start_date / end_date: filter to a date range, format YYYY-MM-DD.
+    csv_output: produce comma-separated output (easier for analysis).
+    """
+    cmd = ["mactime", "-b", bodyfile, "-z", "UTC"]
+    if csv_output:
+        cmd.append("-d")
+    if start_date:
+        cmd.append(start_date)
+    if end_date:
+        cmd.append(end_date)
+    if output_path:
+        return run_with_output_file(
+            cmd, output_path=output_path, mode="w", timeout=VOL_TIMEOUT,
+        )
+    return run(cmd, timeout=VOL_TIMEOUT)
+
+
+@mcp.tool()
+@output_safe
+def tsk_blkcat(image: str, block_number: int, offset_sectors: Optional[int] = None) -> dict:
+    """Extract raw content of a specific data block."""
+    cmd = ["blkcat"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, str(block_number)]
+    return run(cmd, needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_blkstat(image: str, block_number: int, offset_sectors: Optional[int] = None) -> dict:
+    """Display statistics on a specific data block (allocation status, containing file)."""
+    cmd = ["blkstat"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, str(block_number)]
+    return run(cmd, needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_blkcalc(image: str, block_number: int, offset_sectors: Optional[int] = None) -> dict:
+    """Convert between disk and image block addresses."""
+    cmd = ["blkcalc"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, str(block_number)]
+    return run(cmd, needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_mmcat(image: str, partition_slot: int) -> dict:
+    """Output the contents of a partition slot (raw partition data)."""
+    return run(["mmcat", image, str(partition_slot)], needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_mmstat(image: str) -> dict:
+    """Display statistics about the volume system (disk layout metadata)."""
+    return run(["mmstat", image], needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_hfind(
+    hash_db: str,
+    hash_value: str,
+    lookup_type: str = "md5",
+) -> dict:
+    """
+    Look up a file hash in a hash database (NSRL, hashkeeper, md5sum format).
+    hash_db: path to the hash database file.
+    hash_value: the hash to look up.
+    lookup_type: 'md5', 'sha1', 'nsrl-md5', 'nsrl-sha1'.
+    """
+    return run(["hfind", "-f", lookup_type, hash_db, hash_value])
+
+
+@mcp.tool()
+@output_safe
+def tsk_sigfind(image: str, signature_hex: str, offset_sectors: Optional[int] = None) -> dict:
+    """
+    Find a hex byte signature in a disk image.
+    signature_hex: hex string to search for e.g. 'MZ' header = '4D5A'.
+    Useful for locating hidden PE files or deleted MBR signatures.
+    """
+    cmd = ["sigfind"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, signature_hex]
+    return run(cmd, needs_sudo=True, timeout=VOL_TIMEOUT)
+
+
+@mcp.tool()
+@output_safe
+def tsk_sorter(
+    image: str,
+    output_dir: str,
+    offset_sectors: Optional[int] = None,
+    category: Optional[str] = None,
+) -> dict:
+    """
+    Sort files from a disk image into categories based on file type.
+    output_dir: destination for sorted file categories.
+    category: limit to a specific category e.g. 'images', 'exec', 'audio', 'documents'.
+    """
+    cmd = ["sorter", "-d", output_dir]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    if category:
+        cmd += ["-s", category]
+    cmd.append(image)
+    return run(cmd, needs_sudo=True, timeout=VOL_TIMEOUT, output_dir=output_dir)
+
+
+@mcp.tool()
+@output_safe
+def tsk_jls(image: str, offset_sectors: Optional[int] = None) -> dict:
+    """
+    List journal entries from an ext3/ext4 filesystem.
+    Useful for recovering deleted files on Linux disk images.
+    """
+    cmd = ["jls"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd.append(image)
+    return run(cmd, needs_sudo=True, timeout=DEFAULT_TIMEOUT)
+
+
+@mcp.tool()
+@output_safe
+def tsk_jcat(image: str, journal_inode: int, offset_sectors: Optional[int] = None) -> dict:
+    """
+    Output the contents of an ext3/ext4 journal entry by inode number.
+    Use after tsk_jls to inspect a specific journal block.
+    """
+    cmd = ["jcat"]
+    if offset_sectors:
+        cmd += ["-o", str(offset_sectors)]
+    cmd += [image, str(journal_inode)]
+    return run(cmd, needs_sudo=True)
+
+
+@mcp.tool()
+@output_safe
+def tsk_indxparse(mft_path: str, output_path: Optional[str] = None) -> dict:
+    """
+    Parse NTFS $INDX records (directory index slack) using INDXParse.py.
+    Recovers deleted directory entries that MFTECmd and Vol3 miss.
+
+    mft_path: path to the $MFT file (or any file containing $INDX records).
+    output_path: optional output destination (analysis/exports/reports).
+    """
+    binary = shutil.which("INDXParse.py") or "/usr/local/bin/INDXParse.py"
+    cmd = [binary, "-d", "-f", mft_path]
+    result = run(cmd, timeout=600)
+    if output_path and result.get("success") and result.get("stdout"):
+        try:
+            with open(output_path, "w") as f:
+                f.write(result["stdout"])
+            result["output_path"] = output_path
+        except OSError as e:
+            result["write_error"] = str(e)
+    return result

@@ -1,0 +1,559 @@
+"""Tests for the TRUDI dashboard discovery + standalone server.
+
+The dashboard runs as a separate long-lived process (`trudi-dashboard`,
+i.e. `python -m dashboard.serve`). MCP-side code never spawns a server;
+it discovers the running one via ~/.cache/trudi/dashboard.url and returns
+a deep-link URL pre-loaded with the case's trace.
+"""
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import socket
+import threading
+import time
+from unittest.mock import patch
+
+import pytest
+
+
+def _free_port() -> int:
+    s = socket.socket(); s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]; s.close()
+    return p
+
+
+@pytest.fixture
+def standalone_server(tmp_path):
+    """Spin up dashboard.serve in a thread, isolated under tmp_path."""
+    from dashboard import serve as dash_serve
+
+    cases_root = tmp_path / "cases"
+    cases_root.mkdir()
+    port = _free_port()
+
+    discovery = tmp_path / "discovery.json"
+    with patch.object(dash_serve, "DISCOVERY_FILE", str(discovery)):
+        httpd, chosen = dash_serve._bind(str(cases_root), port)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        dash_serve._write_discovery(
+            f"http://127.0.0.1:{chosen}/_dashboard/dashboard.html",
+            chosen, str(cases_root),
+        )
+        try:
+            time.sleep(0.05)
+            yield {
+                "cases_root": cases_root,
+                "port": chosen,
+                "discovery": discovery,
+                "url": f"http://127.0.0.1:{chosen}/_dashboard/dashboard.html",
+            }
+        finally:
+            httpd.shutdown()
+            dash_serve._clear_discovery()
+
+
+def _seed_case(cases_root, case_dir_name, case_id, trace_name=None):
+    case = cases_root / case_dir_name
+    case.mkdir()
+    (case / "CLAUDE.md").write_text(f"**Case ID**: {case_id}\n")
+    (case / "analysis").mkdir()
+    if trace_name:
+        (case / "analysis" / trace_name).write_text(
+            json.dumps({"case_id": case_id, "entries": []})
+        )
+    return case
+
+
+class TestStandaloneServer:
+    def test_redirect_to_dashboard(self, standalone_server):
+        port = standalone_server["port"]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        assert resp.status == 302
+        assert resp.getheader("Location") == "/_dashboard/dashboard.html"
+
+    def test_serves_dashboard_html(self, standalone_server):
+        port = standalone_server["port"]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/_dashboard/dashboard.html")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        assert resp.status == 200
+        assert "TRUDI Trace" in body
+        # The case + trace dropdowns are the centrepiece of the redesign
+        assert 'id="case-select"' in body
+        assert 'id="trace-select"' in body
+
+    def test_serves_chain_view(self, standalone_server):
+        port = standalone_server["port"]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/_dashboard/chain_view.html")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        assert b"dagre" in resp.read()
+
+    def test_serves_vendor_dagre(self, standalone_server):
+        port = standalone_server["port"]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/_dashboard/vendor/dagre.min.js")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        assert resp.getheader("Content-Type").startswith("application/javascript")
+
+    def test_dashboard_asset_rejects_traversal(self, standalone_server):
+        port = standalone_server["port"]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/_dashboard/../tools/misc.py")
+        resp = conn.getresponse()
+        # SimpleHTTPRequestHandler normalizes the path before do_GET sees it,
+        # so traversal under the dashboard prefix never reaches the source dir.
+        assert resp.status in (403, 404)
+
+    def test_api_cases_lists_seeded_cases(self, standalone_server):
+        cases_root = standalone_server["cases_root"]
+        _seed_case(cases_root, "alpha-case", "ALPHA",
+                   trace_name="ALPHA_trace.json")
+        _seed_case(cases_root, "beta-case", "BETA",
+                   trace_name="BETA_trace.json")
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", standalone_server["port"], timeout=2,
+        )
+        conn.request("GET", "/_dashboard/api/cases")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        data = json.loads(resp.read())
+        ids = {c["case_id"] for c in data["cases"]}
+        assert {"ALPHA", "BETA"} <= ids
+        alpha = next(c for c in data["cases"] if c["case_id"] == "ALPHA")
+        assert alpha["traces"][0]["path"] == "/alpha-case/analysis/ALPHA_trace.json"
+
+    def test_api_cases_picks_up_new_trace_without_restart(self, standalone_server):
+        cases_root = standalone_server["cases_root"]
+        case = _seed_case(cases_root, "live-case", "LIVE")
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", standalone_server["port"], timeout=2,
+        )
+        conn.request("GET", "/_dashboard/api/cases")
+        before = json.loads(conn.getresponse().read())
+        live = next(c for c in before["cases"] if c["case_id"] == "LIVE")
+        assert live["traces"] == []
+        # Drop a trace while the server is running.
+        (case / "analysis" / "LIVE_trace.json").write_text(
+            '{"case_id":"LIVE","entries":[]}'
+        )
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", standalone_server["port"], timeout=2,
+        )
+        conn.request("GET", "/_dashboard/api/cases")
+        after = json.loads(conn.getresponse().read())
+        live2 = next(c for c in after["cases"] if c["case_id"] == "LIVE")
+        assert len(live2["traces"]) == 1
+
+    def test_serves_trace_json_from_case(self, standalone_server):
+        cases_root = standalone_server["cases_root"]
+        _seed_case(cases_root, "ts-case", "TS",
+                   trace_name="TS_trace.json")
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", standalone_server["port"], timeout=2,
+        )
+        conn.request("GET", "/ts-case/analysis/TS_trace.json")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        assert b'"case_id": "TS"' in resp.read()
+
+
+class TestServeDashboardDiscovery:
+    """The MCP `serve_dashboard` tool just builds a deep-link URL into the
+    running standalone dashboard."""
+
+    def test_no_dashboard_returns_hint(self, tmp_path, monkeypatch):
+        from tools import misc
+        case = tmp_path / "fallback-case"
+        case.mkdir()
+        (case / "CLAUDE.md").write_text("**Case ID**: FALLBACK\n")
+        monkeypatch.setattr(
+            misc, "_DASHBOARD_DISCOVERY_FILE", str(tmp_path / "missing.url"),
+        )
+        r = misc.launch_dashboard(str(case))
+        assert r["success"] is False
+        assert "trudi-dashboard" in r["error"]
+        # The hint URL still uses the case's expected trace path so the
+        # operator can open it as soon as the dashboard is running.
+        assert "?trace=/fallback-case/analysis/FALLBACK_trace.json" in r["hint_url"]
+
+    def test_invalid_case_dir(self, tmp_path):
+        from tools import misc
+        r = misc.launch_dashboard(str(tmp_path / "nope"))
+        assert r["success"] is False
+        assert "not a directory" in r["error"]
+
+    def test_live_dashboard_returns_deep_link(self, standalone_server, monkeypatch):
+        from tools import misc
+
+        cases_root = standalone_server["cases_root"]
+        case = _seed_case(cases_root, "deep-case", "DEEP")
+        monkeypatch.setattr(
+            misc, "_DASHBOARD_DISCOVERY_FILE", str(standalone_server["discovery"]),
+        )
+        r = misc.launch_dashboard(str(case))
+        assert r["success"] is True
+        assert r["url"].startswith(standalone_server["url"])
+        assert "?trace=/deep-case/analysis/DEEP_trace.json" in r["url"]
+        assert r["case_id"] == "DEEP"
+
+    def test_case_outside_cases_root_refuses(
+        self, standalone_server, tmp_path, monkeypatch,
+    ):
+        from tools import misc
+
+        outsider = tmp_path / "outside-case"
+        outsider.mkdir()
+        (outsider / "CLAUDE.md").write_text("**Case ID**: OUT\n")
+        monkeypatch.setattr(
+            misc, "_DASHBOARD_DISCOVERY_FILE", str(standalone_server["discovery"]),
+        )
+        r = misc.launch_dashboard(str(outsider))
+        assert r["success"] is False
+        assert "outside the dashboard's cases_root" in r["error"]
+
+    def test_stale_discovery_file_is_ignored(self, tmp_path, monkeypatch):
+        """A discovery file with a dead PID must not look like a live dashboard."""
+        from tools import misc
+
+        case = tmp_path / "stale-case"
+        case.mkdir()
+        (case / "CLAUDE.md").write_text("**Case ID**: STALE\n")
+        discovery = tmp_path / "stale.json"
+        # PID 1 is init — exists, but won't match a Python dashboard.
+        # Use a definitely-dead PID instead by picking a very large one.
+        discovery.write_text(json.dumps({
+            "url": "http://127.0.0.1:65535/_dashboard/dashboard.html",
+            "port": 65535,
+            "cases_root": str(tmp_path),
+            "pid": 999999,
+        }))
+        monkeypatch.setattr(misc, "_DASHBOARD_DISCOVERY_FILE", str(discovery))
+        r = misc.launch_dashboard(str(case))
+        assert r["success"] is False
+        assert "no standalone dashboard reachable" in r["error"]
+
+
+class TestStartExecutionLogIntegratesDashboard:
+    def test_url_written_when_dashboard_live(
+        self, standalone_server, tmp_path, monkeypatch,
+    ):
+        from tools import misc
+        from tools.misc import start_execution_log
+        from core.execution_log import log as global_log
+
+        cases_root = standalone_server["cases_root"]
+        case = _seed_case(cases_root, "EL-CASE", "EL-CASE")
+        log_path = str(case / "analysis" / "EL-CASE_trace.json")
+        monkeypatch.setattr(
+            misc, "_DASHBOARD_DISCOVERY_FILE", str(standalone_server["discovery"]),
+        )
+        with patch("core.execution_log._SESSION_FILE", str(tmp_path / "sess.json")):
+            r = start_execution_log("EL-CASE", log_path)
+        assert r["success"] is True
+        assert r.get("dashboard_url"), r
+        assert "?trace=/EL-CASE/analysis/EL-CASE_trace.json" in r["dashboard_url"]
+        # Also persisted next to the trace so the operator can grab it from
+        # the analysis dir.
+        url_file = case / "analysis" / "dashboard.url"
+        assert url_file.exists()
+        assert r["dashboard_url"] in url_file.read_text()
+        # Happy path: the only system_error allowed is the trace_initialized
+        # sentinel that start_execution_log writes to verify the trace path.
+        # Anything else means a silent failure slipped through.
+        bad = [e for e in global_log._entries
+               if e.get("type") == "system_error"
+               and e.get("category") != "trace_initialized"]
+        assert not bad, f"unexpected system_error entries on happy path: {bad}"
+
+    def test_no_dashboard_surfaces_hint(
+        self, tmp_path, monkeypatch,
+    ):
+        from tools import misc
+        from tools.misc import start_execution_log
+
+        case = tmp_path / "OFFLINE-CASE"
+        case.mkdir()
+        (case / "CLAUDE.md").write_text("**Case ID**: OFFLINE-CASE\n")
+        (case / "analysis").mkdir()
+        log_path = str(case / "analysis" / "OFFLINE-CASE_trace.json")
+        monkeypatch.setattr(
+            misc, "_DASHBOARD_DISCOVERY_FILE", str(tmp_path / "missing.url"),
+        )
+        with patch("core.execution_log._SESSION_FILE", str(tmp_path / "sess.json")):
+            r = start_execution_log("OFFLINE-CASE", log_path)
+        assert r["success"] is True
+        assert "dashboard_url" not in r
+        assert r.get("dashboard_error")
+        assert r.get("dashboard_hint_url")
+
+    def test_launch_dashboard_false_skips_discovery(self, tmp_path):
+        from tools.misc import start_execution_log
+        case = tmp_path / "SKIP-CASE"
+        case.mkdir()
+        (case / "CLAUDE.md").write_text("**Case ID**: SKIP-CASE\n")
+        (case / "analysis").mkdir()
+        log_path = str(case / "analysis" / "SKIP-CASE_trace.json")
+        with patch("core.execution_log._SESSION_FILE", str(tmp_path / "sess.json")):
+            r = start_execution_log(
+                "SKIP-CASE", log_path, launch_dashboard=False,
+            )
+        assert r["success"] is True
+        assert "dashboard_url" not in r
+        assert "dashboard_error" not in r
+        assert not (case / "analysis" / "dashboard.url").exists()
+
+
+class TestTraceNameFidelity:
+    """The deep link and the trace filename must describe the REAL file —
+    a model that names the trace unexpectedly must not make the run
+    invisible to the dashboard (observed live: output_path without .json +
+    a {detected_case_id}_trace.json guess → dashboard showed nothing)."""
+
+    def test_launch_dashboard_deep_links_actual_trace(
+        self, standalone_server, monkeypatch,
+    ):
+        from tools import misc
+
+        cases_root = standalone_server["cases_root"]
+        case = _seed_case(cases_root, "fidelity-case", "FID")
+        monkeypatch.setattr(
+            misc, "_DASHBOARD_DISCOVERY_FILE", str(standalone_server["discovery"]),
+        )
+        r = misc.launch_dashboard(
+            str(case), trace_path=str(case / "analysis" / "ODD-NAME_trace.json"))
+        assert r["success"] is True
+        assert "?trace=/fidelity-case/analysis/ODD-NAME_trace.json" in r["url"]
+
+    def test_start_execution_log_appends_json_extension(self, tmp_path):
+        from tools import misc
+
+        case = tmp_path / "ext-case"
+        (case / "analysis").mkdir(parents=True)
+        r = misc.start_execution_log(
+            "EXT-TEST", str(case / "analysis" / "EXT-TEST_trace"),
+            launch_dashboard=False)
+        assert r["success"] is True
+        assert r["log_path"].endswith("EXT-TEST_trace.json")
+        assert (case / "analysis" / "EXT-TEST_trace.json").exists()
+        assert not (case / "analysis" / "EXT-TEST_trace").exists()
+
+
+class TestOutputEndpoint:
+    """/_dashboard/api/output serves a trace's produced output (stdout
+    sidecars, evidence-fetch results, exports) read-only — nothing else."""
+
+    def _get(self, port, trace, path, extra=""):
+        from urllib.parse import quote
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", f"/_dashboard/api/output?trace={quote(trace)}&path={quote(path)}{extra}")
+        resp = conn.getresponse()
+        return resp.status, resp.read(), resp
+
+    def _seed(self, cases_root):
+        case = _seed_case(cases_root, "c1", "C-1", "C-1_trace.json")
+        (case / "analysis" / ".tool_output").mkdir()
+        (case / "analysis" / ".tool_output" / "7.txt").write_text("A,B\n1,2\n")
+        (case / "exports" / "mft").mkdir(parents=True)
+        (case / "exports" / "mft" / "mft.csv").write_text("x" * 5000)
+        (case / "analysis" / "secret.txt").write_text("nope")
+        (case / "evidence").mkdir()
+        (case / "evidence" / "disk.raw").write_text("evidence")
+        (case / "exports" / "link").symlink_to(case / "evidence" / "disk.raw")
+        return case
+
+    def test_serves_sidecar_and_export(self, standalone_server):
+        root, port = standalone_server["cases_root"], standalone_server["port"]
+        case = self._seed(root)
+        trace = "/c1/analysis/C-1_trace.json"
+        st, body, _ = self._get(port, trace, str(case / "analysis" / ".tool_output" / "7.txt"))
+        assert st == 200 and body == b"A,B\n1,2\n"
+        st, body, resp = self._get(port, trace, "exports/mft/mft.csv", "&max=100")
+        assert st == 200 and len(body) == 100
+        assert resp.getheader("X-Trudi-Truncated") == "1"
+        assert resp.getheader("X-Trudi-Size") == "5000"
+
+    def test_relocated_case_path_is_rerooted(self, standalone_server):
+        root, port = standalone_server["cases_root"], standalone_server["port"]
+        self._seed(root)
+        st, body, _ = self._get(port, "/c1/analysis/C-1_trace.json",
+                                "/old/home/cases/orig/analysis/.tool_output/7.txt")
+        assert st == 200 and body.startswith(b"A,B")
+
+    @pytest.mark.parametrize("path", [
+        "analysis/secret.txt",
+        "analysis/.tool_output/../secret.txt",
+        "exports/../evidence/disk.raw",
+        "exports/link",                       # symlink out of exports/
+        "/etc/passwd",
+        "/x/analysis/.tool_output/../../../../etc/passwd",
+        "analysis/C-1_trace.json",
+    ])
+    def test_refuses_everything_else(self, standalone_server, path):
+        root, port = standalone_server["cases_root"], standalone_server["port"]
+        self._seed(root)
+        st, body, _ = self._get(port, "/c1/analysis/C-1_trace.json", path)
+        assert st in (403, 404) and b"evidence" not in body and b"nope" not in body
+
+    def test_refuses_bad_trace(self, standalone_server):
+        root, port = standalone_server["cases_root"], standalone_server["port"]
+        self._seed(root)
+        for trace in ("/c1/analysis/../../c1/analysis/C-1_trace.json", "/c1/CLAUDE.md", ""):
+            st, _, _ = self._get(port, trace, "exports/mft/mft.csv")
+            assert st == 403
+
+
+def test_trace_viewer_type_filters_are_written_types():
+    """Every type filter in the trace view names an entry type the code base
+    writes (no dead filters), and the newer written types have filters."""
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tv = open(os.path.join(root, "dashboard", "trace_viewer.html")).read()
+    offered = set(re.findall(r'class="type-filter" value="([a-z_]+)"', tv))
+    written = set()
+    for sub in ("core", "tools", "claude"):
+        for dp, _dn, fns in os.walk(os.path.join(root, sub)):
+            for fn in fns:
+                if fn.endswith(".py"):
+                    src = open(os.path.join(dp, fn), encoding="utf-8").read()
+                    written |= set(re.findall(r"""["']type["']\s*:\s*["']([a-z_]+)["']""", src))
+    assert offered, "no type filters found"
+    assert offered <= written, f"dead filters: {sorted(offered - written)}"
+    for t in ("phase_transition", "finding_submission", "ioc", "reason_evidence_fetch"):
+        assert t in offered, f"missing filter for {t}"
+    assert "phase_work" not in tv and "FOLLOW-UP" not in tv
+
+
+def test_views_share_the_finding_renderer(standalone_server):
+    """trace view and chain view load the same trace_render.js, which renders
+    the finding detail (typed claim, tier, gate) and read.* output tables."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for page in ("trace_viewer.html", "chain_view.html"):
+        body = open(os.path.join(root, "dashboard", page), encoding="utf-8").read()
+        assert '<script src="trace_render.js"></script>' in body, page
+        assert "findingDetailHtml(" in body, page
+    js = open(os.path.join(root, "dashboard", "trace_render.js"), encoding="utf-8").read()
+    for fn in ("findingDetailHtml", "parseDelimited", "parseReadCmd", "parseMailLines",
+               "outputHtml", "fetchOutput"):
+        assert f"TR.{fn} = " in js, fn
+    conn = http.client.HTTPConnection("127.0.0.1", standalone_server["port"], timeout=2)
+    conn.request("GET", "/_dashboard/trace_render.js")
+    resp = conn.getresponse()
+    assert resp.status == 200 and b"TrudiRender" in resp.read()
+    assert resp.getheader("Content-Type").startswith("application/javascript")
+
+
+class TestReportViewer:
+    """Report list/render endpoints behind the dashboard's report viewer."""
+
+    def _case(self, tmp_path):
+        case = tmp_path / "cases" / "c1"
+        (case / "analysis").mkdir(parents=True)
+        (case / "reports").mkdir()
+        (case / "analysis" / "C1_trace.json").write_text("{}")
+        (case / "reports" / "C1_report.md").write_text(
+            "# Report\n\nSee cid96 and F-137, call 92.\n\n| a | b |\n|---|---|\n| 1 | `cid5` |\n"
+            "\n<script>alert(1)</script>\n")
+        (case / "reports" / "C1_trace.md").write_text("# trace")
+        (case / "evidence").mkdir()
+        (case / "evidence" / "secret.md").write_text("x")
+        return str(tmp_path / "cases"), "/c1/analysis/C1_trace.json"
+
+    def test_lists_reports_final_first(self, tmp_path):
+        from dashboard.serve import list_reports
+        root, trace = self._case(tmp_path)
+        names = [r["name"] for r in list_reports(root, trace)["reports"]]
+        assert names[0] == "C1_report.md" and "C1_trace.md" in names
+
+    def test_renders_tables_links_calls_and_drops_raw_html(self, tmp_path):
+        from dashboard.serve import render_report
+        root, trace = self._case(tmp_path)
+        html, err = render_report(root, trace, "C1_report.md")
+        assert not err and "<table>" in html
+        assert 'data-cid="96"' in html and 'data-cid="137"' in html and 'data-cid="92"' in html
+        assert 'data-cid="5"' not in html                 # not inside code
+        assert "<script>" not in html
+
+    def test_refuses_other_files(self, tmp_path):
+        from dashboard.serve import render_report
+        root, trace = self._case(tmp_path)
+        for bad in ("../evidence/secret.md", "C1_report.txt", "/etc/passwd", ""):
+            assert render_report(root, trace, bad)[0] is None
+        assert render_report(root, "/c1/evidence/secret.md", "C1_report.md")[0] is None
+
+    def test_download_sends_the_markdown_as_an_attachment(self, standalone_server):
+        import shutil
+        import urllib.parse
+        src_root, trace = self._case(standalone_server["cases_root"].parent / "src")
+        shutil.copytree(os.path.join(src_root, "c1"), standalone_server["cases_root"] / "c1")
+        conn = http.client.HTTPConnection("127.0.0.1", standalone_server["port"], timeout=2)
+
+        def get(name):
+            q = urllib.parse.urlencode({"trace": trace, "name": name})
+            conn.request("GET", f"/_dashboard/api/report_download?{q}")
+            r = conn.getresponse()
+            return r, r.read()
+
+        resp, body = get("C1_report.md")
+        assert resp.status == 200 and body.startswith(b"# Report") and b"<script>" in body
+        assert resp.getheader("Content-Disposition") == 'attachment; filename="C1_report.md"'
+        assert resp.getheader("Content-Type").startswith("text/markdown")
+        for bad in ("../evidence/secret.md", "C1_report.txt", "missing.md"):
+            assert get(bad)[0].status in (403, 404), bad
+
+    def test_viewer_has_a_download_button(self):
+        page = open(os.path.join(os.path.dirname(__file__), "..", "..", "dashboard",
+                                 "report_view.html"), encoding="utf-8").read()
+        assert 'id="download"' in page and "api('report_download'" in page
+
+
+class TestImagePreview:
+    """Image preview endpoints: case-scoped paths, header-byte type check."""
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    def _case(self, tmp_path):
+        root = tmp_path / "cases"
+        case = root / "c1"
+        (case / "analysis" / ".tool_output").mkdir(parents=True)
+        (case / "analysis" / "C1_trace.json").write_text("{}")
+        (case / "exports" / "carve" / "png").mkdir(parents=True)
+        (case / "exports" / "carve" / "png" / "00001.png").write_bytes(self.PNG)
+        (case / "exports" / "fake.png").write_text("not an image")
+        shared = tmp_path / "shared_evidence"
+        (shared / "DCIM").mkdir(parents=True)
+        (shared / "DCIM" / "IMG_0001.JPG").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16)
+        (case / "evidence").symlink_to(shared)                       # evidence as a symlink
+        (tmp_path / "outside.png").write_bytes(self.PNG)
+        return str(root), "/c1/analysis/C1_trace.json", case
+
+    def test_serves_real_images_from_case_roots(self, tmp_path):
+        from dashboard.serve import resolve_image_file
+        root, trace, case = self._case(tmp_path)
+        full, ctype, err = resolve_image_file(root, trace, str(case / "exports/carve/png/00001.png"))
+        assert full and ctype == "image/png" and not err
+        full, ctype, _ = resolve_image_file(root, trace, str(case / "evidence/DCIM/IMG_0001.JPG"))
+        assert full and ctype == "image/jpeg"
+
+    def test_refuses_non_images_and_paths_outside_the_case(self, tmp_path):
+        from dashboard.serve import resolve_image_file
+        root, trace, case = self._case(tmp_path)
+        assert resolve_image_file(root, trace, str(case / "exports/fake.png"))[0] is None
+        assert resolve_image_file(root, trace, str(tmp_path / "outside.png"))[0] is None
+        assert resolve_image_file(root, trace, "../../outside.png")[0] is None
+        assert resolve_image_file(root, trace, str(case / "analysis/C1_trace.json"))[0] is None
+
+    def test_lists_images_in_an_output_folder(self, tmp_path):
+        from dashboard.serve import list_images
+        root, trace, case = self._case(tmp_path)
+        res = list_images(root, trace, str(case / "exports/carve"))
+        assert res["total"] == 1 and res["images"][0].endswith("00001.png")
+        assert list_images(root, trace, str(tmp_path))["images"] == []
