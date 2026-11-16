@@ -1,0 +1,12 @@
+.github
+.vscode
+script
+third-party
+.dockerignore
+.gitignore
+**/*.yml
+**/*.yaml
+**/*.md
+!pkg/skills/catalog/skills/**/*.md
+**/*_test.go
+LICENSE

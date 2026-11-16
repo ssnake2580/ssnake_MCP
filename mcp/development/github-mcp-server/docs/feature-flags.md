@@ -1,0 +1,546 @@
+# Feature Flags
+
+Feature flags let you opt into experimental tool behavior on top of the default
+GitHub MCP Server surface. Insiders Mode turns on a curated subset of these
+flags automatically — see [Insiders Features](./insiders-features.md) for that
+specific set.
+
+For background on how flags resolve at request time, see the [resolution
+section in the Insiders docs](./insiders-features.md#how-feature-flags-are-resolved).
+
+## Enabling a flag
+
+| Method | Remote Server | Local Server |
+|--------|---------------|--------------|
+| Header | `X-MCP-Features: <flag>,<flag>` | N/A |
+| URL query parameter | `?features=<flag>,<flag>` on the server URL | N/A |
+| CLI flag | N/A | `--features=<flag>,<flag>` |
+| Environment variable | N/A | `GITHUB_FEATURES=<flag>,<flag>` |
+
+The URL query parameter exists for clients that compose the server URL on the
+user's behalf (hosted IDEs, agent platforms) and cannot set custom headers.
+When both the query parameter and the header are present, the header wins —
+even when its value is empty, whitespace-only, or contains only unknown flags.
+The two channels are never combined.
+
+The complete query string is preserved during OAuth protected-resource metadata
+discovery because it is part of the canonical resource identifier. Query
+parameters also participate in HTTP cache keys, while MCP responses vary on
+`X-MCP-Features` so a header override cannot reuse a response selected for a
+different feature set. Feature names are configuration identifiers, not
+secrets; as with any URL query value, they may appear in client history, proxy
+logs, and server access logs.
+
+Only flags listed in
+[`AllowedFeatureFlags`](../pkg/github/feature_flags.go) can be enabled by
+end users. Insiders-only flags are not user-toggleable.
+
+## MCP skills
+
+The `skills` flag replaces server instructions with bundled workflow skills
+served through the `io.modelcontextprotocol/skills` extension. It is off by
+default and enabled automatically in Insiders Mode:
+
+```bash
+github-mcp-server stdio --features=skills
+# Equivalent opt-in: GITHUB_FEATURES=skills
+github-mcp-server stdio --insiders
+```
+
+When enabled, both initialization and `server/discover` omit instructions entirely.
+There is no discovery blurb or fallback instructions for clients without skills
+support. Without the flag, the existing server instructions are unchanged and
+the skills extension is not advertised.
+
+Clients discover skills with paginated `skills/list`, resolve one with
+`skills/get`, and read `skill://github.com/<name>/SKILL.md` and supporting files
+through `resources/read`. Directory reads are also supported. Entries contain
+the file manifests, byte lengths and SHA-256 digests defined by the
+[beta extension specification](https://github.com/modelcontextprotocol/ext-skills/blob/main/specification/beta/skills.mdx).
+
+The catalog is filtered against the current connection's tools: toolsets,
+explicit tools, exclusions, read-only mode, feature variants and token-scope
+filters apply. All required core tools must be available; missing optional tools
+are allowed. A withheld skill is unavailable through listing, direct get,
+directory reads and file reads alike. Tool associations remain server-side:
+there is no `allowed-tools` frontmatter or skill metadata on tools, and loading
+a skill grants no tool permissions.
+
+For a Copilot CLI build with experimental MCP skills support, enable
+`MCP_SKILLS=true` and add a stdio server:
+
+```bash
+MCP_SKILLS=true copilot --additional-mcp-config \
+  '{"mcpServers":{"github":{"type":"local","command":"/absolute/path/to/github-mcp-server","args":["stdio","--features=skills","--toolsets=context"],"tools":["*"]}}}'
+```
+
+In the CLI, use `/skills list` and invoke the discovered server-qualified skill
+command. For the `github` server above, the account skill command is
+`/mcp:github:skill:github.com:account-and-team-context`. Remove the context-only
+toolset restriction to expose workflows supported by the default toolsets.
+
+Supply credentials through the normal server environment, not configuration
+arguments or transcripts. Skill activation requires the client's explicit skill
+consent even with `/allow-all` or `--yolo`. Discovery, command naming and consent
+behavior depend on the CLI build; this flag alone does not establish client
+conformance.
+
+VS Code Insiders can opt into its skills client with
+`chat.agentHost.mcpSkills.enabled: true`, using the same server configuration.
+That setting is a client prerequisite, not a claim that every VS Code build
+supports every extension feature.
+
+Library integrators can extend `catalog.Source()` using `Registry.WithSkills`
+and supply the resulting registry as `MCPServerConfig.SkillsSource`. Set each
+additional skill's `RequiredTools` (groups of alternative tool names) and
+`OptionalTools` before building the registry. The shared constructor filters the
+catalog per request and removes instructions when its feature checker enables
+`github.FeatureFlagSkillsExtension`.
+
+## Declaring tool availability
+
+### Issue artifacts
+
+Enable `--features=issue_artifacts` (or `GITHUB_FEATURES=issue_artifacts`) to
+expose `issue_artifact_read` (`method: list | get`) and `issue_artifact_write`
+(`method: create | update | delete`) in the `issues` toolset.
+This flag is **off by default**, including in Insiders mode. Read-only mode
+exposes only `issue_artifact_read`.
+
+The MCP flag only exposes tools; it does not grant API access. The tools
+use the configured authenticated GitHub client and base URL without an
+endpoint-specific preview header. They declare `repo` in their OAuth challenge
+metadata; API access also depends on the token's permissions and repository
+access. API failures are returned explicitly; writes are not retried.
+
+Artifact numbers are scoped to their owning issue, not global IDs. Updates
+preserve omitted fields, allow `body: ""` to clear the body, and cannot change
+type. Lists return one explicit `page`/`perPage` with bodies; request successive
+pages until fewer than `perPage` artifacts are returned. This works with or
+without REST `Link` headers; the tools do not expose those headers.
+Artifact names and bodies are sanitized as user-authored content.
+Both tools fail closed in lockdown mode because the reference artifact
+response does not identify authors for content-trust checks.
+
+All methods require `owner`, `repo`, and `issue_number`. Get, update, and delete
+also require `artifact_number`. Create requires `type`, `name`, and `body`;
+an empty body is allowed. Update requires `name`, `body`, or both. Method-specific
+fields are rejected when used with another method.
+
+Create and list's optional type filter support the existing REST API types:
+`generic`, `link`, `plan`, and `embedded_html`. For `embedded_html`, supply HTML
+source in `body`. Returned artifact types remain unrestricted for forward
+compatibility.
+
+Get, create, and update return an `artifact` object. List returns a `list` object
+containing `artifacts`, `page`, and `perPage`; delete returns a `deleted` object
+containing `issue_number`, `artifact_number`, and a confirmation message.
+
+Tools, resources, and prompts use `inventory.NewFeatureRule` when feature flags
+change whether they are available. Each rule declares the flags it references
+and evaluates them with a fail-closed `FeatureResolver`, so normal Go boolean
+expressions can represent AND, OR, NOT, and mixed conditions:
+
+```go
+tool.FeatureRule = inventory.NewFeatureRule(
+	[]inventory.FeatureFlag{x, y},
+	func(featureAsBool inventory.FeatureResolver) bool {
+		return !(featureAsBool(x) && featureAsBool(y))
+	},
+)
+```
+
+Library consumers migrating existing inventory declarations should replace
+`FeatureFlagEnable`, `FeatureFlagEnableAll`, and `FeatureFlagDisable` on
+`ServerTool`, `ServerResourceTemplate`, and `ServerPrompt` with `FeatureRule`.
+`FeatureFlagChecker` and `ToolDependencies.IsFeatureEnabled` continue to accept
+string flag names.
+
+Rules are evaluated lazily after request narrowing and static availability
+filters. Normal Go short-circuiting avoids checks that cannot affect the result,
+while one request-owned memo ensures each flag actually reached is resolved at
+most once across tools, resources, prompts, and `deps.IsFeatureEnabled`.
+Unavailable named tool calls skip rule evaluation but remain registered so the
+handler can return the specific client-availability error.
+
+Feature predicates are pure and may depend only on their resolver. Construction
+validates every combination of up to 16 declared flags, so an undeclared lookup
+fails immediately even when ordinary evaluation would short-circuit that
+branch.
+
+The inventory's string-based checker owns request feature state. Once installed,
+that state is authoritative; a checker stored on tool dependencies is used only
+as a fallback when handlers are invoked directly without request state.
+Feature checkers must not call `ResolveFeature`; nested resolution fails the
+owning check closed.
+
+---
+
+## Tools affected by each flag
+
+The list below is regenerated by comparing the default tool surface with each
+user-controllable flag enabled individually. Complex multi-flag rules may
+require separate documentation. Flags that only affect runtime behavior (such
+as output formatting) won't appear here.
+
+<!-- START AUTOMATED FEATURE FLAG TOOLS -->
+
+### `issues_granular`
+
+- **add_issue_comment_reaction** - Add Reaction to Issue or Pull Request Comment
+  - **OAuth Challenge Scopes**: `repo`
+  - `comment_id`: The issue or pull request comment ID (number, required)
+  - `content`: The emoji reaction type (string, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **add_issue_reaction** - Add Reaction to Issue or Pull Request
+  - **OAuth Challenge Scopes**: `repo`
+  - `content`: The emoji reaction type (string, required)
+  - `issue_number`: The issue number (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **add_sub_issue** - Add Sub-Issue
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The parent issue number (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `replace_parent`: If true, reparent the sub-issue if it already has a parent (boolean, optional)
+  - `repo`: Repository name (string, required)
+  - `sub_issue_id`: The ID of the sub-issue to add. ID is not the same as issue number (number, required)
+
+- **create_issue** - Create Issue
+  - **OAuth Challenge Scopes**: `repo`
+  - `body`: Issue body content (optional) (string, optional)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `parent_issue_number`: Issue number of the parent issue. The new issue is created and attached to this parent in the same operation. (number, optional)
+  - `parent_owner`: Repository owner of the parent issue. Must be provided with parent_repo. Omit both to use owner and repo. Only used when parent_issue_number is provided. (string, optional)
+  - `parent_repo`: Repository name of the parent issue. Must be provided with parent_owner. Omit both to use owner and repo. Only used when parent_issue_number is provided. (string, optional)
+  - `repo`: Repository name (string, required)
+  - `title`: Issue title (string, required)
+
+- **hide_issue_comment** - Hide Issue Comment
+  - **OAuth Challenge Scopes**: `repo`
+  - `classifier`: The reason for hiding the comment (string, required)
+  - `comment_id`: The numeric ID of the issue or pull request conversation comment (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **remove_issue_comment_reaction** - Remove Reaction from Issue or Pull Request Comment
+  - **OAuth Challenge Scopes**: `repo`
+  - `comment_id`: The issue or pull request comment ID (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `reaction_id`: The reaction ID to remove (number, required)
+  - `repo`: Repository name (string, required)
+
+- **remove_issue_reaction** - Remove Reaction from Issue or Pull Request
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The issue number (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `reaction_id`: The reaction ID to remove (number, required)
+  - `repo`: Repository name (string, required)
+
+- **remove_sub_issue** - Remove Sub-Issue
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The parent issue number (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+  - `sub_issue_id`: The ID of the sub-issue to remove. ID is not the same as issue number (number, required)
+
+- **reprioritize_sub_issue** - Reprioritize Sub-Issue
+  - **OAuth Challenge Scopes**: `repo`
+  - `after_id`: The ID of the sub-issue to place this after (either after_id OR before_id should be specified) (number, optional)
+  - `before_id`: The ID of the sub-issue to place this before (either after_id OR before_id should be specified) (number, optional)
+  - `issue_number`: The parent issue number (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+  - `sub_issue_id`: The ID of the sub-issue to reorder. ID is not the same as issue number (number, required)
+
+- **set_issue_fields** - Set Issue Fields
+  - **OAuth Challenge Scopes**: `repo`
+  - `fields`: Array of issue field values to set. Each element must have a 'field_id' (string, the GraphQL node ID of the field) and exactly one value field: 'text_value' for text fields, 'number_value' for number fields, 'date_value' (ISO 8601 date string) for date fields, or 'single_select_option_id' (the GraphQL node ID of the option) for single select fields. Set 'delete' to true to remove a field value. (object[], required)
+  - `issue_number`: The issue number to update (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **unhide_issue_comment** - Unhide Issue Comment
+  - **OAuth Challenge Scopes**: `repo`
+  - `comment_id`: The numeric ID of the issue or pull request conversation comment (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **update_issue_assignees** - Update Issue Assignees
+  - **OAuth Challenge Scopes**: `repo`
+  - `assignees`: GitHub usernames to assign to this issue. ([], required)
+  - `issue_number`: The issue number to update (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **update_issue_body** - Update Issue Body
+  - **OAuth Challenge Scopes**: `repo`
+  - `body`: The new body content for the issue (string, required)
+  - `issue_number`: The issue number to update (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **update_issue_labels** - Update Issue Labels
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The issue number to update (number, required)
+  - `labels`: Labels to apply to this issue. ([], required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **update_issue_milestone** - Update Issue Milestone
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The issue number to update (number, required)
+  - `milestone`: The milestone number to set on the issue (integer, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **update_issue_state** - Update Issue State
+  - **OAuth Challenge Scopes**: `repo`
+  - `confidence`: How confident you are in this choice. Use 'HIGH' for clear signal or explicit user request, 'MEDIUM' for reasonable inference with some ambiguity, 'LOW' for best guess with limited signal. (string, optional)
+  - `duplicate_of`: The issue number of the canonical issue this issue duplicates. Only valid when state_reason is 'duplicate'. Required when is_suggestion is true and state_reason is 'duplicate'. The issue number is resolved to a database ID before being sent to the API. (number, optional)
+  - `is_suggestion`: If true, this state change is sent to the API as a suggestion (suggest:true) rather than an applied change. Whether the change is applied or recorded as a proposal is determined by the API. (boolean, optional)
+  - `issue_number`: The issue number to update (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `rationale`: One concise sentence explaining what specifically about the issue led you to choose this state. State the concrete signal (e.g. 'The reported crash is fixed in v2.1' → completed). (string, optional)
+  - `repo`: Repository name (string, required)
+  - `state`: The new state for the issue (string, required)
+  - `state_reason`: The reason for the state change (only for closed state) (string, optional)
+
+- **update_issue_title** - Update Issue Title
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The issue number to update (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+  - `title`: The new title for the issue (string, required)
+
+- **update_issue_type** - Update Issue Type
+  - **OAuth Challenge Scopes**: `repo`
+  - `confidence`: How confident you are in this choice. Use 'HIGH' for clear signal or explicit user request, 'MEDIUM' for reasonable inference with some ambiguity, 'LOW' for best guess with limited signal. (string, optional)
+  - `is_suggestion`: If true, this issue type change is sent to the API as a suggestion (suggest:true) rather than an applied value. Whether the type is applied or recorded as a proposal is determined by the API. (boolean, optional)
+  - `issue_number`: The issue number to update (number, required)
+  - `issue_type`: The issue type to set, or null to remove the current type (string | null, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `rationale`: One concise sentence explaining what specifically about the issue led you to choose this type. State the concrete signal (e.g. 'Reports a crash when saving' → bug, 'Asks for dark mode support' → feature). (string, optional)
+  - `repo`: Repository name (string, required)
+
+### `pull_requests_granular`
+
+- **add_pull_request_review_comment** - Add Pull Request Review Comment
+  - **OAuth Challenge Scopes**: `repo`
+  - `body`: The comment body (string, required)
+  - `line`: The line number in the diff to comment on (optional) (number, optional)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `path`: The relative path of the file to comment on (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+  - `side`: The side of the diff to comment on (optional) (string, optional)
+  - `startLine`: The start line of a multi-line comment (optional) (number, optional)
+  - `startSide`: The start side of a multi-line comment (optional) (string, optional)
+  - `subjectType`: The subject type of the comment (string, required)
+
+- **add_pull_request_review_comment_reaction** - Add Pull Request Review Comment Reaction
+  - **OAuth Challenge Scopes**: `repo`
+  - `comment_id`: The numeric pull request review comment ID. Use the number from a #discussion_r... anchor, not the GraphQL thread node ID (PRRT_...). (number, required)
+  - `content`: The emoji reaction type (string, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **create_pull_request_review** - Create Pull Request Review
+  - **OAuth Challenge Scopes**: `repo`
+  - `body`: The review body text (optional) (string, optional)
+  - `commitID`: The SHA of the commit to review (optional, defaults to latest) (string, optional)
+  - `event`: The review action to perform. If omitted, creates a pending review. (string, optional)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+
+- **delete_pending_pull_request_review** - Delete Pending Pull Request Review
+  - **OAuth Challenge Scopes**: `repo`
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+
+- **hide_pull_request_review** - Hide Pull Request Review
+  - **OAuth Challenge Scopes**: `repo`
+  - `classifier`: The reason for hiding the comment (string, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+  - `review_id`: The numeric ID of the pull request review (number, required)
+
+- **hide_pull_request_review_comment** - Hide Pull Request Review Comment
+  - **OAuth Challenge Scopes**: `repo`
+  - `classifier`: The reason for hiding the comment (string, required)
+  - `comment_id`: The numeric pull request review comment ID. Use the number from a #discussion_r... anchor, not the GraphQL thread node ID (PRRT_...). (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **remove_pull_request_review_comment_reaction** - Remove Pull Request Review Comment Reaction
+  - **OAuth Challenge Scopes**: `repo`
+  - `comment_id`: The numeric pull request review comment ID. Use the number from a #discussion_r... anchor, not the GraphQL thread node ID (PRRT_...). (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `reaction_id`: The reaction ID to remove (number, required)
+  - `repo`: Repository name (string, required)
+
+- **request_pull_request_reviewers** - Request Pull Request Reviewers
+  - **OAuth Challenge Scopes**: `repo`
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+  - `reviewers`: GitHub usernames or ORG/team-slug team reviewers to request reviews from (string[], required)
+
+- **resolve_review_thread** - Resolve Review Thread
+  - **OAuth Challenge Scopes**: `repo`
+  - `threadID`: The node ID of the review thread to resolve (e.g., PRRT_kwDOxxx) (string, required)
+
+- **submit_pending_pull_request_review** - Submit Pending Pull Request Review
+  - **OAuth Challenge Scopes**: `repo`
+  - `body`: The review body text (optional) (string, optional)
+  - `event`: The review action to perform (string, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+
+- **unhide_pull_request_review** - Unhide Pull Request Review
+  - **OAuth Challenge Scopes**: `repo`
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+  - `review_id`: The numeric ID of the pull request review (number, required)
+
+- **unhide_pull_request_review_comment** - Unhide Pull Request Review Comment
+  - **OAuth Challenge Scopes**: `repo`
+  - `comment_id`: The numeric pull request review comment ID. Use the number from a #discussion_r... anchor, not the GraphQL thread node ID (PRRT_...). (number, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `repo`: Repository name (string, required)
+
+- **unresolve_review_thread** - Unresolve Review Thread
+  - **OAuth Challenge Scopes**: `repo`
+  - `threadID`: The node ID of the review thread to unresolve (e.g., PRRT_kwDOxxx) (string, required)
+
+- **update_pull_request_body** - Update Pull Request Body
+  - **OAuth Challenge Scopes**: `repo`
+  - `body`: The new body content for the pull request (string, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+
+- **update_pull_request_draft_state** - Update Pull Request Draft State
+  - **OAuth Challenge Scopes**: `repo`
+  - `draft`: Set to true to convert to draft, false to mark as ready for review (boolean, required)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+
+- **update_pull_request_state** - Update Pull Request State
+  - **OAuth Challenge Scopes**: `repo`
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+  - `state`: The new state for the pull request (string, required)
+
+- **update_pull_request_title** - Update Pull Request Title
+  - **OAuth Challenge Scopes**: `repo`
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `pullNumber`: The pull request number (number, required)
+  - `repo`: Repository name (string, required)
+  - `title`: The new title for the pull request (string, required)
+
+### `file_blame`
+
+- **get_file_blame** - Get file blame information
+  - **OAuth Challenge Scopes**: `repo`
+  - `after`: Cursor for pagination. Use the cursor from the previous response. (string, optional)
+  - `end_line`: Optional 1-based ending line of the window of interest. Must be >= start_line when both are provided. (number, optional)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `path`: Path to the file in the repository, relative to the repository root (string, required)
+  - `perPage`: Results per page for pagination (min 1, max 100) (number, optional)
+  - `ref`: Git reference (branch, tag, or commit SHA). Defaults to the repository's default branch (HEAD). (string, optional)
+  - `repo`: Repository name (string, required)
+  - `start_line`: Optional 1-based starting line of the window of interest. Only ranges overlapping [start_line, end_line] are returned, clamped to the window. (number, optional)
+
+### `issue_dependencies`
+
+- **issue_dependency_read** - Read issue dependencies
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The number of the issue (number, required)
+  - `method`: The read operation to perform on a single issue's dependencies.
+    Options are:
+    1. get_blocked_by - List the issues that block this issue (this issue is blocked by them).
+    2. get_blocking - List the issues that this issue blocks.
+     (string, required)
+  - `owner`: The owner of the repository (string, required)
+  - `page`: Page number for pagination (min 1) (number, optional)
+  - `perPage`: Results per page for pagination (min 1, max 100) (number, optional)
+  - `repo`: The name of the repository (string, required)
+
+- **issue_dependency_write** - Change issue dependency
+  - **OAuth Challenge Scopes**: `repo`
+  - `issue_number`: The number of the subject issue (number, required)
+  - `method`: The action to perform.
+    Options are:
+    - 'add' - create the dependency relationship.
+    - 'remove' - delete the dependency relationship. (string, required)
+  - `owner`: The owner of the subject issue's repository (string, required)
+  - `related_issue_number`: The number of the related issue to link or unlink (number, required)
+  - `related_owner`: The owner of the related issue's repository. Defaults to 'owner' when omitted. (string, optional)
+  - `related_repo`: The name of the related issue's repository. Defaults to 'repo' when omitted. (string, optional)
+  - `repo`: The name of the subject issue's repository (string, required)
+  - `type`: The relationship direction relative to the subject issue.
+    Options are:
+    - 'blocked_by' - the subject issue is blocked by the related issue.
+    - 'blocking' - the subject issue blocks the related issue. (string, required)
+
+### `issue_artifacts`
+
+- **issue_artifact_read** - Read issue artifacts
+  - **OAuth Challenge Scopes**: `repo`
+  - `artifact_number`: Required for get: positive issue-scoped artifact number, not its global ID (integer, optional)
+  - `issue_number`: Positive issue number (integer, required)
+  - `method`:  (string, required)
+  - `owner`: Repository owner (string, required)
+  - `page`: For list only: page number, starting at 1 (default 1) (integer, optional)
+  - `perPage`: For list only: results per page, from 1 to 100 (default 30) (integer, optional)
+  - `repo`: Repository name (string, required)
+  - `type`:  (string, optional)
+
+- **issue_artifact_write** - Write issue artifacts
+  - **OAuth Challenge Scopes**: `repo`
+  - `artifact_number`: Required for update and delete: positive issue-scoped artifact number, not its global ID (integer, optional)
+  - `body`: Required for create, optional for update: artifact content (HTML source for embedded_html); an empty string clears it (string, optional)
+  - `issue_number`: Positive issue number (integer, required)
+  - `method`:  (string, required)
+  - `name`: Required for create, optional for update: nonempty artifact name (string, optional)
+  - `owner`: Repository owner (string, required)
+  - `repo`: Repository name (string, required)
+  - `type`:  (string, optional)
+
+### `duplicate_detection`
+
+- **find_duplicate** - Find duplicate issues
+  - **OAuth Challenge Scopes**: `repo`
+  - `confidence_threshold`: Minimum similarity threshold a candidate must meet to be returned; higher values are stricter. When omitted, the API's high-precision default is used. The scale is defined by the API, so no client-side bounds are enforced. (number, optional)
+  - `issue_number`: The number of the existing issue to find duplicates for (number, required)
+  - `owner`: The owner of the repository (string, required)
+  - `page`: Page number for pagination (min 0). Zero is forwarded for the GitHub API default. (number, optional)
+  - `perPage`: Results per page for pagination (min 0, max 100). Zero is forwarded for the GitHub API default. (number, optional)
+  - `repo`: The name of the repository (string, required)
+
+### `thread_resolution_reason`
+
+- **pull_request_review_write** - Write operations (create, submit, delete) on pull request reviews
+  - **OAuth Challenge Scopes**: `repo`
+  - `body`: Review comment text (string, optional)
+  - `commitID`: SHA of commit to review (string, optional)
+  - `event`: Review action to perform. (string, optional)
+  - `method`: The write operation to perform on pull request review. (string, required)
+  - `owner`: Repository owner (string, required)
+  - `pullNumber`: Pull request number (number, required)
+  - `repo`: Repository name (string, required)
+  - `resolutionReason`: Optional reason for resolving a Copilot code review thread: addressed, wont-fix, or invalid. (string, optional)
+  - `threadId`: The node ID of the review thread (e.g., PRRT_kwDOxxx). Required for resolve_thread and unresolve_thread methods. Get thread IDs from pull_request_read with method get_review_comments. (string, optional)
+
+<!-- END AUTOMATED FEATURE FLAG TOOLS -->

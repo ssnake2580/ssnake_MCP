@@ -1,0 +1,19 @@
+---
+title: Data Safety
+description: How Context7 detects prompt injection and malicious content in indexed documentation
+---
+
+## Prompt Injection and Malware Pattern Detection
+
+To prevent malicious content from reaching AI assistants, Context7 screens documentation from public sources before it is indexed.
+
+<Frame>
+![How our detection system works](/images/security/classifier_pipeline.png)
+</Frame>
+
+- **Robust Detection** — Each chunk of content is analyzed by a classifier tailored for Context7 to identify prompt injection attempts and malware-related patterns
+- **Blocking** — Content that the classifier flags is not indexed
+- **Continuous Monitoring** — Flagged content is tracked and reviewed on an ongoing basis
+- **Regular Updates** — Detection logic is updated to address evolving attack methods and new injection techniques
+
+This helps keep documentation retrieved through Context7 safe to consume by both human developers and AI coding agents.
