@@ -1,0 +1,414 @@
+"""MCP protocol smoke coverage without external network access."""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import (
+    CallToolRequest,
+    CallToolRequestParams,
+    GetPromptRequest,
+    ListPromptsRequest,
+    ListToolsRequest,
+)
+
+import drissionpage_mcp
+from drissionpage_mcp.server import DrissionPageMCPServer
+
+
+@pytest.mark.asyncio
+async def test_list_tools_handler_returns_current_mcp_tools_with_annotations() -> None:
+    """lists all current tools through the MCP Server request handler."""
+
+    server = DrissionPageMCPServer()
+    handler = server.server.request_handlers[ListToolsRequest]
+
+    result = await handler(ListToolsRequest(method="tools/list"))
+
+    tools = result.root.tools
+    assert len(tools) == 69
+    assert "element_input_text" not in {tool.name for tool in tools}
+    assert "wait_sleep" not in {tool.name for tool in tools}
+    assert {tool.name for tool in tools} >= {
+        "page_navigate",
+        "page_screenshot_save",
+        "page_observe",
+        "page_console_logs",
+        "page_evaluate",
+        "page_snapshot",
+        "tab_list",
+        "tab_switch",
+        "tab_close",
+        "element_find_all",
+        "page_dialog_respond",
+        "element_click_and_download",
+        "element_get_text",
+        "wait_until",
+        "wait_time",
+        "element_upload_file",
+        "page_scroll",
+        "element_hover",
+        "element_select",
+        "frame_list",
+        "frame_snapshot",
+        "shadow_find",
+        "browser_cookies_get",
+        "browser_cookies_set",
+        "browser_cookies_delete",
+        "browser_cookies_clear",
+        "browser_headers_set",
+        "browser_user_agent_set",
+        "browser_cache_clear",
+        "storage_get",
+        "network_listen_start",
+        "network_listen_wait",
+        "network_listen_stop",
+        "network_blocked_urls_set",
+        "browser_permission_get",
+        "browser_permission_set",
+        "browser_permissions_reset",
+        "page_export_artifact",
+        "element_click_and_upload",
+        "page_navigate_with_http_auth",
+    }
+    for tool in tools:
+        assert tool.description
+        assert tool.inputSchema["type"] == "object"
+        assert tool.annotations is not None
+        assert tool.annotations.title == tool.title
+        assert tool.annotations.openWorldHint is True
+        assert isinstance(tool.annotations.readOnlyHint, bool)
+        assert isinstance(tool.annotations.destructiveHint, bool)
+        assert isinstance(tool.annotations.idempotentHint, bool)
+    assert {
+        "form_inspect",
+        "form_fill",
+        "form_submit",
+        "form_fill_preview",
+        "page_detect_challenges",
+        "page_click_xy_batch",
+        "page_wait_challenge_result",
+        "browser_open_and_snapshot",
+        "browser_extract_links",
+    }.isdisjoint(tool.name for tool in tools)
+
+
+def test_server_exposes_no_prompt_capability_or_handlers() -> None:
+    server = DrissionPageMCPServer()
+
+    assert ListPromptsRequest not in server.server.request_handlers
+    assert GetPromptRequest not in server.server.request_handlers
+
+
+@pytest.mark.asyncio
+async def test_call_tool_handler_returns_validation_error_for_missing_required_arguments() -> (
+    None
+):
+    """returns a text error when MCP call arguments fail schema validation."""
+
+    server = DrissionPageMCPServer()
+    handler = server.server.request_handlers[CallToolRequest]
+
+    result = await handler(_call_tool_request("page_navigate", {}))
+
+    assert result.root.isError is True
+    assert result.root.content[0].type == "text"
+    assert result.root.content[0].text.startswith("### JSON_RESULT")
+    assert result.root.structuredContent["ok"] is False
+    assert result.root.structuredContent["error"]["code"] == "MCP_ARGUMENT_INVALID"
+    assert "Input validation error" in result.root.structuredContent["message"]
+    assert "url" in result.root.structuredContent["message"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_handler_rejects_unknown_arguments_before_browser_startup() -> (
+    None
+):
+    """returns schema errors for typos instead of silently ignoring extra fields."""
+
+    server = DrissionPageMCPServer()
+    handler = server.server.request_handlers[CallToolRequest]
+
+    result = await handler(_call_tool_request("page_screenshot", {"fullPage": True}))
+
+    assert server.context is None
+    assert result.root.isError is True
+    assert result.root.structuredContent["error"]["code"] == "MCP_ARGUMENT_INVALID"
+    assert "fullPage" in result.root.structuredContent["message"]
+    assert (
+        result.root.structuredContent["error"]["details"]["hints"][0]["action"]
+        == "check_input_schema"
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_tool_handler_reports_unknown_tool_without_browser_startup() -> None:
+    """returns a deterministic not-found response for unknown tool names."""
+
+    server = DrissionPageMCPServer()
+    handler = server.server.request_handlers[CallToolRequest]
+
+    result = await handler(_call_tool_request("not_a_tool", {}))
+
+    assert result.root.content[0].type == "text"
+    text = result.root.content[0].text
+    assert result.root.isError is True
+    assert text.startswith("### JSON_RESULT")
+    payload = json.loads(re.search(r"```json\n(.*?)\n```", text, re.S).group(1))
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "TOOL_NOT_FOUND"
+    assert payload["message"] == "Tool 'not_a_tool' not found"
+    assert payload["error"]["details"]["hints"][0]["action"] == "list_available_tools"
+
+
+@pytest.mark.asyncio
+async def test_removed_alias_tools_return_actionable_tool_not_found() -> None:
+    server = DrissionPageMCPServer()
+    handler = server.server.request_handlers[CallToolRequest]
+
+    result = await handler(_call_tool_request("element_input_text", {}))
+
+    assert result.root.isError is True
+    assert result.root.structuredContent["error"]["code"] == "TOOL_NOT_FOUND"
+    assert result.root.structuredContent["error"]["details"]["suggested_tool"] == (
+        "element_type"
+    )
+    assert "Use 'element_type' instead" in result.root.structuredContent["message"]
+
+
+def _call_tool_request(name: str, arguments: dict[str, Any]) -> CallToolRequest:
+    return CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name=name, arguments=arguments),
+    )
+
+
+@pytest.mark.asyncio
+async def test_stdio_client_initialize_list_and_call_tool() -> None:
+    """smokes the real stdio MCP client path without external network access."""
+
+    params = StdioServerParameters(
+        command="python",
+        args=["-m", "drissionpage_mcp.cli", "--log-level", "ERROR"],
+    )
+    async with stdio_client(params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            init = await session.initialize()
+            assert init.serverInfo.name == "DrissionPage MCP"
+            assert init.serverInfo.version == drissionpage_mcp.__version__
+
+            tools = await session.list_tools()
+            assert len(tools.tools) == 69
+            assert {tool.name for tool in tools.tools} >= {
+                "page_get_url",
+                "page_navigate",
+                "page_screenshot_save",
+                "page_observe",
+                "page_console_logs",
+                "page_evaluate",
+                "page_snapshot",
+                "tab_list",
+                "element_find_all",
+                "page_dialog_respond",
+                "element_click_and_download",
+                "wait_until",
+                "element_upload_file",
+                "frame_list",
+                "shadow_find",
+                "browser_cookies_set",
+                "browser_cookies_delete",
+                "browser_cookies_clear",
+                "browser_headers_set",
+                "browser_user_agent_set",
+                "browser_cache_clear",
+                "storage_get",
+                "network_listen_start",
+                "network_listen_wait",
+                "network_listen_stop",
+                "network_blocked_urls_set",
+                "browser_permission_get",
+                "browser_permission_set",
+                "browser_permissions_reset",
+                "page_export_artifact",
+                "element_click_and_upload",
+                "page_navigate_with_http_auth",
+            }
+            assert "element_input_text" not in {tool.name for tool in tools.tools}
+            assert "wait_sleep" not in {tool.name for tool in tools.tools}
+            assert {
+                "form_inspect",
+                "form_fill",
+                "form_submit",
+                "form_fill_preview",
+                "page_detect_challenges",
+                "page_click_xy_batch",
+                "page_wait_challenge_result",
+                "browser_open_and_snapshot",
+                "browser_extract_links",
+            }.isdisjoint(tool.name for tool in tools.tools)
+
+            wait_result = await session.call_tool("wait_time", {"seconds": 0})
+            assert wait_result.isError is not True
+            assert wait_result.structuredContent["ok"] is True
+            assert wait_result.structuredContent["data"]["waited_seconds"] == 0
+
+            result = await session.call_tool("not_a_tool", {})
+            assert result.isError is True
+            assert result.structuredContent["error"]["code"] == "TOOL_NOT_FOUND"
+            assert result.content[0].text.startswith("### JSON_RESULT")
+
+
+@pytest.mark.asyncio
+async def test_stdio_policy_denial_precedes_browser_startup_and_redacts_target(
+    monkeypatch,
+) -> None:
+    """Reject denied URLs over stdio without launching Chromium or leaking input."""
+
+    monkeypatch.setenv("DP_MCP_NAV_ALLOWLIST", "https://allowed.test")
+    monkeypatch.setenv("CHROME_PATH", "/missing/chromium-for-policy-test")
+    monkeypatch.setenv("DP_HEADLESS", "1")
+    params = StdioServerParameters(
+        command="python",
+        args=["-m", "drissionpage_mcp.cli", "--log-level", "ERROR"],
+        env={
+            "DP_MCP_NAV_ALLOWLIST": "https://allowed.test",
+            "CHROME_PATH": "/missing/chromium-for-policy-test",
+            "DP_HEADLESS": "1",
+        },
+    )
+    private_url = "https://denied.test/private?token=stdio-secret"
+
+    async with stdio_client(params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            for name, arguments in (
+                ("page_navigate", {"url": private_url}),
+                ("page_navigate", {"url": private_url, "new_tab": True}),
+                (
+                    "page_navigate_with_http_auth",
+                    {"url": private_url, "username": "user", "password": "stdio-secret"},
+                ),
+            ):
+                result = await session.call_tool(name, arguments)
+                payload = result.structuredContent
+                encoded = json.dumps(payload, ensure_ascii=False)
+                assert result.isError is True
+                text_result = result.content[0].text
+                mirror = json.loads(
+                    re.search(r"```json\n(.*?)\n```", text_result, re.S).group(1)
+                )
+                assert mirror == payload
+                assert payload["error"]["code"] == "POLICY_DENIED"
+                assert payload["error"]["details"]["value"] == "<redacted>"
+                assert "denied.test" not in encoded
+                assert "stdio-secret" not in encoded
+                assert "denied.test" not in text_result
+                assert "stdio-secret" not in text_result
+                assert "/missing/chromium" not in encoded
+
+
+@pytest.mark.asyncio
+async def test_list_tools_exposes_shared_output_schema_when_supported() -> None:
+    """exposes the stable typed ToolResult envelope through MCP outputSchema."""
+
+    server = DrissionPageMCPServer()
+    handler = server.server.request_handlers[ListToolsRequest]
+
+    result = await handler(ListToolsRequest(method="tools/list"))
+
+    schemas = {tool.name: tool.outputSchema for tool in result.root.tools}
+    for tool in result.root.tools:
+        if getattr(tool, "outputSchema", None) is None:
+            pytest.skip("Installed MCP SDK Tool model does not expose outputSchema")
+        schema = tool.outputSchema
+        assert schema["type"] == "object"
+        assert schema["oneOf"][0]["required"] == ["ok", "message", "data"]
+        assert schema["oneOf"][0]["properties"]["ok"]["const"] is True
+        assert schema["oneOf"][1]["required"] == ["ok", "message", "error"]
+        assert schema["oneOf"][1]["properties"]["ok"]["const"] is False
+        assert schema["oneOf"][1]["properties"]["error"]["required"] == [
+            "code",
+            "message",
+        ]
+
+    assert schemas["page_navigate"]["oneOf"][0]["properties"]["data"]["title"] == (
+        "PageNavigateData"
+    )
+    assert (
+        "final_url"
+        in schemas["page_navigate"]["oneOf"][0]["properties"]["data"]["properties"]
+    )
+    assert schemas["element_find"]["oneOf"][0]["properties"]["data"]["title"] == (
+        "ElementFindData"
+    )
+    assert (
+        "element"
+        in schemas["element_find"]["oneOf"][0]["properties"]["data"]["required"]
+    )
+    assert schemas["wait_time"]["oneOf"][0]["properties"]["data"]["title"] == (
+        "WaitTimeData"
+    )
+    assert schemas["page_snapshot"]["oneOf"][0]["properties"]["data"]["title"] == (
+        "PageSnapshotData"
+    )
+    snapshot_data = schemas["page_snapshot"]["oneOf"][0]["properties"]["data"]
+    variants = {item["$ref"] for item in snapshot_data["anyOf"]}
+    assert variants == {
+        "#/$defs/PageSnapshotData",
+        "#/$defs/PageSnapshotSearchData",
+    }
+    snapshot_defs = schemas["page_snapshot"]["$defs"]
+    assert "links" in snapshot_defs["PageSnapshotData"]["properties"]
+    assert "matches" in snapshot_defs["PageSnapshotSearchData"]["properties"]
+    assert schemas["element_find_all"]["oneOf"][0]["properties"]["data"]["title"] == (
+        "ElementFindAllData"
+    )
+    assert (
+        "elements"
+        in schemas["element_find_all"]["oneOf"][0]["properties"]["data"]["required"]
+    )
+    assert schemas["page_dialog_respond"]["oneOf"][0]["properties"]["data"][
+        "title"
+    ] == ("PageDialogRespondData")
+    assert {
+        "dialog_type",
+        "dialog_message",
+        "handled",
+        "receipt",
+    } <= set(
+        schemas["page_dialog_respond"]["oneOf"][0]["properties"]["data"]["required"]
+    )
+    assert {"button", "click_count"} <= set(
+        schemas["element_click"]["oneOf"][0]["properties"]["data"]["required"]
+    )
+    assert (
+        schemas["element_click_and_download"]["oneOf"][0]["properties"]["data"]["title"]
+        == "ElementClickAndDownloadData"
+    )
+    download_data_schema = schemas["element_click_and_download"]["oneOf"][0][
+        "properties"
+    ]["data"]
+    assert len(download_data_schema["oneOf"]) == 4
+    assert set(download_data_schema["discriminator"]["mapping"]) == {
+        "success",
+        "failed",
+        "validation_failed",
+        "indeterminate",
+    }
+    assert schemas["element_upload_file"]["oneOf"][0]["properties"]["data"][
+        "title"
+    ] == ("ElementUploadFileData")
+    assert schemas["frame_snapshot"]["oneOf"][0]["properties"]["data"]["title"] == (
+        "FrameSnapshotData"
+    )
+    assert schemas["storage_get"]["oneOf"][0]["properties"]["data"]["title"] == (
+        "StorageGetData"
+    )
+    assert schemas["network_listen_wait"]["oneOf"][0]["properties"]["data"][
+        "title"
+    ] == ("NetworkListenWaitData")

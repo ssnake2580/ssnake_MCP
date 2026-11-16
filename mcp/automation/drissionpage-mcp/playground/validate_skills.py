@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Validate repository Skills against the versioned MCP catalog."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
+
+from drissionpage_mcp import __version__
+from drissionpage_mcp.resources import SKILL_EXAMPLES, SKILLS_SOURCE_REVISION
+from drissionpage_mcp.tools import get_all_tools
+
+ROOT = Path(__file__).resolve().parents[1]
+NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+REVISION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+REMOTE_REPOSITORY = "jumodada/skills-manager"
+REMOTE_TIMEOUT_SECONDS = 5.0
+REMOTE_MAX_BYTES = 256 * 1024
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    match = VERSION_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(f"unsupported semantic version: {value}")
+    return tuple(int(part) for part in match.groups())
+
+
+def version_in_compatibility(version: str, compatibility: str) -> bool:
+    """Check the catalog's bounded >= lower, < upper version range."""
+
+    bounds = [part.strip() for part in compatibility.split(",")]
+    if (
+        len(bounds) != 2
+        or not bounds[0].startswith(">=")
+        or not bounds[1].startswith("<")
+    ):
+        raise ValueError("compatibility must be formatted as >=X.Y.Z,<X.Y.Z")
+    current = _version_tuple(version)
+    lower = _version_tuple(bounds[0][2:])
+    upper = _version_tuple(bounds[1][1:])
+    return lower <= current < upper
+
+def _frontmatter(text: str) -> dict[str, str]:
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        raise ValueError("missing YAML frontmatter")
+    try:
+        closing = lines.index("---", 1)
+    except ValueError as exc:
+        raise ValueError("unterminated YAML frontmatter") from exc
+
+    values: dict[str, str] = {}
+    for line in lines[1:closing]:
+        if not line.strip():
+            continue
+        if line.startswith((" ", "\t")) or ":" not in line:
+            raise ValueError("frontmatter must contain flat key/value pairs")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key in values:
+            raise ValueError(f"duplicate frontmatter field: {key}")
+        values[key] = value.strip()
+    return values
+
+
+def remote_url(catalog_entry: dict[str, Any]) -> str:
+    """Build the only allowed remote source URL from pinned catalog fields."""
+
+    revision = str(catalog_entry["source_revision"])
+    if not REVISION_PATTERN.fullmatch(revision):
+        raise ValueError("remote source revision is invalid")
+    path = Path(str(catalog_entry["path"]))
+    if path.is_absolute() or ".." in path.parts or path.parts[:1] != ("skills",):
+        raise ValueError("remote Skill path is invalid")
+    return (
+        f"https://raw.githubusercontent.com/{REMOTE_REPOSITORY}/"
+        f"{revision}/{path.as_posix()}"
+    )
+
+
+def _validate_remote(catalog_entry: dict[str, Any]) -> dict[str, Any]:
+    try:
+        url = remote_url(catalog_entry)
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"ok": False, "url": "", "error": str(exc)}
+
+    try:
+        with urlopen(url, timeout=REMOTE_TIMEOUT_SECONDS) as response:
+            content = response.read(REMOTE_MAX_BYTES + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        return {
+            "ok": False,
+            "url": url,
+            "error": f"remote fetch failed: {type(exc).__name__}",
+        }
+
+    if len(content) > REMOTE_MAX_BYTES:
+        return {
+            "ok": False,
+            "url": url,
+            "bytes": len(content),
+            "error": "remote Skill exceeds size limit",
+        }
+
+    digest = hashlib.sha256(content).hexdigest()
+    matches = digest == catalog_entry["sha256"]
+    result: dict[str, Any] = {
+        "ok": matches,
+        "url": url,
+        "bytes": len(content),
+        "sha256": digest,
+        "hash_matches": matches,
+    }
+    if not matches:
+        result["error"] = "remote SHA-256 does not match catalog"
+    return result
+
+
+def validate_skills(root: Path = ROOT, *, remote: bool = False) -> dict[str, Any]:
+    """Return a deterministic report for all catalogued repository Skills."""
+
+    tool_names = {tool.name for tool in get_all_tools()}
+    results: list[dict[str, Any]] = []
+    for catalog_entry in SKILL_EXAMPLES:
+        name = str(catalog_entry["name"])
+        path = root / str(catalog_entry["path"])
+        errors: list[str] = []
+        text = ""
+
+        if not path.is_file():
+            errors.append("skill entrypoint is missing")
+        else:
+            text = path.read_text(encoding="utf-8")
+            try:
+                metadata = _frontmatter(text)
+            except ValueError as exc:
+                errors.append(str(exc))
+            else:
+                if set(metadata) != {"name", "description"}:
+                    errors.append("frontmatter must contain only name and description")
+                if metadata.get("name") != name:
+                    errors.append("frontmatter name does not match catalog")
+                if not NAME_PATTERN.fullmatch(metadata.get("name", "")):
+                    errors.append("skill name is not lowercase hyphen-case")
+                description = metadata.get("description", "")
+                if not description or len(description) > 1024:
+                    errors.append("description must contain 1-1024 characters")
+
+            if len(text.splitlines()) >= 500:
+                errors.append("SKILL.md must stay under 500 lines")
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest != catalog_entry["sha256"]:
+                errors.append("SHA-256 does not match catalog")
+
+        required_tools = set(catalog_entry["required_tools"])
+        unknown_tools = sorted(required_tools - tool_names)
+        if unknown_tools:
+            errors.append("unknown required tools: " + ", ".join(unknown_tools))
+        if catalog_entry["source_revision"] != SKILLS_SOURCE_REVISION:
+            errors.append("source revision does not match catalog release")
+        source_url = str(catalog_entry["source_url"])
+        if f"/tree/{SKILLS_SOURCE_REVISION}/" not in source_url:
+            errors.append("source URL is not pinned to the catalog revision")
+        try:
+            compatible = version_in_compatibility(
+                __version__, str(catalog_entry["mcp_compatibility"])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"invalid MCP compatibility range: {exc}")
+        else:
+            if not compatible:
+                errors.append("MCP compatibility range excludes current server version")
+
+        result: dict[str, Any] = {
+            "name": name,
+            "ok": not errors,
+            "path": str(catalog_entry["path"]),
+            "required_tools": sorted(required_tools),
+            "errors": errors,
+        }
+        if remote:
+            remote_result = _validate_remote(catalog_entry)
+            result["remote"] = remote_result
+            result["ok"] = result["ok"] and remote_result["ok"]
+        results.append(result)
+
+    report = {
+        "ok": all(item["ok"] for item in results),
+        "source_revision": SKILLS_SOURCE_REVISION,
+        "tool_count": len(tool_names),
+        "skills": results,
+    }
+    if remote:
+        report["remote"] = {
+            "enabled": True,
+            "source": "github_raw",
+            "revision": SKILLS_SOURCE_REVISION,
+            "timeout_seconds": REMOTE_TIMEOUT_SECONDS,
+            "max_bytes": REMOTE_MAX_BYTES,
+        }
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="Print JSON output")
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Also fetch and verify Skills from the pinned GitHub raw revision",
+    )
+    args = parser.parse_args()
+    report = validate_skills(remote=args.remote)
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    else:
+        for item in report["skills"]:
+            status = "PASS" if item["ok"] else "FAIL"
+            print(f"[{status}] {item['name']}")
+            for error in item["errors"]:
+                print(f"  - {error}")
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

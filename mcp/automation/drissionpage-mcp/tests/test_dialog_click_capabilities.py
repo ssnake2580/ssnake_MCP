@@ -1,0 +1,853 @@
+"""Contracts for native dialog responses and enriched element clicks."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timezone
+from threading import Event, Timer
+from time import monotonic, sleep
+from types import SimpleNamespace
+
+import pytest
+from pydantic import ValidationError
+
+from drissionpage_mcp.browser.dialogs import (
+    DialogNotFoundError,
+    DialogOperations,
+    DialogPreconditionError,
+    DialogResponseIndeterminateError,
+    DialogUnsupportedError,
+)
+from drissionpage_mcp.browser.elements import ElementOperations
+from drissionpage_mcp.context import DrissionPageContext
+from drissionpage_mcp.tool_outputs import CapabilityProbe, CapabilitySet
+from drissionpage_mcp.tools.dialogs import PageDialogRespondInput, page_dialog_respond
+from drissionpage_mcp.tools.element import ClickElementInput, click_element
+
+
+def test_dialog_input_is_strict_bounded_and_action_aware() -> None:
+    value = PageDialogRespondInput(action="accept", prompt_text="office-safe")
+
+    assert value.timeout == 0.0
+    with pytest.raises(ValidationError, match="prompt_text cannot be used"):
+        PageDialogRespondInput(action="dismiss", prompt_text="not-allowed")
+    with pytest.raises(ValidationError):
+        PageDialogRespondInput(action="accept", prompt_text="x" * 4001)
+    assert PageDialogRespondInput(action="accept", timeout=0).timeout == 0
+    with pytest.raises(ValidationError):
+        PageDialogRespondInput(action="accept", timeout=-0.1)
+    with pytest.raises(ValidationError):
+        PageDialogRespondInput(action="accept", unknown=True)  # type: ignore[call-arg]
+
+
+def test_click_input_defaults_are_compatible_and_variants_are_strict() -> None:
+    value = ClickElementInput(selector="#target")
+
+    assert value.button == "left"
+    assert value.click_count == 1
+    with pytest.raises(ValidationError):
+        ClickElementInput(selector="#target", button="primary")  # type: ignore[arg-type]
+    for invalid_count in (0, 3, True, 1.5):
+        with pytest.raises(ValidationError):
+            ClickElementInput(selector="#target", click_count=invalid_count)  # type: ignore[arg-type]
+
+
+class _DialogStates:
+    def __init__(self, has_alert: bool) -> None:
+        self.has_alert = has_alert
+
+
+class _DialogPage:
+    def __init__(self, *, dialog_type: str = "alert", message: str = "message") -> None:
+        self.states = _DialogStates(True)
+        self._alert = SimpleNamespace(activated=True, type=dialog_type, text=message)
+        self.result: object = True
+        self.error: Exception | None = None
+
+    def handle_alert(
+        self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+    ) -> None:
+        return None
+
+    def _handle_alert(
+        self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+    ) -> object:
+        if self.error is not None:
+            raise self.error
+        self.states.has_alert = False
+        return self.result
+
+
+@pytest.mark.parametrize(
+    ("page", "reason"),
+    [
+        (SimpleNamespace(), "HANDLE_ALERT_API_UNAVAILABLE"),
+        (
+            SimpleNamespace(handle_alert=lambda: None),
+            "HANDLE_ALERT_API_UNAVAILABLE",
+        ),
+        (
+            SimpleNamespace(
+                handle_alert=_DialogPage().handle_alert,
+                _handle_alert=lambda: None,
+            ),
+            "BOUNDED_HANDLE_ALERT_API_UNAVAILABLE",
+        ),
+        (
+            SimpleNamespace(
+                handle_alert=_DialogPage().handle_alert,
+                _handle_alert=_DialogPage()._handle_alert,
+                states=SimpleNamespace(),
+            ),
+            "ALERT_STATE_UNAVAILABLE",
+        ),
+        (
+            SimpleNamespace(
+                handle_alert=_DialogPage().handle_alert,
+                _handle_alert=_DialogPage()._handle_alert,
+                states=_DialogStates(True),
+                _alert=SimpleNamespace(type="alert"),
+            ),
+            "ALERT_METADATA_UNAVAILABLE",
+        ),
+    ],
+)
+def test_dialog_probe_fails_closed_for_incomplete_runtime(
+    page: object, reason: str
+) -> None:
+    operations = DialogOperations(SimpleNamespace(page=page))  # type: ignore[arg-type]
+    with pytest.raises(DialogUnsupportedError) as caught:
+        operations.probe()
+    assert caught.value.reason_code == reason
+
+
+@pytest.mark.asyncio
+async def test_dialog_adapter_classifies_pending_and_native_failure_paths() -> None:
+    unsupported_page = _DialogPage(dialog_type="beforeunload")
+    unsupported = DialogOperations(SimpleNamespace(page=unsupported_page))  # type: ignore[arg-type]
+    with pytest.raises(DialogUnsupportedError, match="DIALOG_TYPE_UNSUPPORTED"):
+        await unsupported.wait_for_pending(timeout=0.01)
+
+    timeout_page = _DialogPage()
+    timeout_page.states.has_alert = False
+    waiting = DialogOperations(SimpleNamespace(page=timeout_page))  # type: ignore[arg-type]
+    with pytest.raises(DialogNotFoundError, match="No pending"):
+        await waiting.wait_for_pending(timeout=0)
+
+    changed_page = _DialogPage()
+    changed = DialogOperations(SimpleNamespace(page=changed_page))  # type: ignore[arg-type]
+    with pytest.raises(DialogPreconditionError, match="changed"):
+        await changed.respond(
+            pending={"dialog_type": "confirm", "message": "other"},
+            action="accept",
+            prompt_text=None,
+            timeout=0.01,
+        )
+    with pytest.raises(DialogPreconditionError, match="prompt_text"):
+        await changed.respond(
+            pending={"dialog_type": "alert", "message": "message"},
+            action="accept",
+            prompt_text="not-valid",
+            timeout=0.01,
+        )
+
+    error_page = _DialogPage()
+    error_page.error = RuntimeError("native failure")
+    failing = DialogOperations(SimpleNamespace(page=error_page))  # type: ignore[arg-type]
+    with pytest.raises(DialogResponseIndeterminateError):
+        await failing.respond(
+            pending={"dialog_type": "alert", "message": "message"},
+            action="accept",
+            prompt_text=None,
+            timeout=0.01,
+        )
+
+    false_page = _DialogPage()
+    false_page.result = False
+    false_result = DialogOperations(SimpleNamespace(page=false_page))  # type: ignore[arg-type]
+    with pytest.raises(DialogResponseIndeterminateError):
+        await false_result.respond(
+            pending={"dialog_type": "alert", "message": "message"},
+            action="dismiss",
+            prompt_text=None,
+            timeout=0.01,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dialog_native_response_does_not_block_the_event_loop() -> None:
+    class SlowDialogPage(_DialogPage):
+        def _handle_alert(
+            self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+        ) -> object:
+            sleep(0.05)
+            return super()._handle_alert(
+                accept=accept, send=send, timeout=timeout, next_one=next_one
+            )
+
+    operations = DialogOperations(SimpleNamespace(page=SlowDialogPage()))  # type: ignore[arg-type]
+    response = asyncio.create_task(
+        operations.respond(
+            pending={"dialog_type": "alert", "message": "message"},
+            action="accept",
+            prompt_text=None,
+            timeout=0.2,
+        )
+    )
+
+    await asyncio.sleep(0.01)
+
+    assert response.done() is False
+    await response
+
+
+@pytest.mark.asyncio
+async def test_dialog_concurrent_responses_invoke_native_handler_once() -> None:
+    class CountingDialogPage(_DialogPage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def _handle_alert(
+            self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+        ) -> object:
+            self.calls += 1
+            sleep(0.03)
+            return super()._handle_alert(
+                accept=accept, send=send, timeout=timeout, next_one=next_one
+            )
+
+    page = CountingDialogPage()
+    operations = DialogOperations(SimpleNamespace(page=page))  # type: ignore[arg-type]
+    pending = {"dialog_type": "alert", "message": "message"}
+
+    results = await asyncio.gather(
+        operations.respond(
+            pending=pending,
+            action="accept",
+            prompt_text=None,
+            timeout=0.2,
+        ),
+        operations.respond(
+            pending=pending,
+            action="accept",
+            prompt_text=None,
+            timeout=0.2,
+        ),
+        return_exceptions=True,
+    )
+
+    assert page.calls == 1
+    assert sum(result is None for result in results) == 1
+    assert sum(isinstance(result, DialogPreconditionError) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_dialog_response_lock_is_held_until_delayed_closure() -> None:
+    class DelayedClosurePage(_DialogPage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def _handle_alert(
+            self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+        ) -> object:
+            self.calls += 1
+            Timer(0.03, setattr, args=(self.states, "has_alert", False)).start()
+            return True
+
+    page = DelayedClosurePage()
+    operations = DialogOperations(SimpleNamespace(page=page))  # type: ignore[arg-type]
+    pending = {"dialog_type": "alert", "message": "message"}
+
+    results = await asyncio.gather(
+        operations.respond(
+            pending=pending,
+            action="accept",
+            prompt_text=None,
+            timeout=0.2,
+        ),
+        operations.respond(
+            pending=pending,
+            action="accept",
+            prompt_text=None,
+            timeout=0.2,
+        ),
+        return_exceptions=True,
+    )
+
+    assert page.calls == 1
+    assert sum(result is None for result in results) == 1
+    assert sum(isinstance(result, DialogPreconditionError) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_dialog_cancellation_drains_native_response_before_unlocking() -> None:
+    class PausedDialogPage(_DialogPage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.started = Event()
+            self.release = Event()
+
+        def _handle_alert(
+            self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+        ) -> object:
+            self.calls += 1
+            self.started.set()
+            self.release.wait(timeout)
+            self.states.has_alert = False
+            return True
+
+    page = PausedDialogPage()
+    operations = DialogOperations(SimpleNamespace(page=page))  # type: ignore[arg-type]
+    pending = {"dialog_type": "alert", "message": "message"}
+    first = asyncio.create_task(
+        operations.respond(
+            pending=pending,
+            action="accept",
+            prompt_text=None,
+            timeout=0.5,
+        )
+    )
+    assert await asyncio.to_thread(page.started.wait, 0.1)
+
+    first.cancel()
+    second = asyncio.create_task(
+        operations.respond(
+            pending=pending,
+            action="accept",
+            prompt_text=None,
+            timeout=0.5,
+        )
+    )
+    await asyncio.sleep(0.01)
+    calls_before_release = page.calls
+    page.release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert calls_before_release == 1
+    assert page.calls == 1
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert isinstance(results[1], DialogPreconditionError)
+
+
+@pytest.mark.asyncio
+async def test_dialog_response_rejects_when_lock_consumes_deadline() -> None:
+    operations = DialogOperations(SimpleNamespace(page=_DialogPage()))  # type: ignore[arg-type]
+    await operations._response_lock.acquire()
+    try:
+        with pytest.raises(DialogPreconditionError, match="consumed the response deadline"):
+            await operations.respond(
+                pending={"dialog_type": "alert", "message": "message"},
+                action="accept",
+                prompt_text=None,
+                timeout=0.001,
+            )
+    finally:
+        operations._response_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_dialog_response_rejects_expired_deadline_before_native_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _DialogPage()
+    operations = DialogOperations(SimpleNamespace(page=page))  # type: ignore[arg-type]
+    times = iter((10.0, 10.2))
+    monkeypatch.setattr(
+        "drissionpage_mcp.browser.dialogs.monotonic", lambda: next(times)
+    )
+
+    with pytest.raises(DialogPreconditionError, match="deadline expired"):
+        await operations.respond(
+            pending={"dialog_type": "alert", "message": "message"},
+            action="accept",
+            prompt_text=None,
+            timeout=0.1,
+        )
+
+    assert page.states.has_alert is True
+
+
+@pytest.mark.asyncio
+async def test_dialog_cancellation_preserves_cancel_when_native_response_fails() -> None:
+    class PausedFailingDialogPage(_DialogPage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = Event()
+            self.release = Event()
+
+        def _handle_alert(
+            self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+        ) -> object:
+            self.started.set()
+            self.release.wait(timeout)
+            raise RuntimeError("native failure after cancellation")
+
+    page = PausedFailingDialogPage()
+    operations = DialogOperations(SimpleNamespace(page=page))  # type: ignore[arg-type]
+    response = asyncio.create_task(
+        operations.respond(
+            pending={"dialog_type": "alert", "message": "message"},
+            action="accept",
+            prompt_text=None,
+            timeout=0.5,
+        )
+    )
+    assert await asyncio.to_thread(page.started.wait, 0.1)
+
+    response.cancel()
+    page.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await response
+    assert operations._response_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_dialog_response_is_indeterminate_when_alert_never_closes() -> None:
+    class StuckDialogPage(_DialogPage):
+        def _handle_alert(
+            self, *, accept: bool, send: str | None, timeout: float, next_one: bool
+        ) -> object:
+            return True
+
+    operations = DialogOperations(SimpleNamespace(page=StuckDialogPage()))  # type: ignore[arg-type]
+
+    with pytest.raises(DialogResponseIndeterminateError):
+        await operations.respond(
+            pending={"dialog_type": "alert", "message": "message"},
+            action="dismiss",
+            prompt_text=None,
+            timeout=0.05,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dialog_response_returns_only_redacted_metadata_and_receipt() -> None:
+    secret_message = "Secret fixture dialog message"
+    prompt_text = "safe-office-value"
+
+    class FakeDialogs:
+        def __init__(self) -> None:
+            self.responses: list[dict[str, object]] = []
+
+        def probe(self) -> None:
+            return None
+
+        async def wait_for_pending(self, *, timeout: float) -> dict[str, str]:
+            assert timeout == 2
+            return {"dialog_type": "prompt", "message": secret_message}
+
+        async def respond(self, **kwargs: object) -> None:
+            self.responses.append(kwargs)
+
+    context = DrissionPageContext()
+    fake_dialogs = FakeDialogs()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://user:password@example.test/dialog?token=secret#fragment",
+        mcp_tab_id="t0",
+        dialogs=fake_dialogs,
+    )
+
+    outcome = await page_dialog_respond.execute(
+        context,
+        PageDialogRespondInput(action="accept", prompt_text=prompt_text, timeout=2),
+    )
+
+    assert outcome.is_error is False
+    data = outcome.structured_content()["data"]
+    assert data["dialog_type"] == "prompt"
+    assert data["action"] == "accept"
+    assert data["handled"] is True
+    assert data["dialog_message"] == {
+        "present": True,
+        "length": len(secret_message),
+        "redacted": True,
+    }
+    assert data["prompt"] == {
+        "provided": True,
+        "length": len(prompt_text),
+        "redacted": True,
+    }
+    assert data["final_url"] == "https://example.test/dialog"
+    receipt = data["receipt"]
+    assert receipt["kind"] == "page_dialog_respond"
+    assert receipt["side_effect"] == "dialog_response"
+    assert receipt["status"] == "success"
+    assert receipt["redacted"] is True
+    assert len(context._operation_receipts) == 1
+    assert context.capability_set().capabilities[0].status == "supported"
+    assert len(fake_dialogs.responses) == 1
+    response_args = fake_dialogs.responses[0]
+    assert response_args["pending"] == {
+        "dialog_type": "prompt",
+        "message": secret_message,
+    }
+    assert response_args["action"] == "accept"
+    assert response_args["prompt_text"] == prompt_text
+    assert 0 < float(response_args["timeout"]) <= 2
+    encoded = json.dumps(outcome.structured_content(), ensure_ascii=False)
+    assert secret_message not in encoded
+    assert prompt_text not in encoded
+    assert "token=secret" not in encoded
+
+
+@pytest.mark.asyncio
+async def test_dialog_response_without_pending_dialog_fails_immediately() -> None:
+    class NoPendingDialogs:
+        response_calls = 0
+
+        def probe(self) -> None:
+            return None
+
+        async def wait_for_pending(self, *, timeout: float) -> dict[str, str]:
+            assert timeout == 0
+            raise DialogNotFoundError(
+                "No pending JavaScript dialog is available to respond to."
+            )
+
+        async def respond(self, **kwargs: object) -> None:
+            self.response_calls += 1
+
+    context = DrissionPageContext()
+    dialogs = NoPendingDialogs()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://example.test/dialog",
+        mcp_tab_id="t0",
+        dialogs=dialogs,
+    )
+
+    started = monotonic()
+    outcome = await page_dialog_respond.execute(
+        context, PageDialogRespondInput(action="accept")
+    )
+    elapsed = monotonic() - started
+
+    payload = outcome.structured_content()
+    assert outcome.is_error is True
+    assert payload["error"]["code"] == "DIALOG_NOT_FOUND"
+    assert {hint.get("tool") for hint in payload["error"]["details"]["hints"]} >= {
+        "page_dialog_observe",
+        "page_dialog_respond",
+    }
+    assert elapsed < 0.1
+    assert dialogs.response_calls == 0
+    assert len(context._operation_fingerprints) == 0
+    assert len(context._operation_receipts) == 0
+
+
+@pytest.mark.asyncio
+async def test_dialog_unsupported_fails_before_response_claim_or_receipt() -> None:
+    class UnsupportedDialogs:
+        response_calls = 0
+
+        def probe(self) -> None:
+            raise DialogUnsupportedError("HANDLE_ALERT_API_UNAVAILABLE")
+
+        async def wait_for_pending(self, *, timeout: float) -> dict[str, str]:
+            raise AssertionError("unsupported dialog must not be awaited")
+
+        async def respond(self, **kwargs: object) -> None:
+            self.response_calls += 1
+
+    context = DrissionPageContext()
+    fake_dialogs = UnsupportedDialogs()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://example.test/dialog",
+        mcp_tab_id="t0",
+        dialogs=fake_dialogs,
+    )
+
+    outcome = await page_dialog_respond.execute(
+        context, PageDialogRespondInput(action="accept", timeout=1)
+    )
+
+    assert outcome.is_error is True
+    assert outcome.structured_content()["error"]["code"] == "UNSUPPORTED_OPERATION"
+    assert fake_dialogs.response_calls == 0
+    assert len(context._operation_fingerprints) == 0
+    assert len(context._operation_receipts) == 0
+    capability = context.capability_set().capabilities[0]
+    assert capability.name == "dialog.respond"
+    assert capability.status == "unsupported"
+    assert capability.reason_code == "HANDLE_ALERT_API_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_prompt_text_for_non_prompt_fails_before_claim_or_response() -> None:
+    class AlertDialogs:
+        response_calls = 0
+
+        def probe(self) -> None:
+            return None
+
+        async def wait_for_pending(self, *, timeout: float) -> dict[str, str]:
+            return {"dialog_type": "alert", "message": "redacted"}
+
+        async def respond(self, **kwargs: object) -> None:
+            self.response_calls += 1
+
+    context = DrissionPageContext()
+    dialogs = AlertDialogs()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://example.test/dialog",
+        mcp_tab_id="t0",
+        dialogs=dialogs,
+    )
+
+    outcome = await page_dialog_respond.execute(
+        context,
+        PageDialogRespondInput(action="accept", prompt_text="not-for-alert"),
+    )
+
+    assert outcome.is_error is True
+    assert outcome.structured_content()["error"]["code"] == "PRECONDITION_FAILED"
+    assert dialogs.response_calls == 0
+    assert len(context._operation_fingerprints) == 0
+    assert len(context._operation_receipts) == 0
+
+
+@pytest.mark.asyncio
+async def test_recorded_dialog_denial_happens_before_tab_access() -> None:
+    context = DrissionPageContext()
+    context.set_capability_set(
+        CapabilitySet(
+            overall_status="unsupported",
+            capabilities=(
+                CapabilityProbe(
+                    name="dialog.respond",
+                    status="unsupported",
+                    evidence_source="runtime_probe",
+                    reason_code="HANDLE_ALERT_API_UNAVAILABLE",
+                    checked_at=datetime.now(timezone.utc),
+                ),
+            ),
+        )
+    )
+
+    outcome = await page_dialog_respond.execute(
+        context, PageDialogRespondInput(action="accept", timeout=1)
+    )
+
+    assert outcome.is_error is True
+    assert outcome.structured_content()["error"]["code"] == "UNSUPPORTED_OPERATION"
+    assert len(context._operation_fingerprints) == 0
+    assert len(context._operation_receipts) == 0
+
+
+@pytest.mark.asyncio
+async def test_dialog_native_error_is_redacted_and_indeterminate() -> None:
+    secret = "native-secret-value"
+
+    class FailingDialogs:
+        def probe(self) -> None:
+            return None
+
+        async def wait_for_pending(self, *, timeout: float) -> dict[str, str]:
+            return {"dialog_type": "prompt", "message": "redacted"}
+
+        async def respond(self, **kwargs: object) -> None:
+            raise DialogResponseIndeterminateError(secret)
+
+    context = DrissionPageContext()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://example.test/dialog",
+        mcp_tab_id="t0",
+        dialogs=FailingDialogs(),
+    )
+
+    outcome = await page_dialog_respond.execute(
+        context,
+        PageDialogRespondInput(action="accept", prompt_text=secret),
+    )
+
+    encoded = json.dumps(outcome.structured_content(), ensure_ascii=False)
+    assert outcome.is_error is True
+    assert secret not in encoded
+    receipt = list(context._operation_receipts.values())[0]
+    assert receipt.status == "indeterminate"
+    assert receipt.error_code == "DIALOG_RESPONSE_INDETERMINATE"
+
+
+@pytest.mark.asyncio
+async def test_dialog_timeout_is_one_shared_budget() -> None:
+    class SlowDialogs:
+        def probe(self) -> None:
+            return None
+
+        async def wait_for_pending(self, *, timeout: float) -> dict[str, str]:
+            await asyncio.sleep(timeout * 0.7)
+            return {"dialog_type": "alert", "message": "redacted"}
+
+        async def respond(self, **kwargs: object) -> None:
+            await asyncio.sleep(float(kwargs["timeout"]) + 0.02)
+            raise DialogResponseIndeterminateError("late")
+
+    context = DrissionPageContext()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://example.test/dialog",
+        mcp_tab_id="t0",
+        dialogs=SlowDialogs(),
+    )
+
+    started = monotonic()
+    outcome = await page_dialog_respond.execute(
+        context, PageDialogRespondInput(action="accept", timeout=0.1)
+    )
+    elapsed = monotonic() - started
+
+    assert outcome.is_error is True
+    assert elapsed < 0.15
+
+
+class _Clicker:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def __call__(self) -> None:
+        self.calls.append(("call", {}))
+
+    def right(self) -> None:
+        self.calls.append(("right", {}))
+
+    def multi(self, *, times: int) -> None:
+        self.calls.append(("multi", {"times": times}))
+
+    def at(self, *, button: str, count: int) -> None:
+        self.calls.append(("at", {"button": button, "count": count}))
+
+
+class _ElementTab:
+    def __init__(self, clicker: object) -> None:
+        self.element = SimpleNamespace(click=clicker)
+        self.stabilize_calls = 0
+
+    async def _element_by_plan(self, plan: object, *, timeout: int) -> object:
+        return self.element
+
+    async def _stabilize(self, *args: object, **kwargs: object) -> None:
+        self.stabilize_calls += 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("button", "click_count", "expected"),
+    [
+        ("left", 1, ("call", {})),
+        ("right", 1, ("right", {})),
+        ("left", 2, ("multi", {"times": 2})),
+        ("middle", 2, ("at", {"button": "middle", "count": 2})),
+    ],
+)
+async def test_element_click_uses_exact_native_clicker_path(
+    button: str, click_count: int, expected: tuple[str, dict[str, object]]
+) -> None:
+    clicker = _Clicker()
+    tab = _ElementTab(clicker)
+
+    await ElementOperations(tab).click(  # type: ignore[arg-type]
+        "#target", timeout=1, button=button, click_count=click_count
+    )
+
+    assert clicker.calls == [expected]
+    assert tab.stabilize_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unsupported_click_variant_never_substitutes_a_left_click() -> None:
+    class LeftOnlyClicker:
+        calls = 0
+
+        def __call__(self) -> None:
+            self.calls += 1
+
+    clicker = LeftOnlyClicker()
+    element_tab = _ElementTab(clicker)
+    context = DrissionPageContext()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://example.test/click-variants",
+        mcp_tab_id="t0",
+        elements=ElementOperations(element_tab),  # type: ignore[arg-type]
+    )
+
+    outcome = await click_element.execute(
+        context,
+        ClickElementInput(
+            selector="#click-target", button="right", click_count=1, timeout=1
+        ),
+    )
+
+    assert outcome.is_error is True
+    assert outcome.structured_content()["error"]["code"] == "UNSUPPORTED_OPERATION"
+    assert clicker.calls == 0
+    assert element_tab.stabilize_calls == 0
+    capability = context.capability_set().capabilities[0]
+    assert capability.name == "element.click.right"
+    assert capability.status == "unsupported"
+    assert capability.reason_code == "RIGHT_CLICK_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_recorded_click_denial_happens_before_tab_or_dom_access() -> None:
+    context = DrissionPageContext()
+    context.set_capability_set(
+        CapabilitySet(
+            overall_status="unsupported",
+            capabilities=(
+                CapabilityProbe(
+                    name="element.click.right",
+                    status="unsupported",
+                    evidence_source="runtime_probe",
+                    reason_code="RIGHT_CLICK_UNAVAILABLE",
+                    checked_at=datetime.now(timezone.utc),
+                ),
+            ),
+        )
+    )
+
+    outcome = await click_element.execute(
+        context,
+        ClickElementInput(selector="#target", button="right", timeout=1),
+    )
+
+    assert outcome.is_error is True
+    assert outcome.structured_content()["error"]["code"] == "UNSUPPORTED_OPERATION"
+
+
+@pytest.mark.asyncio
+async def test_right_click_denial_does_not_block_supported_double_click() -> None:
+    class DoubleOnlyClicker:
+        def __init__(self) -> None:
+            self.multi_calls = 0
+
+        def __call__(self) -> None:
+            raise AssertionError("left single click must not be substituted")
+
+        def multi(self, *, times: int) -> None:
+            assert times == 2
+            self.multi_calls += 1
+
+    clicker = DoubleOnlyClicker()
+    element_tab = _ElementTab(clicker)
+    context = DrissionPageContext()
+    context._current_tab = SimpleNamespace(  # type: ignore[assignment]
+        url="https://example.test/click-variants",
+        mcp_tab_id="t0",
+        elements=ElementOperations(element_tab),  # type: ignore[arg-type]
+    )
+
+    right = await click_element.execute(
+        context,
+        ClickElementInput(selector="#target", button="right", timeout=1),
+    )
+    double = await click_element.execute(
+        context,
+        ClickElementInput(selector="#target", click_count=2, timeout=1),
+    )
+
+    assert right.is_error is True
+    assert double.is_error is False
+    assert clicker.multi_calls == 1

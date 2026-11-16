@@ -1,0 +1,226 @@
+"""Unit coverage for compact page observation helpers."""
+
+from __future__ import annotations
+
+import json
+import math
+from types import SimpleNamespace
+
+import pytest
+
+from drissionpage_mcp.metadata import response_meta, with_response_meta
+from drissionpage_mcp.observation import (
+    bounded_json_value,
+    diff_observations,
+    result_type,
+)
+from drissionpage_mcp.tools._observe import observed_changes
+
+
+def test_diff_observations_reports_url_title_counts_and_text_changes() -> None:
+    before = {
+        "url": "https://example.test/start",
+        "title": "Start",
+        "counts": {"buttons": "1", "inputs": object()},
+        "text_samples": ["Loading", "Save"],
+    }
+    after = {
+        "url": "https://example.test/done",
+        "title": "Done",
+        "ready_state": "complete",
+        "counts": {"buttons": 2, "links": 1},
+        "text_samples": ["Save", "Saved"],
+        "active_element": {"tag": "button"},
+    }
+
+    diff = diff_observations(before, after)
+
+    assert diff["url_changed"] is True
+    assert diff["title_changed"] is True
+    assert diff["counts_before"] == {"buttons": 1, "inputs": 0}
+    assert diff["counts_delta"] == {"buttons": 1, "inputs": 0, "links": 1}
+    assert diff["appeared_texts"] == ["Saved"]
+    assert diff["removed_texts"] == ["Loading"]
+    assert diff["active_element"] == {"tag": "button"}
+
+
+def test_diff_observations_reports_console_changes() -> None:
+    before = {
+        "console": {
+            "available": True,
+            "listening": True,
+            "count": 2,
+            "next_cursor": 1,
+            "error_count": 0,
+            "warning_count": 1,
+            "recent": [
+                {
+                    "index": 1,
+                    "level": "warning",
+                    "text": "before warning",
+                    "url": "",
+                    "line": 0,
+                    "column": 0,
+                    "source": "",
+                }
+            ],
+        }
+    }
+    after = {
+        "console": {
+            "available": True,
+            "listening": True,
+            "count": 4,
+            "next_cursor": 3,
+            "error_count": 1,
+            "warning_count": 2,
+            "recent": [
+                {
+                    "index": 2,
+                    "level": "warning",
+                    "text": "after warning",
+                    "url": "https://example.test",
+                    "line": 7,
+                    "column": 3,
+                    "source": "console-api",
+                },
+                {
+                    "index": 3,
+                    "level": "error",
+                    "text": "after error",
+                    "url": "https://example.test",
+                    "line": 8,
+                    "column": 4,
+                    "source": "console-api",
+                },
+            ],
+        }
+    }
+
+    diff = diff_observations(before, after)
+
+    assert diff["console_errors_added"] == 1
+    assert diff["console_warnings_added"] == 1
+    assert [item["text"] for item in diff["new_console_messages"]] == [
+        "after warning",
+        "after error",
+    ]
+
+
+def test_bounded_json_value_and_result_type_cover_json_edges() -> None:
+    short, truncated, original = bounded_json_value({"ok": True}, max_chars=20)
+    long_object, object_truncated, object_original = bounded_json_value(
+        {"items": list(range(20))},
+        max_chars=12,
+    )
+    long_string, string_truncated, string_original = bounded_json_value(
+        "abcdef",
+        max_chars=3,
+    )
+    non_finite, non_finite_truncated, non_finite_original = bounded_json_value(
+        float("inf"),
+        max_chars=20,
+    )
+
+    assert short == {"ok": True}
+    assert truncated is False
+    assert original > 0
+    assert long_object == {"preview": '{"items":[0,', "truncated_json": True}
+    assert object_truncated is True
+    assert object_original > 12
+    assert long_string == "abc"
+    assert string_truncated is True
+    assert string_original == 8
+    assert non_finite is None
+    assert non_finite_truncated is False
+    assert non_finite_original == 4
+    assert math.isfinite(float(non_finite_original))
+    assert json.dumps(non_finite, allow_nan=False) == "null"
+    assert [result_type(value) for value in (None, True, 1, "x", [], {}, object())] == [
+        "null",
+        "boolean",
+        "number",
+        "string",
+        "array",
+        "object",
+        "object",
+    ]
+
+
+def test_response_metadata_detects_nested_truncation() -> None:
+    payload = {"items": [{"truncated": {"text": False, "html": True}}]}
+
+    meta = response_meta(payload)
+    enriched = with_response_meta({"items": [1]}, truncated=False)
+
+    assert meta["truncated"] is True
+    assert meta["json_chars"] > 0
+    assert enriched["meta"]["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_observed_changes_waits_for_delayed_console_messages(monkeypatch) -> None:
+    before = {
+        "console": {
+            "available": True,
+            "next_cursor": 2,
+        }
+    }
+    observations = iter(
+        (
+            before,
+            before,
+            {
+                "console": {
+                    "available": True,
+                    "next_cursor": 3,
+                    "recent": [
+                        {
+                            "index": 3,
+                            "level": "error",
+                            "text": "late failure",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+
+    async def observe() -> dict[str, object]:
+        return next(observations)
+
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("drissionpage_mcp.tools._observe.asyncio.sleep", sleep)
+    tab = SimpleNamespace(observation=SimpleNamespace(observe=observe))
+
+    changes = await observed_changes(tab, before)
+
+    assert changes is not None
+    assert changes["console_errors_added"] == 1
+    assert changes["new_console_messages"][0]["text"] == "late failure"
+    assert sleeps == [0.05, 0.05]
+
+
+@pytest.mark.asyncio
+async def test_observed_changes_skips_settle_wait_without_console_metadata(
+    monkeypatch,
+) -> None:
+    async def observe() -> dict[str, object]:
+        return {"url": "https://example.test/after"}
+
+    async def unexpected_sleep(_seconds: float) -> None:
+        raise AssertionError("console settling should not run")
+
+    monkeypatch.setattr(
+        "drissionpage_mcp.tools._observe.asyncio.sleep", unexpected_sleep
+    )
+    tab = SimpleNamespace(observation=SimpleNamespace(observe=observe))
+
+    changes = await observed_changes(tab, {"url": "https://example.test/before"})
+
+    assert changes is not None
+    assert changes["url_changed"] is True

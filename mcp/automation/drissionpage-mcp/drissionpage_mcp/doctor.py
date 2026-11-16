@@ -1,0 +1,411 @@
+"""Doctor/self-test diagnostics for drissionpage-mcp."""
+
+import importlib
+import importlib.metadata
+import json
+import logging
+import os
+import platform
+import re
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+from . import __version__
+from .mcp_compat import (
+    MCP_SDK_RANGE,
+    MCP_SDK_REPAIR_COMMAND,
+    is_supported_mcp_sdk_version,
+)
+
+
+def _package_version(module_name: str, version_attr: str = "__version__") -> str:
+    """Return importable package version using metadata before module attrs."""
+
+    distribution_names = {
+        "mcp": "mcp",
+        "DrissionPage": "DrissionPage",
+    }
+    try:
+        return importlib.metadata.version(
+            distribution_names.get(module_name, module_name)
+        )
+    except importlib.metadata.PackageNotFoundError:
+        pass
+
+    try:
+        module = importlib.import_module(module_name)
+        return str(getattr(module, version_attr, "unknown"))
+    except Exception as exc:
+        return f"unavailable: {exc}"
+
+
+def _distribution_metadata() -> dict[str, str]:
+    """Return the installed distribution version and location when available."""
+
+    try:
+        distribution = importlib.metadata.distribution("drissionpage-mcp")
+        return {
+            "version": distribution.version,
+            "location": str(distribution.locate_file("")),
+        }
+    except importlib.metadata.PackageNotFoundError:
+        return {"version": "unavailable", "location": "unavailable"}
+
+
+def _import_path() -> Path:
+    """Return the resolved package path used by this process."""
+
+    module = importlib.import_module("drissionpage_mcp")
+    return Path(str(module.__file__)).resolve()
+
+
+def _is_source_tree() -> bool:
+    """Detect imports from a checkout or editable install source directory."""
+
+    package_dir = _import_path().parent
+    return (package_dir.parent / "pyproject.toml").is_file()
+
+
+def _find_browser() -> str | None:
+    candidates = [
+        os.getenv("CHROME_PATH"),
+        os.getenv("DP_BROWSER_PATH"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("chrome"),
+    ]
+    if sys.platform == "darwin":
+        candidates.extend(
+            [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ]
+        )
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def _config() -> dict[str, Any]:
+    names = [
+        "CHROME_PATH",
+        "DP_BROWSER_PATH",
+        "DP_USER_DATA_PATH",
+        "DP_AUTO_PORT",
+        "DP_HEADLESS",
+        "DP_LOAD_MODE",
+        "DP_TIMEOUT",
+        "DP_PAGE_LOAD_TIMEOUT",
+        "DP_SCRIPT_TIMEOUT",
+        "DP_NO_SANDBOX",
+        "DP_DISABLE_WEB_SECURITY",
+        "DP_MCP_NAV_ALLOWLIST",
+        "DP_MCP_NAV_BLOCKLIST",
+        "DP_MCP_BLOCK_PRIVATE_NETWORK",
+        "DP_MCP_SCREENSHOT_ROOT",
+        "DP_MCP_UPLOAD_ROOT",
+    ]
+    path_like = {
+        "CHROME_PATH",
+        "DP_BROWSER_PATH",
+        "DP_USER_DATA_PATH",
+        "DP_MCP_SCREENSHOT_ROOT",
+        "DP_MCP_UPLOAD_ROOT",
+    }
+    config: dict[str, Any] = {}
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        if name in path_like:
+            config[name] = {
+                "configured": True,
+                "value": "<redacted>",
+                "exists": os.path.exists(value),
+            }
+        elif name in {"DP_MCP_NAV_ALLOWLIST", "DP_MCP_NAV_BLOCKLIST"}:
+            config[name] = {
+                "configured": True,
+                "value": "<redacted>",
+                "count": len([part for part in value.split(",") if part.strip()]),
+            }
+        else:
+            config[name] = value
+    return config
+
+
+def _server_wiring_check() -> tuple[bool, str]:
+    """Construct the real server and verify the core request handlers exist."""
+
+    try:
+        from mcp.types import (
+            CallToolRequest,
+            ListResourcesRequest,
+            ListToolsRequest,
+            ReadResourceRequest,
+        )
+
+        from .server import DrissionPageMCPServer
+
+        server = DrissionPageMCPServer()
+        required_handlers = {
+            "tools/list": ListToolsRequest,
+            "tools/call": CallToolRequest,
+            "resources/list": ListResourcesRequest,
+            "resources/read": ReadResourceRequest,
+        }
+        missing = [
+            name
+            for name, request_type in required_handlers.items()
+            if request_type not in server.server.request_handlers
+        ]
+        if missing:
+            return False, f"missing request handlers: {', '.join(missing)}"
+        return (
+            True,
+            f"{len(server.tools)} tools and {len(required_handlers)} core handlers registered",
+        )
+    except Exception as exc:
+        return False, f"{exc.__class__.__name__}: {exc}"
+
+
+def _public_surface_check() -> tuple[bool, str]:
+    """Verify the stable public counts without starting a browser."""
+
+    try:
+        from mcp.types import ListPromptsRequest
+
+        from .resources import list_resources
+        from .server import DrissionPageMCPServer
+        from .tools import get_all_tools
+
+        server = DrissionPageMCPServer()
+        tool_count = len(get_all_tools())
+        prompt_count = int(ListPromptsRequest in server.server.request_handlers)
+        resource_count = len(list_resources())
+        detail = (
+            f"{tool_count} tools, {prompt_count} prompts, {resource_count} resource"
+        )
+        return (tool_count == 69 and prompt_count == 0 and resource_count == 1, detail)
+    except Exception as exc:
+        return False, f"{exc.__class__.__name__}: {exc}"
+
+
+def run_diagnostics(launch_browser: bool = False) -> dict[str, Any]:
+    """Collect package/config/browser diagnostics without launching by default."""
+
+    checks: list[dict[str, Any]] = []
+    hints: list[str] = []
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    python_ok = sys.version_info >= (3, 10)
+    check("python", python_ok, sys.version.split()[0])
+    if not python_ok:
+        hints.append("Use Python 3.10 or newer.")
+
+    mcp_version = _package_version("mcp")
+    mcp_available = not mcp_version.startswith("unavailable")
+    check("mcp_package", mcp_available, mcp_version)
+    mcp_supported = mcp_available and is_supported_mcp_sdk_version(mcp_version)
+    check(
+        "mcp_supported",
+        mcp_supported,
+        f"installed: {mcp_version}; supported range: {MCP_SDK_RANGE}",
+    )
+    if not mcp_supported:
+        hints.append(
+            f"Install the supported MCP Python SDK range with: {MCP_SDK_REPAIR_COMMAND}"
+        )
+
+    server_logger = logging.getLogger("drissionpage_mcp.server")
+    previous_server_log_level = server_logger.level
+    server_logger.setLevel(logging.WARNING)
+    try:
+        server_wiring_ok, server_wiring_detail = _server_wiring_check()
+        public_surface_ok, public_surface_detail = _public_surface_check()
+    finally:
+        server_logger.setLevel(previous_server_log_level)
+    check("mcp_server_wiring", server_wiring_ok, server_wiring_detail)
+    if not server_wiring_ok:
+        hints.append(
+            "MCP server wiring failed before a client could connect. "
+            f"Repair the installation with: {MCP_SDK_REPAIR_COMMAND}"
+        )
+
+    dp_version = _package_version("DrissionPage")
+    check("drissionpage_package", not dp_version.startswith("unavailable"), dp_version)
+    dp_supported = not _is_drissionpage_5_or_newer(dp_version)
+    check("drissionpage_supported", dp_supported, "supported range: >=4.1.1.4,<5")
+    if not dp_supported:
+        hints.append(
+            f"DrissionPage 5.x is not supported by drissionpage-mcp {__version__}; "
+            "install DrissionPage>=4.1.1.4,<5."
+        )
+
+    import_path = _import_path()
+    source_tree = _is_source_tree()
+    import_detail = f"path={import_path}; source_tree={'yes' if source_tree else 'no'}"
+    check("package_import", True, import_detail)
+    if source_tree:
+        hints.append(
+            "This process appears to run from a source checkout. "
+            "Use a wheel or sdist in a clean environment to verify release contents."
+        )
+
+    distribution = _distribution_metadata()
+    metadata_version = distribution.get("version", "unavailable")
+    metadata_location = distribution.get("location", "unavailable")
+    metadata_matches = metadata_version == __version__
+    metadata_detail = (
+        f"metadata_version={metadata_version}; location={metadata_location}; "
+        f"imported_version={__version__}; "
+        f"match={'yes' if metadata_matches else 'no'}"
+    )
+    # Editable/source installs can retain stale egg-info while developing. The
+    # clean wheel/sdist gate remains responsible for enforcing this invariant.
+    check("package_metadata", metadata_matches or source_tree, metadata_detail)
+    if not metadata_matches and not source_tree:
+        hints.append(
+            "Installed package metadata does not match the imported code. "
+            "Reinstall the wheel or sdist in a clean environment."
+        )
+
+    check("public_surface", public_surface_ok, public_surface_detail)
+    if not public_surface_ok:
+        hints.append(
+            "The public MCP surface must contain 69 tools, zero prompts, and one resource."
+        )
+
+    browser_path = _find_browser()
+    check(
+        "browser_binary",
+        bool(browser_path),
+        browser_path or "not found on PATH/default locations",
+    )
+    if not browser_path:
+        hints.append("Install Chrome/Chromium or set CHROME_PATH/DP_BROWSER_PATH.")
+
+    config = _config()
+    check(
+        "config",
+        True,
+        json.dumps(config, sort_keys=True) if config else "default environment",
+    )
+
+    user_data_path = os.getenv("DP_USER_DATA_PATH")
+    if user_data_path:
+        exists = os.path.exists(user_data_path)
+        parent = os.path.dirname(os.path.abspath(user_data_path)) or "."
+        parent_ok = os.path.isdir(parent) and os.access(parent, os.W_OK)
+        check(
+            "profile_path",
+            exists or parent_ok,
+            "DP_USER_DATA_PATH configured (<redacted>); "
+            + (
+                "exists"
+                if exists
+                else "parent writable" if parent_ok else "parent not writable"
+            ),
+        )
+        if not exists and not parent_ok:
+            hints.append(
+                "DP_USER_DATA_PATH is configured but its parent directory is not writable."
+            )
+
+    if _env_truthy("DP_NO_SANDBOX"):
+        hints.append(
+            "Chrome sandbox is disabled by DP_NO_SANDBOX. "
+            "Use it only in restricted container/root environments."
+        )
+
+    launch_detail = "skipped (pass --launch-browser to test browser startup)"
+    launch_ok = True
+    if launch_browser:
+        try:
+            from .compat import create_browser, quit_browser
+
+            browser = create_browser()
+            try:
+                launch_detail = "launched successfully"
+            finally:
+                quit_browser(browser)
+        except Exception as exc:
+            launch_ok = False
+            launch_detail = f"{exc.__class__.__name__}: {exc}"
+            hints.append(
+                "Browser launch failed. Check CHROME_PATH/DP_BROWSER_PATH, sandbox permissions, and headless settings."
+            )
+    check("browser_launch", launch_ok, launch_detail)
+
+    ok = all(item["ok"] for item in checks)
+    return {
+        "ok": ok,
+        "version": __version__,
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python_executable": sys.executable,
+        },
+        "checks": checks,
+        "hints": hints,
+    }
+
+
+def _is_drissionpage_5_or_newer(version: str) -> bool:
+    """Return True for version strings whose major version is >= 5."""
+
+    match = re.search(r"(\d+)", version)
+    if not match:
+        return False
+    return int(match.group(1)) >= 5
+
+
+def format_diagnostics(report: dict[str, Any]) -> str:
+    """Format diagnostics for humans while preserving JSON parseability."""
+
+    lines = [
+        "DrissionPage MCP doctor",
+        "status: %s" % ("ok" if report.get("ok") else "problem"),
+        f"version: {report.get('version', 'unknown')}",
+    ]
+    platform_info = report.get("platform", {})
+    lines.append(
+        "platform: {system} {release} {machine} ({python_executable})".format(
+            system=platform_info.get("system", "unknown"),
+            release=platform_info.get("release", ""),
+            machine=platform_info.get("machine", ""),
+            python_executable=platform_info.get("python_executable", ""),
+        )
+    )
+    lines.append("checks:")
+    for item in report.get("checks", []):
+        mark = "ok" if item.get("ok") else "fail"
+        lines.append(f"  - [{mark}] {item.get('name')}: {item.get('detail', '')}")
+    if report.get("hints"):
+        lines.append("hints:")
+        for hint in report["hints"]:
+            lines.append(f"  - {hint}")
+    lines.append("### JSON_RESULT")
+    lines.append("```json")
+    lines.append(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    lines.append("```")
+    return "\n".join(lines)

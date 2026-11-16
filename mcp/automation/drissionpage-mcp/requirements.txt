@@ -1,0 +1,17 @@
+# Core dependencies
+# Supports current stable 4.1.x and DrissionPage 4.2 pre-releases via:
+#   pip install --pre --upgrade DrissionPage
+DrissionPage>=4.1.1.4,<5
+pydantic>=2.0.0
+typing-extensions>=4.0.0
+
+# MCP SDK
+mcp>=1.0.0,<2
+
+# Development dependencies (optional)
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+isort>=5.0.0
+flake8>=6.0.0
+mypy>=1.0.0

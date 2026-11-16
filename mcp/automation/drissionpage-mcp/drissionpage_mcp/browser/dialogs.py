@@ -1,0 +1,194 @@
+"""Capability-probed JavaScript dialog operations for one browser tab."""
+
+from __future__ import annotations
+
+import asyncio
+from time import monotonic, sleep
+from typing import TYPE_CHECKING, Any
+
+from ..compat import accepts_parameters
+from ..response_errors import ErrorCode
+
+if TYPE_CHECKING:
+    from ..tab import PageTab
+
+
+class DialogUnsupportedError(RuntimeError):
+    """Raised before response when the attached runtime cannot honor dialogs."""
+
+    code = ErrorCode.UNSUPPORTED_OPERATION
+
+    def __init__(self, reason_code: str):
+        super().__init__(
+            f"JavaScript dialog response is unsupported by this runtime ({reason_code})."
+        )
+        self.reason_code = reason_code
+
+
+class DialogPreconditionError(ValueError):
+    """Raised when the pending dialog cannot honor the requested response."""
+
+    code = ErrorCode.PRECONDITION_FAILED
+
+
+class DialogNotFoundError(LookupError):
+    """Raised when no pending dialog exists within the requested observation window."""
+
+    code = ErrorCode.DIALOG_NOT_FOUND
+
+
+class DialogResponseIndeterminateError(RuntimeError):
+    """Raised after native invocation when the final dialog state is uncertain."""
+
+
+class DialogOperations:
+    """Own pending-dialog inspection and native DrissionPage response calls."""
+
+    def __init__(self, tab: PageTab) -> None:
+        self._tab = tab
+        self._response_lock = asyncio.Lock()
+
+    @property
+    def _page(self) -> Any:
+        return self._tab.page
+
+    def probe(self) -> None:
+        """Fail closed unless the attached runtime exposes the required lifecycle."""
+
+        handler = getattr(self._page, "handle_alert", None)
+        if not callable(handler) or not accepts_parameters(
+            handler, "accept", "send", "timeout", "next_one"
+        ):
+            raise DialogUnsupportedError("HANDLE_ALERT_API_UNAVAILABLE")
+        bounded_handler = getattr(self._page, "_handle_alert", None)
+        if not callable(bounded_handler) or not accepts_parameters(
+            bounded_handler, "accept", "send", "timeout", "next_one"
+        ):
+            raise DialogUnsupportedError("BOUNDED_HANDLE_ALERT_API_UNAVAILABLE")
+        states = getattr(self._page, "states", None)
+        if (
+            states is None
+            or not hasattr(type(states), "has_alert")
+            and not hasattr(states, "has_alert")
+        ):
+            raise DialogUnsupportedError("ALERT_STATE_UNAVAILABLE")
+        alert = getattr(self._page, "_alert", None)
+        if alert is None or any(
+            not hasattr(alert, name) for name in ("activated", "type", "text")
+        ):
+            raise DialogUnsupportedError("ALERT_METADATA_UNAVAILABLE")
+
+    async def wait_for_pending(self, *, timeout: float) -> dict[str, Any]:
+        """Wait for one supported pending dialog without responding to it."""
+
+        return await asyncio.to_thread(self._wait_for_pending, timeout)
+
+    def _wait_for_pending(self, timeout: float) -> dict[str, Any]:
+        """Poll off-loop because native DrissionPage clicks are synchronous."""
+
+        self.probe()
+        deadline = monotonic() + timeout
+        while True:
+            states = self._page.states
+            if bool(states.has_alert):
+                alert = self._page._alert
+                dialog_type = str(alert.type or "").lower()
+                if dialog_type not in {"alert", "confirm", "prompt"}:
+                    raise DialogUnsupportedError("DIALOG_TYPE_UNSUPPORTED")
+                return {
+                    "dialog_type": dialog_type,
+                    "message": str(alert.text or ""),
+                }
+            if monotonic() >= deadline:
+                raise DialogNotFoundError(
+                    "No pending JavaScript dialog was observed within the timeout."
+                )
+            sleep(min(0.02, max(0.001, deadline - monotonic())))
+
+    async def respond(
+        self,
+        *,
+        pending: dict[str, Any],
+        action: str,
+        prompt_text: str | None,
+        timeout: float,
+    ) -> None:
+        """Dispatch one native response and verify closure under one deadline."""
+
+        deadline = monotonic() + timeout
+        try:
+            await asyncio.wait_for(self._response_lock.acquire(), timeout=timeout)
+        except TimeoutError as exc:
+            raise DialogPreconditionError(
+                "Another JavaScript dialog response consumed the response deadline."
+            ) from exc
+        try:
+            self.probe()
+            alert = self._page._alert
+            current_type = str(alert.type or "").lower()
+            current_message = str(alert.text or "")
+            if not bool(self._page.states.has_alert) or (
+                current_type != pending["dialog_type"]
+                or current_message != pending["message"]
+            ):
+                raise DialogPreconditionError(
+                    "The pending JavaScript dialog changed before it could be handled."
+                )
+            if prompt_text is not None and current_type != "prompt":
+                raise DialogPreconditionError(
+                    "prompt_text is valid only for a pending prompt dialog."
+                )
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise DialogPreconditionError(
+                    "Dialog response deadline expired before native invocation."
+                )
+            completion = asyncio.create_task(
+                self._invoke_and_verify(
+                    accept=action == "accept",
+                    prompt_text=prompt_text,
+                    timeout=remaining,
+                    deadline=deadline,
+                )
+            )
+            try:
+                await asyncio.shield(completion)
+            except asyncio.CancelledError:
+                try:
+                    await completion
+                except Exception:
+                    pass
+                raise
+        finally:
+            self._response_lock.release()
+
+    async def _invoke_and_verify(
+        self,
+        *,
+        accept: bool,
+        prompt_text: str | None,
+        timeout: float,
+        deadline: float,
+    ) -> None:
+        try:
+            result = await asyncio.to_thread(
+                self._page._handle_alert,
+                accept=accept,
+                send=prompt_text,
+                timeout=timeout,
+                next_one=False,
+            )
+        except Exception as exc:
+            raise DialogResponseIndeterminateError(
+                "Dialog response outcome is indeterminate after native invocation."
+            ) from exc
+        if result is False:
+            raise DialogResponseIndeterminateError(
+                "Dialog response outcome is indeterminate after native invocation."
+            )
+        while bool(self._page.states.has_alert):
+            if monotonic() >= deadline:
+                raise DialogResponseIndeterminateError(
+                    "Dialog response outcome is indeterminate after native invocation."
+                )
+            await asyncio.sleep(min(0.01, max(0.001, deadline - monotonic())))
