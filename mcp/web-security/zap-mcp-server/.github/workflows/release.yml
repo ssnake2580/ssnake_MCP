@@ -1,0 +1,192 @@
+name: Release
+
+env:
+  IMAGE_NAME: mcp-zap-server
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  docker-release:
+    name: Publish release images and archive SBOM
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve release metadata
+        id: vars
+        env:
+          RELEASE_VERSION: ${{ github.event.release.tag_name }}
+          RELEASE_IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_IS_IMMUTABLE: ${{ github.event.release.immutable }}
+        run: |
+          set -euo pipefail
+
+          if [ "$RELEASE_IS_IMMUTABLE" != "true" ]; then
+            echo "GitHub immutable releases must be enabled before publication" >&2
+            exit 1
+          fi
+
+          if [[ ! "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Release version must be a strict vMAJOR.MINOR.PATCH tag with an optional prerelease suffix" >&2
+            exit 1
+          fi
+
+          publish_latest=true
+          if [ "$RELEASE_IS_PRERELEASE" = "true" ] || [[ "$RELEASE_VERSION" == *-* ]]; then
+            publish_latest=false
+          fi
+
+          printf 'version=%s\n' "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'publish_latest=%s\n' "$publish_latest" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify release tag, commit, and project version
+        env:
+          RELEASE_VERSION: ${{ steps.vars.outputs.version }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release event commit must be a full lowercase SHA-1" >&2
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_VERSION}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          test "$head_commit" = "$EXPECTED_COMMIT" || {
+            echo "Checked-out HEAD must equal the release event commit" >&2
+            exit 1
+          }
+          test "$tag_commit" = "$EXPECTED_COMMIT" || {
+            echo "${RELEASE_VERSION} must still reference the release event commit" >&2
+            exit 1
+          }
+
+          git rev-parse --verify "refs/remotes/origin/main^{commit}" >/dev/null || {
+            echo "origin/main is unavailable; refusing to execute release code" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$EXPECTED_COMMIT" refs/remotes/origin/main || {
+            echo "Release event commit must be reachable from origin/main" >&2
+            exit 1
+          }
+
+          project_version="$(sed -n "s/^version = '\([^']*\)'$/\1/p" build.gradle)"
+          test -n "$project_version"
+          test "$RELEASE_VERSION" = "v${project_version}" || {
+            echo "Release tag must be v${project_version}" >&2
+            exit 1
+          }
+
+      - name: Require Desktop bundle and setup guide on the published release
+        id: desktop-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          package_version="$(python3 -c 'import json; print(json.load(open("packaging/claude-desktop/package.json"))["version"])')"
+          [[ "$package_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
+          base="mcp-zap-connect-claude-desktop-${package_version}"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          jq -e --arg tag "$RELEASE_VERSION" \
+            '.draft == false and .immutable == true and .tag_name == $tag' <<< "$release" >/dev/null
+          for file in "${base}.mcpb" "${base}.mcpb.sha256" "${base}-setup.md" "${base}-setup.md.sha256"; do
+            jq -e --arg name "$file" \
+              '[.assets[] | select(.name == $name)] | length == 1 and .[0].state == "uploaded" and .[0].size > 0' \
+              <<< "$release" >/dev/null || {
+              echo "Missing complete Desktop asset: $file. Attach all four files to the draft before publication." >&2
+              exit 1
+            }
+          done
+
+      - name: Verify Distroless runtime signature
+        run: ./scripts/verify-distroless-signature.sh
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: "25"
+          distribution: temurin
+          cache: gradle
+          server-id: github
+          settings-path: ${{ github.workspace }}
+
+      - name: Build with Gradle and generate SBOM
+        run: ./gradlew build cyclonedxBom --scan --no-daemon --stacktrace --info
+
+      - name: Run Docker-backed integration tests
+        run: ./gradlew dockerTest --scan --no-daemon --stacktrace --info
+
+      - name: Archive SBOM workflow artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sbom-${{ steps.vars.outputs.version }}
+          path: build/reports/cyclonedx-direct/bom.json
+          if-no-files-found: error
+
+      - name: Compute release image tags
+        id: image-tags
+        env:
+          RELEASE_VERSION: ${{ steps.vars.outputs.version }}
+          PUBLISH_LATEST: ${{ steps.vars.outputs.publish_latest }}
+          GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          DOCKER_HUB_IMAGE: ${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "tags<<EOF"
+            echo "${GHCR_IMAGE}:${RELEASE_VERSION}"
+            echo "${DOCKER_HUB_IMAGE}:${RELEASE_VERSION}"
+
+            if [ "$PUBLISH_LATEST" = "true" ]; then
+              echo "${GHCR_IMAGE}:latest"
+              echo "${DOCKER_HUB_IMAGE}:latest"
+            fi
+
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ github.actor }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
+        with:
+          driver-opts: image=docker.io/moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Build and push release images
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ steps.image-tags.outputs.tags }}

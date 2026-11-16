@@ -1,0 +1,61 @@
+package tools
+
+import (
+	"context"
+
+	"github.com/c0tton-fluff/caido-mcp-server/v4/internal/replay"
+	caido "github.com/caido-community/sdk-go"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+type ListReplayCollectionsInput struct{}
+
+type ReplayCollectionSummary struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type ListReplayCollectionsOutput struct {
+	Collections []ReplayCollectionSummary `json:"collections"`
+}
+
+func listReplayCollectionsHandler(
+	client *caido.Client,
+) func(context.Context, *mcp.CallToolRequest, ListReplayCollectionsInput) (*mcp.CallToolResult, ListReplayCollectionsOutput, error) {
+	return func(
+		ctx context.Context,
+		req *mcp.CallToolRequest,
+		input ListReplayCollectionsInput,
+	) (*mcp.CallToolResult, ListReplayCollectionsOutput, error) {
+		collections, err := replay.ListCollections(ctx, client)
+		if err != nil {
+			return nil, ListReplayCollectionsOutput{}, err
+		}
+
+		output := ListReplayCollectionsOutput{
+			Collections: make(
+				[]ReplayCollectionSummary, 0, len(collections),
+			),
+		}
+		for _, c := range collections {
+			output.Collections = append(output.Collections, ReplayCollectionSummary{
+				ID:   c.ID,
+				Name: c.Name,
+			})
+		}
+
+		return nil, output, nil
+	}
+}
+
+func RegisterListReplayCollectionsTool(
+	server *mcp.Server, client *caido.Client,
+) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "caido_list_replay_collections",
+		Title:       "List Replay Collections",
+		Description: `List replay collections. Returns id and name for each collection.`,
+		InputSchema: map[string]any{"type": "object"},
+		Annotations: readOnlyAnn(),
+	}, listReplayCollectionsHandler(client))
+}

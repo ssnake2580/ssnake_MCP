@@ -1,0 +1,280 @@
+package com.burpmcp.ultra.tools.intruder
+
+import com.burpmcp.ultra.bridge.IntruderBridge
+import com.burpmcp.ultra.state.StateManager
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
+import io.modelcontextprotocol.kotlin.sdk.types.TextContent
+import io.modelcontextprotocol.kotlin.sdk.server.Server
+import kotlinx.serialization.json.*
+
+object IntruderTools {
+
+    fun register(server: Server, bridge: IntruderBridge, stateManager: StateManager) {
+
+        server.addTool(
+            name = "intruder_send",
+            description = "Send an HTTP request to Burp Suite's Intruder tool for automated attack " +
+                "configuration. Creates a new Intruder tab with the specified request. " +
+                "Parameters: request (raw HTTP request string), host (target hostname), " +
+                "port (target port), use_tls (boolean), tab_name (optional tab name).",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request string") }
+                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
+                    putJsonObject("port") { put("type", "integer"); put("description", "Target port") }
+                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use TLS, default false") }
+                    putJsonObject("tab_name") { put("type", "string"); put("description", "Optional Intruder tab name") }
+                },
+                required = listOf("request", "host", "port")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
+                        isError = true
+                    )
+                val host = args["host"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
+                        isError = true
+                    )
+                val port = args["port"]?.jsonPrimitive?.intOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
+                        isError = true
+                    )
+                val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
+                val tabName = args["tab_name"]?.jsonPrimitive?.contentOrNull
+
+                val result = bridge.sendToIntruder(rawRequest, host, port, useTls, tabName)
+                CallToolResult(content = listOf(TextContent(result.toString())))
+            } catch (e: Exception) {
+                CallToolResult(
+                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
+                    isError = true
+                )
+            }
+        }
+
+        server.addTool(
+            name = "intruder_send_with_positions",
+            description = "Send an HTTP request to Intruder with pre-defined payload insertion " +
+                "point positions. Each position is a [start, end] byte offset pair marking " +
+                "where payloads should be inserted. Parameters: request (raw HTTP request), " +
+                "host (target hostname), port (target port), use_tls (boolean), " +
+                "positions (array of [start, end] pairs), tab_name (optional tab name).",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request string") }
+                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
+                    putJsonObject("port") { put("type", "integer"); put("description", "Target port") }
+                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use TLS, default false") }
+                    putJsonObject("positions") {
+                        put("type", "array")
+                        put("description", "Array of [start, end] byte offset pairs marking payload insertion points")
+                        putJsonObject("items") { put("type", "array") }
+                    }
+                    putJsonObject("tab_name") { put("type", "string"); put("description", "Optional Intruder tab name") }
+                },
+                required = listOf("request", "host", "port", "positions")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
+                        isError = true
+                    )
+                val host = args["host"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
+                        isError = true
+                    )
+                val port = args["port"]?.jsonPrimitive?.intOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
+                        isError = true
+                    )
+                val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
+                val tabName = args["tab_name"]?.jsonPrimitive?.contentOrNull
+
+                val rawPositions = args["positions"]?.jsonArray
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: positions"}""")),
+                        isError = true
+                    )
+
+                val positions = rawPositions.map { pos ->
+                    when {
+                        pos is JsonArray -> IntruderValidation.parsePositionArray(pos)
+                        pos is JsonObject -> {
+                            val start = (pos["start"]?.jsonPrimitive?.intOrNull
+                                ?: pos["0"]?.jsonPrimitive?.intOrNull)
+                                ?: throw IllegalArgumentException("Position missing 'start' field")
+                            val end = (pos["end"]?.jsonPrimitive?.intOrNull
+                                ?: pos["1"]?.jsonPrimitive?.intOrNull)
+                                ?: throw IllegalArgumentException("Position missing 'end' field")
+                            if (end < start) throw IllegalArgumentException(
+                                "position end ($end) must be >= start ($start)")
+                            Pair(start, end)
+                        }
+                        else -> throw IllegalArgumentException("Invalid position format: $pos")
+                    }
+                }
+
+                val result = bridge.sendWithPositions(rawRequest, host, port, useTls, positions, tabName)
+                CallToolResult(content = listOf(TextContent(result.toString())))
+            } catch (e: IllegalArgumentException) {
+                // Validation failures carry a clean, descriptive message safe to surface.
+                CallToolResult(
+                    content = listOf(TextContent(
+                        buildJsonObject { put("error", e.message ?: "invalid positions") }.toString()
+                    )),
+                    isError = true
+                )
+            } catch (e: Exception) {
+                // Never leak raw JDK internals (e.g. IndexOutOfBoundsException bounds text).
+                CallToolResult(
+                    content = listOf(TextContent(
+                        buildJsonObject { put("error", "internal error processing positions") }.toString()
+                    )),
+                    isError = true
+                )
+            }
+        }
+
+        server.addTool(
+            name = "intruder_register_payload_processor",
+            description = "Register a custom payload processor with Intruder that transforms " +
+                "payloads during attacks. Supported transform types: encode_base64, encode_url, " +
+                "hash_md5, hash_sha1, hash_sha256, prefix (prepend string), suffix (append " +
+                "string), regex_replace (apply regex replacement). Parameters: name (processor " +
+                "name), transform_type (one of the supported types), prefix_value (string to " +
+                "prepend, for prefix type), suffix_value (string to append, for suffix type), " +
+                "regex_pattern (regex pattern, for regex_replace type), regex_replacement " +
+                "(replacement string, for regex_replace type).",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("name") { put("type", "string"); put("description", "Processor name") }
+                    putJsonObject("transform_type") { put("type", "string"); put("description", "One of: encode_base64, encode_url, hash_md5, hash_sha1, hash_sha256, prefix, suffix, regex_replace") }
+                    putJsonObject("prefix_value") { put("type", "string"); put("description", "String to prepend, for prefix type") }
+                    putJsonObject("suffix_value") { put("type", "string"); put("description", "String to append, for suffix type") }
+                    putJsonObject("regex_pattern") { put("type", "string"); put("description", "Regex pattern, for regex_replace type") }
+                    putJsonObject("regex_replacement") { put("type", "string"); put("description", "Replacement string, for regex_replace type") }
+                },
+                required = listOf("name", "transform_type")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val name = args["name"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: name"}""")),
+                        isError = true
+                    )
+                val transformType = args["transform_type"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: transform_type"}""")),
+                        isError = true
+                    )
+
+                val validTypes = listOf(
+                    "encode_base64", "encode_url",
+                    "hash_md5", "hash_sha1", "hash_sha256",
+                    "prefix", "suffix", "regex_replace"
+                )
+                if (transformType !in validTypes) {
+                    return@addTool CallToolResult(
+                        content = listOf(TextContent(
+                            """{"error":"Invalid transform_type: $transformType. Valid types: ${validTypes.joinToString(", ")}"}"""
+                        )),
+                        isError = true
+                    )
+                }
+
+                val params = mutableMapOf<String, String>()
+                (args["prefix_value"]?.jsonPrimitive?.contentOrNull)?.let { params["prefix_value"] = it }
+                (args["suffix_value"]?.jsonPrimitive?.contentOrNull)?.let { params["suffix_value"] = it }
+                (args["regex_pattern"]?.jsonPrimitive?.contentOrNull)?.let { params["regex_pattern"] = it }
+                (args["regex_replacement"]?.jsonPrimitive?.contentOrNull)?.let { params["regex_replacement"] = it }
+
+                // BUG #33: eagerly validate regex_replace inputs at registration time so an
+                // invalid pattern is rejected here instead of silently failing later, mid-attack,
+                // when each payload is processed.
+                if (transformType == "regex_replace") {
+                    IntruderValidation.regexError(params)?.let { errObj ->
+                        return@addTool CallToolResult(
+                            content = listOf(TextContent(errObj.toString())),
+                            isError = true
+                        )
+                    }
+                }
+
+                val result = bridge.registerPayloadProcessor(name, transformType, params)
+                CallToolResult(content = listOf(TextContent(result.toString())))
+            } catch (e: Exception) {
+                CallToolResult(
+                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
+                    isError = true
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Pure, Burp-free validation helpers for the Intruder tools. Kept in this file (which the
+ * owning agent controls) so the parsing/validation rules can be unit-tested without a live
+ * Montoya API.
+ */
+internal object IntruderValidation {
+
+    /**
+     * BUG #16: parse a JSON `[start, end]` position pair with strict arity validation.
+     *
+     * The previous implementation indexed `pos[0]`/`pos[1]` directly, which leaked a raw
+     * [IndexOutOfBoundsException] for a too-short array and silently ignored extra elements
+     * for a too-long array. This validates exact arity and integer-ness up front so both
+     * failure modes surface an identical, descriptive [IllegalArgumentException] that the
+     * tool layer renders as a clean `{"error":...}` response.
+     */
+    fun parsePositionArray(pos: JsonArray): Pair<Int, Int> {
+        if (pos.size != 2) throw IllegalArgumentException(
+            "each position must be a [start,end] pair (got ${pos.size} element(s))")
+        val start = pos[0].jsonPrimitive.intOrNull
+            ?: throw IllegalArgumentException("position start must be an integer")
+        val end = pos[1].jsonPrimitive.intOrNull
+            ?: throw IllegalArgumentException("position end must be an integer")
+        if (end < start) throw IllegalArgumentException(
+            "position end ($end) must be >= start ($start)")
+        return Pair(start, end)
+    }
+
+    /**
+     * BUG #33: eagerly validate the regex of a `regex_replace` payload processor.
+     *
+     * Returns a `{"error":...}` [JsonObject] when the pattern is missing/blank or cannot be
+     * compiled, or `null` when the pattern is valid. Registering with an invalid pattern used
+     * to succeed and only blow up later, once per payload, during a live attack.
+     */
+    fun regexError(params: Map<String, String>): JsonObject? {
+        val pattern = params["regex_pattern"]
+        if (pattern.isNullOrEmpty()) {
+            return buildJsonObject {
+                put("error", "regex_replace requires a non-empty regex_pattern")
+            }
+        }
+        return try {
+            Regex(pattern)
+            null
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("error", "Invalid regex_pattern: ${e.message ?: "could not compile pattern"}")
+            }
+        }
+    }
+}

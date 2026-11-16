@@ -1,0 +1,40 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'com.example.mcpzap'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+def defaultExtensionApiVersion = '0.17.1'
+def extensionApiVersion = providers.gradleProperty('extensionApiVersion').orElse(defaultExtensionApiVersion).get()
+def extensionApiGroup = providers.gradleProperty('extensionApiGroup').orElse('io.github.dtkmn').get()
+def extensionApiCoordinate = "${extensionApiGroup}:mcp-zap-extension-api:${extensionApiVersion}"
+def defaultExtensionApiRepositoryUrl = file('../../../build/extension-api-public-preview-publication').toURI().toString()
+def extensionApiRepositoryUrl = providers.gradleProperty('extensionApiRepositoryUrl')
+        .orElse(defaultExtensionApiRepositoryUrl)
+        .get()
+
+repositories {
+    exclusiveContent {
+        forRepository {
+            maven {
+                url = uri(extensionApiRepositoryUrl)
+            }
+        }
+        filter {
+            includeGroup extensionApiGroup
+        }
+    }
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly extensionApiCoordinate
+    compileOnly 'org.springframework.boot:spring-boot-autoconfigure:4.1.1'
+}

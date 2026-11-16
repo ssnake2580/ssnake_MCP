@@ -1,0 +1,75 @@
+# Release workflow for the Caido MCP server and CLI.
+#
+# Trigger: pushing a tag matching 'v*' (e.g. v4.0.0) publishes a GitHub Release.
+# It can also be run manually via workflow_dispatch with an optional 'tag' input,
+# which is checked out and used as the VERSION (no tag is created by dispatch).
+#
+# The release assets are produced by scripts/build.sh and MUST keep the names
+# caido-mcp-server-<os>-<arch>[.exe] and caido-cli-<os>-<arch>[.exe]. install.sh
+# downloads releases/download/<VERSION>/<BINARY> by those exact names, so renaming
+# the assets here would break installs. The published Release must be a real,
+# non-draft, non-prerelease release whose tag equals the version.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to build (e.g. v4.0.0) for manual testing'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # A dispatch with a tag builds that tag, not the branch head, so the
+      # assets match the tag they are published under.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Derive VERSION
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME:-}"
+          if [ -z "$VERSION" ] || [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            VERSION="${{ inputs.tag }}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "Error: no version available; push a 'v*' tag or supply the 'tag' input" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building VERSION=$VERSION"
+
+      - name: Build release binaries
+        run: |
+          chmod +x scripts/build.sh
+          ./scripts/build.sh "${{ steps.version.outputs.VERSION }}"
+
+      - name: Generate checksums
+        run: cd dist && sha256sum * > sha256sums.txt
+
+      - name: Publish release
+        # SHA-pinned (not @v3): this action has contents:write and a tag can
+        # be moved, so a full commit SHA is required to trust what runs here.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

@@ -1,0 +1,292 @@
+{{- if .Values.mcp.enabled }}
+{{- $jobStoreBackend := include "mcp-zap-server.scanJobStoreBackend" . }}
+{{- $memoryLaunchSafety := eq $jobStoreBackend "in-memory" }}
+{{- $maximumControllers := int .Values.mcp.replicaCount }}
+{{- if .Values.mcp.autoscaling.enabled }}{{- $maximumControllers = int .Values.mcp.autoscaling.maxReplicas }}{{- end }}
+{{- if and $memoryLaunchSafety (gt $maximumControllers 1) }}
+{{- fail "In-memory launch safety requires one MCP controller; use Postgres for multiple workers" }}
+{{- end }}
+{{- $sharedWorkspace := and .Values.zap.persistence.enabled .Values.zap.persistence.shareWithMcp }}
+{{- $workspaceClaim := default (printf "%s-zap-pvc" (include "mcp-zap-server.fullname" .)) .Values.zap.persistence.existingClaim }}
+{{- $launchClaim := default (printf "%s-mcp-launch-safety" (include "mcp-zap-server.fullname" .)) .Values.mcp.launchSafety.persistence.existingClaim }}
+{{- if and $memoryLaunchSafety .Values.zap.persistence.enabled (eq $launchClaim $workspaceClaim) }}
+{{- fail "Launch safety requires an MCP-only claim separate from the ZAP/report workspace claim" }}
+{{- end }}
+{{- $automationDirectory := "" }}
+{{- if $sharedWorkspace }}
+{{- $automationDirectory = printf "%s/%s" (trimSuffix "/" .Values.zap.persistence.mountPath) .Values.zap.persistence.automationSubdirectory }}
+{{- end }}
+{{- $affinity := include "mcp-zap-server.workspaceAffinity" (dict "root" . "affinity" .Values.mcp.affinity) | fromYaml }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp-zap-server.fullname" . }}-mcp
+  labels:
+    {{- include "mcp-zap-server.mcp.labels" . | nindent 4 }}
+spec:
+  revisionHistoryLimit: {{ .Values.mcp.revisionHistoryLimit }}
+  strategy:
+    {{- if $memoryLaunchSafety }}
+    type: Recreate
+    {{- else }}
+    type: {{ .Values.mcp.deploymentStrategy.type }}
+    {{- if eq .Values.mcp.deploymentStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      maxUnavailable: {{ .Values.mcp.deploymentStrategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.mcp.deploymentStrategy.rollingUpdate.maxSurge }}
+    {{- end }}
+    {{- end }}
+  {{- if not .Values.mcp.autoscaling.enabled }}
+  replicas: {{ .Values.mcp.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mcp-zap-server.mcp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "mcp-zap-server.mcp.selectorLabels" . | nindent 8 }}
+        {{- if $sharedWorkspace }}
+        mcp-zap-server.io/workspace: {{ include "mcp-zap-server.fullname" . | quote }}
+        {{- end }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mcp-zap-server.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.mcp.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if $sharedWorkspace }}
+      {{- include "mcp-zap-server.workspaceInitialization" . | nindent 6 }}
+      {{- end }}
+      containers:
+      - name: mcp-server
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: "{{ .Values.mcp.image.repository }}:{{ default .Chart.AppVersion .Values.mcp.image.tag }}"
+        imagePullPolicy: {{ .Values.mcp.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.mcp.service.targetPort }}
+          protocol: TCP
+        env:
+        - name: SERVER_PORT
+          value: "{{ .Values.mcp.service.targetPort }}"
+        - name: ZAP_API_URL
+          value: "{{ default (printf "%s-zap" (include "mcp-zap-server.fullname" .)) .Values.mcp.zapClient.url }}"
+        - name: ZAP_SCAN_JOBS_STORE_BACKEND
+          value: {{ $jobStoreBackend | quote }}
+        {{- if $memoryLaunchSafety }}
+        - name: ZAP_SCAN_LAUNCH_JOURNAL_DIRECTORY
+          value: /var/lib/mcp-zap/scan-launch-safety/receipts
+        {{- end }}
+        - name: ZAP_API_PORT
+          value: "{{ .Values.mcp.zapClient.port }}"
+        - name: ZAP_API_CONNECT_TIMEOUT_MS
+          value: "{{ .Values.mcp.zapClient.connectTimeoutMs }}"
+        - name: ZAP_API_READ_TIMEOUT_MS
+          value: "{{ .Values.mcp.zapClient.readTimeoutMs }}"
+        - name: ZAP_API_KEY
+          {{- if .Values.mcp.zapClient.existingSecret.name }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.mcp.zapClient.existingSecret.name }}
+              key: {{ .Values.mcp.zapClient.existingSecret.apiKeyKey }}
+          {{- else }}
+          value: "{{ default .Values.zap.config.apiKey .Values.mcp.zapClient.apiKey }}"
+          {{- end }}
+        {{- if $sharedWorkspace }}
+        - name: ZAP_REPORT_DIRECTORY
+          value: {{ .Values.zap.persistence.mountPath | quote }}
+        - name: ZAP_AUTOMATION_LOCAL_DIRECTORY
+          value: {{ $automationDirectory | quote }}
+        - name: ZAP_AUTOMATION_ZAP_DIRECTORY
+          value: {{ $automationDirectory | quote }}
+        {{- end }}
+        {{- if .Values.zap.persistence.contentImport.enabled }}
+        - name: ZAP_OPENAPI_CONTENT_ENABLED
+          value: "true"
+        - name: ZAP_OPENAPI_CONTENT_LOCAL_DIRECTORY
+          value: {{ .Values.zap.persistence.contentImport.mountPath | quote }}
+        - name: ZAP_OPENAPI_CONTENT_ZAP_DIRECTORY
+          value: {{ .Values.zap.persistence.contentImport.mountPath | quote }}
+        {{- end }}
+        - name: MCP_SECURITY_MODE
+          value: "{{ .Values.mcp.security.mode }}"
+        - name: MCP_SECURITY_ENABLED
+          value: "{{ .Values.mcp.security.enabled }}"
+        - name: MCP_API_KEY
+          {{- if .Values.mcp.security.existingSecret.name }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.mcp.security.existingSecret.name }}
+              key: {{ .Values.mcp.security.existingSecret.apiKeyKey }}
+          {{- else }}
+          value: "{{ .Values.mcp.security.apiKey }}"
+          {{- end }}
+        - name: MCP_SECURITY_ALLOW_PLACEHOLDER_API_KEY
+          value: "{{ .Values.mcp.security.allowPlaceholderApiKey }}"
+        - name: JWT_ENABLED
+          value: "{{ .Values.mcp.security.jwt.enabled }}"
+        - name: JWT_SECRET
+          {{- if and .Values.mcp.security.jwt.enabled .Values.mcp.security.existingSecret.name }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.mcp.security.existingSecret.name }}
+              key: {{ .Values.mcp.security.existingSecret.jwtSecretKey }}
+          {{- else }}
+          value: "{{ .Values.mcp.security.jwt.secret }}"
+          {{- end }}
+        - name: JWT_ISSUER
+          value: "{{ .Values.mcp.security.jwt.issuer }}"
+        - name: JWT_ACCESS_TOKEN_EXPIRATION
+          value: "{{ .Values.mcp.security.jwt.accessTokenExpiry }}"
+        - name: JWT_REFRESH_TOKEN_EXPIRATION
+          value: "{{ .Values.mcp.security.jwt.refreshTokenExpiry }}"
+        - name: JWT_REVOCATION_STORE_BACKEND
+          value: {{ .Values.mcp.security.jwt.revocation.backend | lower | trim | quote }}
+        - name: JWT_REVOCATION_STORE_POSTGRES_URL
+          value: {{ .Values.mcp.security.jwt.revocation.postgres.url | quote }}
+        - name: JWT_REVOCATION_STORE_POSTGRES_TABLE_NAME
+          value: {{ .Values.mcp.security.jwt.revocation.postgres.tableName | quote }}
+        - name: JWT_REVOCATION_STORE_POSTGRES_FAIL_FAST
+          value: {{ .Values.mcp.security.jwt.revocation.postgres.failFast | toString | quote }}
+        {{- with .Values.mcp.security.jwt.revocation.postgres.existingSecret.name }}
+        - name: JWT_REVOCATION_STORE_POSTGRES_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: {{ . | quote }}
+              key: {{ $.Values.mcp.security.jwt.revocation.postgres.existingSecret.usernameKey | quote }}
+        - name: JWT_REVOCATION_STORE_POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ . | quote }}
+              key: {{ $.Values.mcp.security.jwt.revocation.postgres.existingSecret.passwordKey | quote }}
+        {{- end }}
+        - name: ZAP_MAX_ACTIVE_SCAN_DURATION
+          value: "{{ .Values.mcp.scan.limits.maxActiveScanDurationInMins }}"
+        - name: ZAP_MAX_SPIDER_SCAN_DURATION
+          value: "{{ .Values.mcp.scan.limits.maxSpiderScanDurationInMins }}"
+        - name: ZAP_MAX_CONCURRENT_ACTIVE_SCANS
+          value: "{{ .Values.mcp.scan.limits.maxConcurrentActiveScans }}"
+        - name: ZAP_MAX_CONCURRENT_SPIDER_SCANS
+          value: "{{ .Values.mcp.scan.limits.maxConcurrentSpiderScans }}"
+        - name: ZAP_THREAD_PER_HOST
+          value: "{{ .Values.mcp.scan.limits.threadPerHost }}"
+        - name: ZAP_HOST_PER_SCAN
+          value: "{{ .Values.mcp.scan.limits.hostPerScan }}"
+        - name: ZAP_CONNECTION_TIMEOUT
+          value: "{{ .Values.mcp.scan.limits.connectionTimeoutInSecs }}"
+        - name: ZAP_SPIDER_THREAD_COUNT
+          value: "{{ .Values.mcp.scan.limits.spiderThreadCount }}"
+        - name: ZAP_SPIDER_MAX_DEPTH
+          value: "{{ .Values.mcp.scan.limits.spiderMaxDepth }}"
+        - name: ZAP_SPIDER_MAX_CHILDREN
+          value: "{{ .Values.mcp.scan.limits.spiderMaxChildren }}"
+        - name: ZAP_ALLOW_LOCALHOST
+          value: "{{ .Values.mcp.scan.url.allowLocalhost }}"
+        - name: ZAP_ALLOW_PRIVATE_NETWORKS
+          value: "{{ .Values.mcp.scan.url.allowPrivateNetworks }}"
+        - name: ZAP_URL_VALIDATION_ENABLED
+          value: "{{ .Values.mcp.scan.url.validationEnabled }}"
+        - name: ZAP_URL_WHITELIST
+          value: "{{ .Values.mcp.scan.url.whitelist }}"
+        - name: ZAP_URL_BLACKLIST
+          value: "{{ .Values.mcp.scan.url.blacklist }}"
+        {{- with .Values.mcp.env }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.mcp.envFrom }}
+        envFrom:
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.mcp.livenessProbe.enabled }}
+        livenessProbe:
+          {{- if .Values.mcp.livenessProbe.tcpSocket }}
+          tcpSocket:
+            {{- toYaml .Values.mcp.livenessProbe.tcpSocket | nindent 12 }}
+          {{- else }}
+          httpGet:
+            path: {{ .Values.mcp.livenessProbe.httpGet.path }}
+            port: {{ .Values.mcp.livenessProbe.httpGet.port }}
+          {{- end }}
+          initialDelaySeconds: {{ .Values.mcp.livenessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.mcp.livenessProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.mcp.livenessProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.mcp.livenessProbe.failureThreshold }}
+        {{- end }}
+        {{- if .Values.mcp.readinessProbe.enabled }}
+        readinessProbe:
+          httpGet:
+            path: {{ .Values.mcp.readinessProbe.httpGet.path }}
+            port: {{ .Values.mcp.readinessProbe.httpGet.port }}
+          initialDelaySeconds: {{ .Values.mcp.readinessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.mcp.readinessProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.mcp.readinessProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.mcp.readinessProbe.failureThreshold }}
+        {{- end }}
+        {{- if .Values.mcp.startupProbe.enabled }}
+        startupProbe:
+          httpGet:
+            path: {{ .Values.mcp.startupProbe.httpGet.path }}
+            port: {{ .Values.mcp.startupProbe.httpGet.port }}
+          failureThreshold: {{ .Values.mcp.startupProbe.failureThreshold }}
+          periodSeconds: {{ .Values.mcp.startupProbe.periodSeconds }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.mcp.resources | nindent 12 }}
+        {{- if or $sharedWorkspace $memoryLaunchSafety }}
+        volumeMounts:
+        {{- if $sharedWorkspace }}
+        - name: zap-data
+          mountPath: {{ .Values.zap.persistence.mountPath | quote }}
+          {{- with .Values.zap.persistence.workspaceSubPath }}
+          subPath: {{ . | quote }}
+          {{- end }}
+        {{- if .Values.zap.persistence.contentImport.enabled }}
+        - name: zap-data
+          mountPath: {{ .Values.zap.persistence.contentImport.mountPath | quote }}
+          subPath: {{ .Values.zap.persistence.contentImport.subPath | quote }}
+        {{- end }}
+        {{- end }}
+        {{- if $memoryLaunchSafety }}
+        - name: mcp-launch-safety
+          mountPath: /var/lib/mcp-zap/scan-launch-safety
+        {{- end }}
+        {{- end }}
+      {{- if or $sharedWorkspace $memoryLaunchSafety }}
+      volumes:
+      {{- if $sharedWorkspace }}
+      - name: zap-data
+        persistentVolumeClaim:
+          claimName: {{ $workspaceClaim | quote }}
+      {{- end }}
+      {{- if $memoryLaunchSafety }}
+      - name: mcp-launch-safety
+        persistentVolumeClaim:
+          claimName: {{ $launchClaim | quote }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.mcp.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mcp.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

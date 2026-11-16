@@ -1,0 +1,13 @@
+{
+  "name": "mcp-zap-connect",
+  "displayName": "MCP ZAP Connect",
+  "version": "0.5.0",
+  "description": "Guided local MCP ZAP setup, pre-scan readiness checks and explicit recovery for Codex, Cursor and Claude Code.",
+  "author": {
+    "name": "Daniel Tse"
+  },
+  "homepage": "https://danieltse.org/mcp-zap-server/",
+  "repository": "https://github.com/dtkmn/mcp-zap-server",
+  "license": "Apache-2.0",
+  "logo": "assets/icon.svg"
+}

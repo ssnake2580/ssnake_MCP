@@ -1,0 +1,5 @@
+# Python deps for the Ollama and LM Studio backends (safe to install for all setups)
+mcp
+ollama
+openai
+rich

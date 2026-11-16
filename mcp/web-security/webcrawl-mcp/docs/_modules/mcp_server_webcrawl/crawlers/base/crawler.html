@@ -1,0 +1,575 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../../../">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mcp_server_webcrawl.crawlers.base.crawler &mdash; mcp-server-webcrawl  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            mcp-server-webcrawl
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../guides.html">Setup Guides</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../prompts.html">Prompt Routines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../interactive.html">Interactive Mode</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../modules.html">mcp_server_webcrawl</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">mcp-server-webcrawl</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">Module code</a></li>
+          <li class="breadcrumb-item"><a href="../../crawlers.html">mcp_server_webcrawl.crawlers</a></li>
+      <li class="breadcrumb-item active">mcp_server_webcrawl.crawlers.base.crawler</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for mcp_server_webcrawl.crawlers.base.crawler</h1><div class="highlight"><pre>
+<span></span><span class="kn">import</span> <span class="nn">anyio</span>
+<span class="kn">import</span> <span class="nn">re</span>
+<span class="kn">import</span> <span class="nn">sqlite3</span>
+<span class="kn">import</span> <span class="nn">traceback</span>
+
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Final</span>
+<span class="kn">from</span> <span class="nn">urllib.parse</span> <span class="kn">import</span> <span class="n">urlparse</span>
+
+<span class="kn">from</span> <span class="nn">mcp.server</span> <span class="kn">import</span> <span class="n">NotificationOptions</span><span class="p">,</span> <span class="n">Server</span>
+<span class="kn">from</span> <span class="nn">mcp.server.models</span> <span class="kn">import</span> <span class="n">InitializationOptions</span>
+<span class="kn">from</span> <span class="nn">mcp.types</span> <span class="kn">import</span> <span class="n">EmbeddedResource</span><span class="p">,</span> <span class="n">ImageContent</span><span class="p">,</span> <span class="n">TextContent</span><span class="p">,</span> <span class="n">Tool</span>
+
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.crawlers.base.api</span> <span class="kn">import</span> <span class="n">BaseJsonApi</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.crawlers.base.adapter</span> <span class="kn">import</span> <span class="n">IndexState</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.base</span> <span class="kn">import</span> <span class="n">METADATA_VALUE_TYPE</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.sites</span> <span class="kn">import</span> <span class="n">SITES_TOOL_NAME</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.resources</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">ResourceResult</span><span class="p">,</span>
+    <span class="n">ResourceResultType</span><span class="p">,</span>
+    <span class="n">RESOURCES_DEFAULT_FIELD_MAPPING</span><span class="p">,</span>
+    <span class="n">RESOURCES_EXTRAS_ALLOWED</span><span class="p">,</span>
+    <span class="n">RESOURCES_TOOL_NAME</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.extras.thumbnails</span> <span class="kn">import</span> <span class="n">ThumbnailManager</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.extras.markdown</span> <span class="kn">import</span> <span class="n">get_markdown</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.extras.regex</span> <span class="kn">import</span> <span class="n">get_regex</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.extras.snippets</span> <span class="kn">import</span> <span class="n">get_snippets</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.extras.xpath</span> <span class="kn">import</span> <span class="n">get_xpath</span>
+
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.utils.logger</span> <span class="kn">import</span> <span class="n">get_logger</span>
+
+<span class="n">OVERRIDE_ERROR_MESSAGE</span><span class="p">:</span> <span class="n">Final</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;BaseCrawler subclasses must implement the following </span><span class="se">\</span>
+<span class="s2">methods: handle_list_tools, handle_call_tool, at minimum.&quot;&quot;&quot;</span>
+
+<span class="n">logger</span> <span class="o">=</span> <span class="n">get_logger</span><span class="p">()</span>
+
+
+<div class="viewcode-block" id="BaseCrawler">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler">[docs]</a>
+<span class="k">class</span> <span class="nc">BaseCrawler</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Base crawler class that implements MCP server functionality.</span>
+
+<span class="sd">    This class provides the foundation for specialized crawlers to interact with</span>
+<span class="sd">    the MCP server and handle tool operations for web resources.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+<div class="viewcode-block" id="BaseCrawler.__init__">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.__init__">[docs]</a>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">datasrc</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span>
+        <span class="n">get_sites_func</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span>
+        <span class="n">get_resources_func</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span>
+        <span class="n">resource_field_mapping</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">RESOURCES_DEFAULT_FIELD_MAPPING</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Initialize the BaseCrawler with a data source path and required adapter functions.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            datasrc: path to the data source</span>
+<span class="sd">            get_sites_func: function to retrieve sites from the data source</span>
+<span class="sd">            get_resources_func: function to retrieve resources from the data source</span>
+<span class="sd">            resource_field_mapping: mapping of resource field names to display names</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+
+        <span class="kn">from</span> <span class="nn">mcp_server_webcrawl</span> <span class="kn">import</span> <span class="vm">__name__</span> <span class="k">as</span> <span class="n">module_name</span><span class="p">,</span> <span class="n">__version__</span> <span class="k">as</span> <span class="n">module_version</span>
+
+        <span class="k">assert</span> <span class="n">datasrc</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> needs a datasrc, regardless of action&quot;</span>
+        <span class="k">assert</span> <span class="nb">callable</span><span class="p">(</span><span class="n">get_sites_func</span><span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> requires a callable get_sites_func&quot;</span>
+        <span class="k">assert</span> <span class="nb">callable</span><span class="p">(</span><span class="n">get_resources_func</span><span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> requires a callable get_resources_func&quot;</span>
+        <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">resource_field_mapping</span><span class="p">,</span> <span class="nb">dict</span><span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> resource_field_mapping must be a dict&quot;</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_datasrc</span><span class="p">:</span> <span class="n">Path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">datasrc</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_module_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">module_name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_module_version</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">module_version</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_server</span> <span class="o">=</span> <span class="n">Server</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_module_name</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_server</span><span class="o">.</span><span class="n">list_tools</span><span class="p">()(</span><span class="bp">self</span><span class="o">.</span><span class="n">mcp_list_tools</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_server</span><span class="o">.</span><span class="n">call_tool</span><span class="p">()(</span><span class="bp">self</span><span class="o">.</span><span class="n">mcp_call_tool</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_server</span><span class="o">.</span><span class="n">list_prompts</span><span class="p">()(</span><span class="bp">self</span><span class="o">.</span><span class="n">mcp_list_prompts</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_server</span><span class="o">.</span><span class="n">list_resources</span><span class="p">()(</span><span class="bp">self</span><span class="o">.</span><span class="n">mcp_list_resources</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_resource_field_mapping</span> <span class="o">=</span> <span class="n">resource_field_mapping</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_get_sites</span> <span class="o">=</span> <span class="n">get_sites_func</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_get_resources</span> <span class="o">=</span> <span class="n">get_resources_func</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">datasrc</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_datasrc</span>
+
+<div class="viewcode-block" id="BaseCrawler.mcp_list_prompts">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.mcp_list_prompts">[docs]</a>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">mcp_list_prompts</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;List available prompts (currently none).&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">[]</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.mcp_list_resources">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.mcp_list_resources">[docs]</a>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">mcp_list_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;List available resources (currently none).&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">[]</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.serve">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.serve">[docs]</a>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">serve</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stdin</span><span class="p">:</span> <span class="n">anyio</span><span class="o">.</span><span class="n">AsyncFile</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">stdout</span><span class="p">:</span> <span class="n">anyio</span><span class="o">.</span><span class="n">AsyncFile</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Launch the awaitable server.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            stdin: input stream for the server</span>
+<span class="sd">            stdout: output stream for the server</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            The MCP server over stdio</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_server</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">stdin</span><span class="p">,</span> <span class="n">stdout</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_initialization_options</span><span class="p">())</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.get_initialization_options">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.get_initialization_options">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_initialization_options</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">InitializationOptions</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Get the MCP initialization object.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            Dictionary containing project information</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">notification_events</span> <span class="o">=</span> <span class="n">NotificationOptions</span><span class="p">(</span><span class="n">prompts_changed</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">resources_changed</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">tools_changed</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="n">capabilities</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_server</span><span class="o">.</span><span class="n">get_capabilities</span><span class="p">(</span><span class="n">notification_options</span><span class="o">=</span><span class="n">notification_events</span><span class="p">,</span> <span class="n">experimental_capabilities</span><span class="o">=</span><span class="p">{})</span>
+        <span class="k">return</span> <span class="n">InitializationOptions</span><span class="p">(</span><span class="n">server_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_module_name</span><span class="p">,</span> <span class="n">server_version</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_module_version</span><span class="p">,</span> <span class="n">capabilities</span><span class="o">=</span><span class="n">capabilities</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.get_sites_api_json">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.get_sites_api_json">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_sites_api_json</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Get sites API result as JSON.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            JSON string of sites API results</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">json_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_sites_api</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">json_result</span><span class="o">.</span><span class="n">to_json</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.get_resources_api_json">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.get_resources_api_json">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_resources_api_json</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Get resources API result as JSON.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            JSON string of resources API results</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">json_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_resources_api</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">json_result</span><span class="o">.</span><span class="n">to_json</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.get_sites_api">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.get_sites_api">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_sites_api</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span>
+            <span class="n">ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">fields</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseJsonApi</span><span class="p">:</span>
+        <span class="n">sites</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_get_sites</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_datasrc</span><span class="p">,</span> <span class="n">ids</span><span class="o">=</span><span class="n">ids</span><span class="p">,</span> <span class="n">fields</span><span class="o">=</span><span class="n">fields</span><span class="p">)</span>
+        <span class="n">sites_kwargs</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;ids&quot;</span><span class="p">:</span> <span class="n">ids</span><span class="p">,</span>
+            <span class="s2">&quot;fields&quot;</span><span class="p">:</span> <span class="n">fields</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="n">json_result</span> <span class="o">=</span> <span class="n">BaseJsonApi</span><span class="p">(</span><span class="s2">&quot;GetProjects&quot;</span><span class="p">,</span> <span class="n">sites_kwargs</span><span class="p">)</span>
+        <span class="n">json_result</span><span class="o">.</span><span class="n">set_results</span><span class="p">(</span><span class="n">sites</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">sites</span><span class="p">),</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">sites</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">json_result</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.get_resources_api">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.get_resources_api">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_resources_api</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">sites</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">query</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+        <span class="n">fields</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">sort</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">limit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">20</span><span class="p">,</span>
+        <span class="n">offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">extras</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">extrasRegex</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">extrasXpath</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseJsonApi</span><span class="p">:</span>
+        <span class="n">resources_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">METADATA_VALUE_TYPE</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;sites&quot;</span><span class="p">:</span> <span class="n">sites</span><span class="p">,</span>
+            <span class="s2">&quot;query&quot;</span><span class="p">:</span> <span class="n">query</span><span class="p">,</span>
+            <span class="s2">&quot;fields&quot;</span><span class="p">:</span> <span class="n">fields</span><span class="p">,</span>
+            <span class="s2">&quot;sort&quot;</span><span class="p">:</span> <span class="n">sort</span><span class="p">,</span>
+            <span class="s2">&quot;limit&quot;</span><span class="p">:</span> <span class="n">limit</span><span class="p">,</span>
+            <span class="s2">&quot;offset&quot;</span><span class="p">:</span> <span class="n">offset</span><span class="p">,</span>
+        <span class="p">}</span>
+
+        <span class="k">def</span> <span class="nf">no_results</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">BaseJsonApi</span><span class="p">:</span>
+            <span class="n">api_result</span> <span class="o">=</span> <span class="n">BaseJsonApi</span><span class="p">(</span><span class="s2">&quot;GetResources&quot;</span><span class="p">,</span> <span class="n">resources_kwargs</span><span class="p">,</span> <span class="n">index_state</span><span class="o">=</span><span class="n">IndexState</span><span class="p">())</span>
+            <span class="n">api_result</span><span class="o">.</span><span class="n">set_results</span><span class="p">([],</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">limit</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">api_result</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">sites</span><span class="p">:</span>
+            <span class="n">all_sites</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_get_sites</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_datasrc</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">all_sites</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">no_results</span><span class="p">()</span>
+            <span class="c1"># set to default of all sites if not specified</span>
+            <span class="n">sites</span> <span class="o">=</span> <span class="p">[</span><span class="n">site</span><span class="o">.</span><span class="n">id</span> <span class="k">for</span> <span class="n">site</span> <span class="ow">in</span> <span class="n">all_sites</span><span class="p">]</span>
+
+        <span class="c1"># sometimes the AI gets it in its head this is a good idea</span>
+        <span class="c1"># but it means no query, just take care of it here</span>
+        <span class="k">if</span> <span class="n">query</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">&#39;&quot;&quot;&#39;</span><span class="p">,</span><span class="s2">&quot;&#39;&#39;&quot;</span><span class="p">,</span> <span class="s2">&quot;``&quot;</span><span class="p">,</span> <span class="s2">&quot;*&quot;</span><span class="p">):</span>
+            <span class="n">query</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+
+        <span class="n">site_matches</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_get_sites</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_datasrc</span><span class="p">,</span> <span class="n">ids</span><span class="o">=</span><span class="n">sites</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">site_matches</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">no_results</span><span class="p">()</span>
+
+        <span class="n">extras</span> <span class="o">=</span> <span class="n">extras</span> <span class="ow">or</span> <span class="p">[]</span>
+        <span class="n">extrasXpath</span> <span class="o">=</span> <span class="n">extrasXpath</span> <span class="ow">or</span> <span class="p">[]</span>
+        <span class="n">extrasRegex</span> <span class="o">=</span> <span class="n">extrasRegex</span> <span class="ow">or</span> <span class="p">[]</span>
+        <span class="n">fields</span> <span class="o">=</span> <span class="n">fields</span> <span class="ow">or</span> <span class="p">[]</span>
+        <span class="n">fields_extras_override</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">fields</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+
+        <span class="n">set_extras</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">extras</span><span class="p">)</span>
+        <span class="n">set_extras_content</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;markdown&quot;</span><span class="p">,</span> <span class="s2">&quot;snippets&quot;</span><span class="p">,</span> <span class="s2">&quot;xpath&quot;</span><span class="p">,</span> <span class="s2">&quot;regex&quot;</span><span class="p">}</span>
+        <span class="n">set_extras_headers</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;snippets&quot;</span><span class="p">,</span> <span class="s2">&quot;regex&quot;</span><span class="p">}</span>
+        <span class="n">add_content</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">set_extras_content</span> <span class="o">&amp;</span> <span class="n">set_extras</span><span class="p">)</span>
+        <span class="n">add_headers</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">set_extras_headers</span> <span class="o">&amp;</span> <span class="n">set_extras</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">add_content</span> <span class="ow">and</span> <span class="s2">&quot;content&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">:</span>
+            <span class="n">fields_extras_override</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;content&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">add_headers</span> <span class="ow">and</span> <span class="s2">&quot;headers&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">:</span>
+            <span class="n">fields_extras_override</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;headers&quot;</span><span class="p">)</span>
+
+        <span class="n">results</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">index_state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_get_resources</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_datasrc</span><span class="p">,</span>
+            <span class="n">sites</span><span class="o">=</span><span class="n">sites</span><span class="p">,</span>
+            <span class="n">query</span><span class="o">=</span><span class="n">query</span><span class="p">,</span>
+            <span class="n">fields</span><span class="o">=</span><span class="n">fields_extras_override</span><span class="p">,</span>
+            <span class="n">sort</span><span class="o">=</span><span class="n">sort</span><span class="p">,</span>
+            <span class="n">limit</span><span class="o">=</span><span class="n">limit</span><span class="p">,</span>
+            <span class="n">offset</span><span class="o">=</span><span class="n">offset</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="s2">&quot;markdown&quot;</span> <span class="ow">in</span> <span class="n">extras</span><span class="p">:</span>
+            <span class="n">result</span><span class="p">:</span> <span class="n">ResourceResult</span>
+            <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
+                <span class="n">markdown_result</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">ResourceResultType</span><span class="o">.</span><span class="n">PAGE</span><span class="p">:</span>
+                    <span class="n">markdown_result</span> <span class="o">=</span> <span class="n">get_markdown</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
+                <span class="n">result</span><span class="o">.</span><span class="n">set_extra</span><span class="p">(</span><span class="s2">&quot;markdown&quot;</span><span class="p">,</span> <span class="n">markdown_result</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="s2">&quot;xpath&quot;</span> <span class="ow">in</span> <span class="n">extras</span><span class="p">:</span>
+            <span class="n">result</span><span class="p">:</span> <span class="n">ResourceResult</span>
+            <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
+                <span class="n">xpath_result</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">get_xpath</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">extrasXpath</span><span class="p">)</span>
+                <span class="n">result</span><span class="o">.</span><span class="n">set_extra</span><span class="p">(</span><span class="s2">&quot;xpath&quot;</span><span class="p">,</span> <span class="n">xpath_result</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="s2">&quot;regex&quot;</span> <span class="ow">in</span> <span class="n">extras</span><span class="p">:</span>
+            <span class="n">result</span><span class="p">:</span> <span class="n">ResourceResult</span>
+            <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
+                <span class="n">regex_result</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">get_regex</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">headers</span><span class="p">,</span> <span class="n">result</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">extrasRegex</span><span class="p">)</span>
+                <span class="n">result</span><span class="o">.</span><span class="n">set_extra</span><span class="p">(</span><span class="s2">&quot;regex&quot;</span><span class="p">,</span> <span class="n">regex_result</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="s2">&quot;snippets&quot;</span> <span class="ow">in</span> <span class="n">extras</span> <span class="ow">and</span> <span class="n">query</span><span class="o">.</span><span class="n">strip</span><span class="p">():</span>
+            <span class="n">result</span><span class="p">:</span> <span class="n">ResourceResult</span>
+            <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
+                <span class="n">snippets</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">get_snippets</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">url</span><span class="p">,</span> <span class="n">result</span><span class="o">.</span><span class="n">headers</span><span class="p">,</span> <span class="n">result</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">query</span><span class="p">)</span>
+                <span class="n">result</span><span class="o">.</span><span class="n">set_extra</span><span class="p">(</span><span class="s2">&quot;snippets&quot;</span><span class="p">,</span> <span class="n">snippets</span><span class="p">)</span>
+
+        <span class="n">extras_only_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">fields_extras_override</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">fields</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">extras_only_fields</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">extras_only_fields</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">field</span><span class="p">):</span>
+                        <span class="nb">setattr</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
+        <span class="c1"># note: thumbnails extra a special case, handled in mcp_call_tool</span>
+        <span class="n">api_result</span> <span class="o">=</span> <span class="n">BaseJsonApi</span><span class="p">(</span><span class="s2">&quot;GetResources&quot;</span><span class="p">,</span> <span class="n">resources_kwargs</span><span class="p">,</span> <span class="n">index_state</span><span class="o">=</span><span class="n">index_state</span><span class="p">)</span>
+        <span class="n">api_result</span><span class="o">.</span><span class="n">set_results</span><span class="p">(</span><span class="n">results</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">limit</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">api_result</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.mcp_list_tools">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.mcp_list_tools">[docs]</a>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">mcp_list_tools</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Tool</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        List available tools.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            List of available tools</span>
+
+<span class="sd">        Raises:</span>
+<span class="sd">            NotImplementedError: This method must be implemented by subclasses</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="c1"># each crawler subclass must provide this method</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="n">OVERRIDE_ERROR_MESSAGE</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.mcp_call_tool">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.mcp_call_tool">[docs]</a>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">mcp_call_tool</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">arguments</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span>
+        <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">TextContent</span> <span class="o">|</span> <span class="n">ImageContent</span> <span class="o">|</span> <span class="n">EmbeddedResource</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Handle tool execution requests. You can override this or super(), then tweak.</span>
+<span class="sd">        Basically, it is a passthrough.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            name: name of the tool to call</span>
+<span class="sd">            arguments: arguments to pass to the tool</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            List of content objects resulting from the tool execution</span>
+
+<span class="sd">        Raises:</span>
+<span class="sd">            ValueError: If the specified tool does not exist</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="n">SITES_TOOL_NAME</span><span class="p">:</span>
+                <span class="n">ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;ids&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;ids&quot;</span><span class="p">]</span>
+                <span class="n">fields</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;fields&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;fields&quot;</span><span class="p">]</span>
+
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">ids</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">fields</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">)</span>
+
+                <span class="n">results_json</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_sites_api_json</span><span class="p">(</span>
+                    <span class="n">ids</span><span class="o">=</span><span class="n">ids</span><span class="p">,</span>
+                    <span class="n">fields</span><span class="o">=</span><span class="n">fields</span>
+                <span class="p">)</span>
+                <span class="k">return</span> <span class="p">[</span><span class="n">TextContent</span><span class="p">(</span><span class="nb">type</span><span class="o">=</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="n">results_json</span><span class="p">)]</span>
+
+            <span class="k">elif</span> <span class="n">name</span> <span class="o">==</span> <span class="n">RESOURCES_TOOL_NAME</span><span class="p">:</span>
+
+                <span class="n">extras</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;extras&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;extras&quot;</span><span class="p">]</span>
+
+                <span class="c1"># in case there is any LLM confusion of XPath/xpath or Markdown/markdown, these are</span>
+                <span class="c1"># defined lowercase in the MCP Tool definition, but have counter-weighting as proper nouns</span>
+                <span class="n">extras</span> <span class="o">=</span> <span class="p">[</span><span class="n">extra</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="k">for</span> <span class="n">extra</span> <span class="ow">in</span> <span class="n">extras</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">extra</span><span class="p">,</span> <span class="nb">str</span><span class="p">)]</span>
+                <span class="n">extrasRegex</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;extrasRegex&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;extrasRegex&quot;</span><span class="p">]</span>
+                <span class="n">extrasXpath</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;extrasXpath&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;extrasXpath&quot;</span><span class="p">]</span>
+
+                <span class="n">extras_set</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">extras</span><span class="p">)</span>
+                <span class="n">extras_removed</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">extras_set</span> <span class="o">-</span> <span class="n">RESOURCES_EXTRAS_ALLOWED</span>
+                <span class="k">if</span> <span class="n">extras_removed</span><span class="p">:</span>
+                    <span class="c1"># only allow known extras</span>
+                    <span class="n">extras</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">RESOURCES_EXTRAS_ALLOWED</span><span class="o">.</span><span class="n">intersection</span><span class="p">(</span><span class="n">extras</span><span class="p">))</span>
+
+                <span class="c1"># regular args pass through to the result</span>
+                <span class="n">query</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;query&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;query&quot;</span><span class="p">]</span>
+                <span class="n">fields</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;fields&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;fields&quot;</span><span class="p">]</span>
+                <span class="n">sites</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;sites&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;sites&quot;</span><span class="p">]</span>
+                <span class="n">sort</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;sort&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;sort&quot;</span><span class="p">]</span>
+                <span class="n">limit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">20</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;limit&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;limit&quot;</span><span class="p">]</span>
+                <span class="n">offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">arguments</span> <span class="ow">or</span> <span class="s2">&quot;offset&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">arguments</span> <span class="k">else</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">&quot;offset&quot;</span><span class="p">]</span>
+
+                <span class="c1"># claude keeps getting this wrong, it is properly enumerated in Tool definition</span>
+                <span class="n">clean_sort</span> <span class="o">=</span> <span class="n">sort</span><span class="o">.</span><span class="n">strip</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\&quot;</span><span class="s2">&#39;`&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sort</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">fields</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sites</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">sites</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sort</span><span class="p">,</span> <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="kc">None</span><span class="p">)))</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">limit</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">offset</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">extras</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">extras</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">extrasXpath</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">item</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">extrasXpath</span><span class="p">)</span>
+
+                <span class="n">api_result</span><span class="p">:</span> <span class="n">BaseJsonApi</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_resources_api</span><span class="p">(</span>
+                    <span class="n">sites</span><span class="o">=</span><span class="n">sites</span><span class="p">,</span>
+                    <span class="n">query</span><span class="o">=</span><span class="n">query</span><span class="p">,</span>
+                    <span class="n">fields</span><span class="o">=</span><span class="n">fields</span><span class="p">,</span>
+                    <span class="n">sort</span><span class="o">=</span><span class="n">clean_sort</span><span class="p">,</span>
+                    <span class="n">limit</span><span class="o">=</span><span class="n">limit</span><span class="p">,</span>
+                    <span class="n">offset</span><span class="o">=</span><span class="n">offset</span><span class="p">,</span>
+                    <span class="n">extras</span><span class="o">=</span><span class="n">extras</span><span class="p">,</span>
+                    <span class="n">extrasRegex</span><span class="o">=</span><span class="n">extrasRegex</span><span class="p">,</span>
+                    <span class="n">extrasXpath</span><span class="o">=</span><span class="n">extrasXpath</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="c1"># sometimes nudging makes things worse, AI doubles down on percieved</span>
+                <span class="c1"># rightousness of position. just let it have it. claims in the end it&#39;s</span>
+                <span class="c1"># a JSON encoding confusion with the +/- leading char. who knows? more</span>
+                <span class="c1"># importantly, who cares? play it loose.</span>
+                <span class="c1"># if sort != clean_sort:</span>
+                <span class="c1">#     # let the MCP host know the error of its ways</span>
+                <span class="c1">#     api_result.append_error(f&quot;invalid sort ({sort}) requested [{&#39;, &#39;.join(RESOURCES_DEFAULT_SORT_MAPPING.keys())}]&quot;)</span>
+                <span class="k">if</span> <span class="n">extras_removed</span><span class="p">:</span>
+                    <span class="c1"># only allow known extras</span>
+                    <span class="n">api_result</span><span class="o">.</span><span class="n">append_error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;invalid extras requested (</span><span class="si">{</span><span class="s1">&#39;, &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">extras_removed</span><span class="p">)</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+
+                <span class="n">crawl_results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ResourceResult</span><span class="p">]</span> <span class="o">=</span> <span class="n">api_result</span><span class="o">.</span><span class="n">get_results</span><span class="p">()</span>
+                <span class="n">results_json</span> <span class="o">=</span> <span class="n">api_result</span><span class="o">.</span><span class="n">to_json</span><span class="p">()</span>
+                <span class="n">mcp_result</span> <span class="o">=</span> <span class="p">[</span><span class="n">TextContent</span><span class="p">(</span><span class="nb">type</span><span class="o">=</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="n">results_json</span><span class="p">)]</span>
+
+                <span class="k">if</span> <span class="s2">&quot;thumbnails&quot;</span> <span class="ow">in</span> <span class="n">extras</span><span class="p">:</span>
+                    <span class="n">crawl_results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ResourceResult</span><span class="p">]</span> <span class="o">=</span> <span class="n">api_result</span><span class="o">.</span><span class="n">get_results</span><span class="p">()</span>
+                    <span class="n">mcp_result</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_thumbnails</span><span class="p">(</span><span class="n">crawl_results</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[]</span>
+
+                <span class="k">return</span> <span class="n">mcp_result</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;No such tool (</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+        <span class="k">except</span> <span class="n">sqlite3</span><span class="o">.</span><span class="n">Error</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[</span><span class="n">TextContent</span><span class="p">(</span><span class="nb">type</span><span class="o">=</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;mcp_call_tool/database</span><span class="se">\n</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">ex</span><span class="p">)</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)]</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[</span><span class="n">TextContent</span><span class="p">(</span><span class="nb">type</span><span class="o">=</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;mcp_call_tool/exception</span><span class="se">\n</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">ex</span><span class="p">)</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)]</span></div>
+
+
+<div class="viewcode-block" id="BaseCrawler.get_thumbnails">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.base.html#mcp_server_webcrawl.crawlers.base.crawler.BaseCrawler.get_thumbnails">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_thumbnails</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ResourceResult</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">ImageContent</span><span class="p">]:</span>
+
+        <span class="n">thumbnails_result</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ImageContent</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">image_paths</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">([</span><span class="n">result</span><span class="o">.</span><span class="n">url</span> <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">results</span> <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">url</span> <span class="ow">and</span>
+                <span class="n">result</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">ResourceResultType</span><span class="o">.</span><span class="n">IMAGE</span><span class="p">]))</span>
+        <span class="n">valid_paths</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">image_paths</span><span class="p">:</span>
+            <span class="n">parsed</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;http&quot;</span><span class="p">,</span> <span class="s2">&quot;https&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">parsed</span><span class="o">.</span><span class="n">netloc</span><span class="p">:</span>
+                <span class="n">clean_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span><span class="si">}</span><span class="s2">://</span><span class="si">{</span><span class="n">parsed</span><span class="o">.</span><span class="n">netloc</span><span class="si">}{</span><span class="n">parsed</span><span class="o">.</span><span class="n">path</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="n">valid_paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">clean_path</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;\.(jpg|jpeg|png|gif|bmp|webp)$&quot;</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">re</span><span class="o">.</span><span class="n">IGNORECASE</span><span class="p">):</span>
+                <span class="n">clean_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;?&quot;</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="n">valid_paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">clean_path</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">valid_paths</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">thumbnail_manager</span> <span class="o">=</span> <span class="n">ThumbnailManager</span><span class="p">()</span>
+                <span class="n">thumbnail_data</span> <span class="o">=</span> <span class="n">thumbnail_manager</span><span class="o">.</span><span class="n">get_thumbnails</span><span class="p">(</span><span class="n">valid_paths</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">thumbnail_url</span><span class="p">,</span> <span class="n">thumbnail_base64</span> <span class="ow">in</span> <span class="n">thumbnail_data</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                    <span class="k">if</span> <span class="n">thumbnail_base64</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Thumbnail encountered error during request. </span><span class="si">{</span><span class="n">thumbnail_url</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                        <span class="k">continue</span>
+                    <span class="n">image_content</span> <span class="o">=</span> <span class="n">ImageContent</span><span class="p">(</span><span class="nb">type</span><span class="o">=</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="n">thumbnail_base64</span><span class="p">,</span> <span class="n">mimeType</span><span class="o">=</span><span class="s2">&quot;image/webp&quot;</span><span class="p">)</span>
+                    <span class="n">thumbnails_result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image_content</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Fetched </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">thumbnail_data</span><span class="p">)</span><span class="si">}</span><span class="s2"> thumbnails out of </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">valid_paths</span><span class="p">)</span><span class="si">}</span><span class="s2"> requested URLs&quot;</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error fetching thumbnails: </span><span class="si">{</span><span class="n">ex</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">thumbnails_result</span></div>
+
+
+    <span class="k">def</span> <span class="nf">_convert_to_resource_types</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">types</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">ResourceResultType</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Convert string type values to ResourceResultType enums.  Silently ignore invalid type strings.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            types: optional list of string type values</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            Optional list of ResourceResultType enums, or None if no valid types</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">types</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+
+        <span class="n">result</span> <span class="o">=</span> <span class="p">[</span><span class="n">rt</span> <span class="k">for</span> <span class="n">rt</span> <span class="ow">in</span> <span class="n">ResourceResultType</span> <span class="k">if</span> <span class="n">rt</span><span class="o">.</span><span class="n">value</span> <span class="ow">in</span> <span class="n">types</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">result</span> <span class="k">if</span> <span class="n">result</span> <span class="k">else</span> <span class="kc">None</span></div>
+
+
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, pragmar.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

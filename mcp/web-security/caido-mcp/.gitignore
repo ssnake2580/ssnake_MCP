@@ -1,0 +1,22 @@
+# Binaries (root-anchored so they never match cmd/caido-mcp-server/ or cmd/caido-cli/)
+/caido-mcp-server
+/caido-cli
+dist/
+*.exe
+
+# Test artifacts
+coverage.out
+*.coverprofile
+
+# IDE
+.idea/
+.vscode/
+
+# Token
+~/.caido-mcp/
+.claude/
+
+# Tool scratch output
+.codex/
+graphify-out/
+.aider*

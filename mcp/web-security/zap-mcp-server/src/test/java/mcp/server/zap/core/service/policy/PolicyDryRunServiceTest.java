@@ -1,0 +1,346 @@
+package mcp.server.zap.core.service.policy;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import mcp.server.zap.core.service.authz.ToolScopeRegistry;
+import mcp.server.zap.extension.api.policy.PolicyBundleAccessBoundary;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class PolicyDryRunServiceTest {
+
+    private PolicyDryRunService service;
+
+    @BeforeEach
+    void setUp() {
+        service = new PolicyDryRunService(new ObjectMapper(), new ToolScopeRegistry());
+    }
+
+    @Test
+    void dryRunMatchesAllowRuleForSandboxGuidedRequest() throws Exception {
+        String bundle = Files.readString(Path.of("examples/policy-bundles/ci-guided-guardrails.json"));
+
+        Map<String, Object> response = service.preview(
+                bundle,
+                "zap_attack_start",
+                "https://api.sandbox.example.com/orders",
+                "2026-06-02T01:00:00Z"
+        );
+
+        assertThat(response).containsEntry("contractVersion", PolicyDryRunService.DRY_RUN_CONTRACT_VERSION);
+        assertThat(validation(response)).containsEntry("valid", true);
+        assertThat(decision(response)).containsEntry("result", "allow");
+        assertThat(decision(response)).containsEntry("source", "rule");
+        assertThat(decision(response)).containsEntry("matchedRuleId", "allow-guided-ci-sandbox-hours");
+        assertThat(request(response)).containsEntry("normalizedHost", "api.sandbox.example.com");
+        assertThat(request(response)).containsEntry("bundleLocalDay", "tue");
+        assertThat(objectMap(response, "bundle"))
+                .containsEntry("name", "ci-guided-guardrails")
+                .containsEntry("owner", "security-platform");
+        assertThat(request(response)).containsEntry("tool", "zap_attack_start");
+        assertThat(decision(response))
+                .containsEntry("reason", "Sandbox CI is approved during staffed rollout hours.");
+        assertThat(mapList(response, "trace"))
+                .extracting(entry -> entry.get("ruleId"))
+                .contains("allow-guided-ci-sandbox-hours");
+    }
+
+    @Test
+    void dryRunFallsBackToDefaultDecisionWhenNoRuleMatches() throws Exception {
+        String bundle = Files.readString(Path.of("examples/policy-bundles/guided-readonly-triage.json"));
+
+        Map<String, Object> response = service.preview(
+                bundle,
+                "zap_findings_summary",
+                "https://prod.example.com",
+                "2026-04-06T09:00:00Z"
+        );
+
+        assertThat(validation(response)).containsEntry("valid", true);
+        assertThat(decision(response)).containsEntry("result", "deny");
+        assertThat(decision(response)).containsEntry("source", "default");
+        assertThat(mapList(response, "trace"))
+                .extracting(entry -> entry.get("ruleId"))
+                .contains("allow-readonly-review-surface", "deny-mutation-tools");
+
+        assertThat(objectMap(response, "bundle")).containsEntry("name", "guided-readonly-triage");
+        assertThat(request(response))
+                .containsEntry("tool", "zap_findings_summary")
+                .containsEntry("normalizedHost", "prod.example.com");
+        assertThat(decision(response))
+                .containsEntry("defaultDecision", "deny")
+                .containsEntry("matchedRuleId", null);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"zap_report_read", "zap_report_read_chunk"})
+    void readonlyReportRulesAllowWorkspaceReadsWithoutHostMatching(String toolName) throws Exception {
+        String bundle = Files.readString(Path.of("examples/policy-bundles/guided-readonly-triage.json"));
+        Map<String, Object> response = service.preview(bundle, toolName, null, "2026-04-06T09:00:00Z");
+        assertThat(validation(response)).containsEntry("valid", true);
+        assertThat(decision(response)).containsEntry("result", "allow")
+                .containsEntry("source", "rule").containsEntry("matchedRuleId", "allow-workspace-report-reads");
+    }
+
+    @Test
+    void dryRunSurfacesValidationErrorsForUnknownToolsAndInvalidRequestInputs() {
+        String invalidBundle = """
+                {
+                  "apiVersion": "mcp.zap.policy/v1",
+                  "kind": "PolicyBundle",
+                  "metadata": {
+                    "name": "broken-bundle",
+                    "description": "broken",
+                    "owner": "security"
+                  },
+                  "spec": {
+                    "defaultDecision": "deny",
+                    "evaluationOrder": "first-match",
+                    "timezone": "UTC",
+                    "rules": [
+                      {
+                        "id": "broken-rule",
+                        "description": "broken",
+                        "decision": "allow",
+                        "reason": "broken",
+                        "match": {
+                          "tools": ["zap:not:real"]
+                        }
+                      }
+                    ]
+                  }
+                }
+                """;
+
+        Map<String, Object> response = service.preview(
+                invalidBundle,
+                "zap_unknown_tool",
+                "://bad-target",
+                "not-a-timestamp"
+        );
+
+        assertThat(validation(response)).containsEntry("valid", false);
+        assertThat(stringList(validation(response), "errors"))
+                .anyMatch(error -> error.contains("toolName must be an exact known MCP tool or action"))
+                .anyMatch(error -> error.contains("target must be"))
+                .anyMatch(error -> error.contains("evaluatedAt must be"))
+                .anyMatch(error -> error.contains("unknown tool 'zap:not:real'"));
+        assertThat(decision(response)).containsEntry("result", "invalid");
+        assertThat(response).containsEntry("trace", List.of());
+
+        assertThat(decision(response))
+                .containsEntry("source", "validation")
+                .containsEntry("reason", "The request or policy bundle is invalid.");
+    }
+
+    @Test
+    void dryRunRejectsRuleWithoutDescription() throws Exception {
+        ObjectMapper objectMapper = new ObjectMapper();
+        JsonNode bundle = objectMapper.readTree(
+                Files.readString(Path.of("examples/policy-bundles/ci-guided-guardrails.json"))
+        );
+        ((ObjectNode) bundle.at("/spec/rules/0")).remove("description");
+
+        Map<String, Object> response = service.preview(
+                objectMapper.writeValueAsString(bundle),
+                "zap_attack_start",
+                "https://api.sandbox.example.com/orders",
+                "2026-06-02T01:00:00Z"
+        );
+
+        assertThat(validation(response)).containsEntry("valid", false);
+        assertThat(stringList(validation(response), "errors"))
+                .contains("bundle.spec.rules[0].description must be a non-empty string");
+        assertThat(decision(response)).containsEntry("result", "invalid");
+        assertThat(response).containsEntry("trace", List.of());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "!"})
+    void dryRunValidatesLongHostPatternsWithoutStackOverflow(String suffix) throws Exception {
+        String host = "a.".repeat(10_000) + "a" + suffix;
+        ObjectMapper objectMapper = new ObjectMapper();
+        JsonNode bundle = objectMapper.readTree(
+                Files.readString(Path.of("examples/policy-bundles/ci-guided-guardrails.json"))
+        );
+        ((ObjectNode) bundle.at("/spec/rules/0/match")).putArray("hosts").add(host);
+
+        Map<String, Object> response = service.preview(
+                objectMapper.writeValueAsString(bundle),
+                "zap_attack_start",
+                host,
+                "2026-06-02T01:00:00Z"
+        );
+
+        assertThat(validation(response)).containsEntry("valid", suffix.isEmpty());
+        if (suffix.isEmpty()) {
+            assertThat(decision(response)).containsEntry("matchedRuleId", "deny-production-attack-tools");
+        } else {
+            assertThat(decision(response)).containsEntry("result", "invalid");
+            assertThat(stringList(validation(response), "errors"))
+                    .anyMatch(error -> error.contains("target must be"))
+                    .anyMatch(error -> error.contains("invalid host pattern"));
+        }
+    }
+
+    @Test
+    void dryRunReturnsValidationErrorForEqualTimeWindowBounds() {
+        String invalidBundle = """
+                {
+                  "apiVersion": "mcp.zap.policy/v1",
+                  "kind": "PolicyBundle",
+                  "metadata": {
+                    "name": "equal-time-window",
+                    "description": "invalid equal bounds",
+                    "owner": "security"
+                  },
+                  "spec": {
+                    "defaultDecision": "deny",
+                    "evaluationOrder": "first-match",
+                    "timezone": "UTC",
+                    "rules": [
+                      {
+                        "id": "invalid-window-rule",
+                        "description": "invalid window",
+                        "decision": "allow",
+                        "reason": "invalid",
+                        "match": {
+                          "tools": ["zap_attack_start"],
+                          "hosts": ["api.sandbox.example.com"],
+                          "timeWindows": [
+                            {
+                              "days": ["mon", "tue"],
+                              "start": "09:00",
+                              "end": "09:00"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+                """;
+
+        Map<String, Object> response = service.preview(
+                invalidBundle,
+                "zap_attack_start",
+                "https://api.sandbox.example.com/orders",
+                "2026-06-02T01:00:00Z"
+        );
+
+        assertThat(validation(response)).containsEntry("valid", false);
+        assertThat(stringList(validation(response), "errors"))
+                .anyMatch(error -> error.contains("start and end cannot be identical"));
+        assertThat(decision(response)).containsEntry("result", "invalid");
+        assertThat(response).containsEntry("trace", List.of());
+    }
+
+    @Test
+    void dryRunRejectsBundlesOutsideCurrentTenantScope() {
+        service.setPolicyBundleAccessBoundary(new PolicyBundleAccessBoundary() {
+            @Override
+            public List<String> validateCurrentRequesterAccess(Map<String, String> bundleLabels) {
+                return List.of("bundle.metadata.labels.tenant must match the current tenant scope");
+            }
+
+            @Override
+            public void enrichBundleSummary(Map<String, Object> bundleSummary, Map<String, String> bundleLabels) {
+                bundleSummary.put("tenant", bundleLabels.get("tenant"));
+            }
+
+            @Override
+            public void enrichRequestSummary(Map<String, Object> requestSummary) {
+                requestSummary.put("tenant", "tenant-beta");
+                requestSummary.put("workspace", "workspace-three");
+            }
+        });
+
+        String bundle = """
+                {
+                  "apiVersion": "mcp.zap.policy/v1",
+                  "kind": "PolicyBundle",
+                  "metadata": {
+                    "name": "tenant-scoped-bundle",
+                    "description": "tenant scoped",
+                    "owner": "security",
+                    "labels": {
+                      "tenant": "tenant-alpha"
+                    }
+                  },
+                  "spec": {
+                    "defaultDecision": "deny",
+                    "evaluationOrder": "first-match",
+                    "timezone": "UTC",
+                    "rules": [
+                      {
+                        "id": "allow-sandbox",
+                        "description": "allow sandbox",
+                        "decision": "allow",
+                        "reason": "safe sandbox",
+                        "match": {
+                          "tools": ["zap_report_read"],
+                          "hosts": ["prod.example.com"]
+                        }
+                      }
+                    ]
+                  }
+                }
+                """;
+
+        Map<String, Object> response = service.preview(
+                bundle,
+                "zap_report_read",
+                "https://prod.example.com",
+                "2026-04-06T09:00:00Z"
+        );
+
+        assertThat(validation(response)).containsEntry("valid", false);
+        assertThat(decision(response)).containsEntry("result", "invalid");
+        assertThat(stringList(validation(response), "errors"))
+                .contains("bundle.metadata.labels.tenant must match the current tenant scope");
+        assertThat(request(response))
+                .containsEntry("tenant", "tenant-beta")
+                .containsEntry("workspace", "workspace-three");
+        assertThat(objectMap(response, "bundle"))
+                .containsEntry("tenant", "tenant-alpha");
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> validation(Map<String, Object> response) {
+        return (Map<String, Object>) response.get("validation");
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> decision(Map<String, Object> response) {
+        return (Map<String, Object>) response.get("decision");
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> request(Map<String, Object> response) {
+        return (Map<String, Object>) response.get("request");
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> stringList(Map<String, Object> values, String key) {
+        return (List<String>) values.get(key);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> mapList(Map<String, Object> values, String key) {
+        return (List<Map<String, Object>>) values.get(key);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> objectMap(Map<String, Object> values, String key) {
+        return (Map<String, Object>) values.get(key);
+    }
+}

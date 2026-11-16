@@ -1,0 +1,35 @@
+# Starts the Playwright bot with the task below. The bot does it with the skills of this repo, and
+# opens the pull request as the app. Start it from the Actions tab.
+name: "Agent: roll Playwright"
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  start:
+    name: Hand the task to the bot
+    if: github.repository == 'microsoft/playwright-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      id: app-token
+      with:
+        client-id: ${{ vars.PLAYWRIGHT_APP_CLIENT_ID }}
+        private-key: ${{ secrets.PLAYWRIGHT_PRIVATE_KEY }}
+        owner: microsoft
+        repositories: devops.playwright.dev
+        permission-actions: write
+    - name: Start the bot
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        TASK: >-
+          Roll Playwright to the latest alpha, playwright@next, as "Rolling Playwright" in
+          AGENTS.md says. When a test fails, find the upstream change that broke it. For an
+          intended change, update the test. For a regression, leave the test as it is, and
+          describe the regression and its upstream commit in the PR.
+      run: >-
+        gh workflow run task.yml --repo microsoft/devops.playwright.dev --ref main
+        -f repo="$GITHUB_REPOSITORY" -f task="$TASK"

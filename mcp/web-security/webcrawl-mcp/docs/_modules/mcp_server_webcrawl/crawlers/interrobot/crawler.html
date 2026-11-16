@@ -1,0 +1,196 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../../../">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mcp_server_webcrawl.crawlers.interrobot.crawler &mdash; mcp-server-webcrawl  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            mcp-server-webcrawl
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../guides.html">Setup Guides</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../prompts.html">Prompt Routines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../interactive.html">Interactive Mode</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../modules.html">mcp_server_webcrawl</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">mcp-server-webcrawl</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">Module code</a></li>
+          <li class="breadcrumb-item"><a href="../../crawlers.html">mcp_server_webcrawl.crawlers</a></li>
+      <li class="breadcrumb-item active">mcp_server_webcrawl.crawlers.interrobot.crawler</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for mcp_server_webcrawl.crawlers.interrobot.crawler</h1><div class="highlight"><pre>
+<span></span>
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+
+<span class="kn">from</span> <span class="nn">mcp.types</span> <span class="kn">import</span> <span class="n">Tool</span>
+
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.sites</span> <span class="kn">import</span> <span class="n">SiteResult</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.resources</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">RESOURCES_FIELDS_DEFAULT</span><span class="p">,</span>
+    <span class="n">RESOURCES_FIELDS_BASE</span><span class="p">,</span>
+    <span class="n">RESOURCES_DEFAULT_SORT_MAPPING</span><span class="p">,</span>
+    <span class="n">RESOURCES_FIELDS_OPTIONS</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.crawlers.base.crawler</span> <span class="kn">import</span> <span class="n">BaseCrawler</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.crawlers.interrobot.adapter</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">get_sites</span><span class="p">,</span>
+    <span class="n">get_resources</span><span class="p">,</span>
+    <span class="n">INTERROBOT_RESOURCE_FIELD_MAPPING</span><span class="p">,</span>
+    <span class="n">INTERROBOT_SITE_FIELD_MAPPING</span><span class="p">,</span>
+    <span class="n">INTERROBOT_SITE_FIELD_REQUIRED</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.utils.tools</span> <span class="kn">import</span> <span class="n">get_crawler_tools</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.utils.logger</span> <span class="kn">import</span> <span class="n">get_logger</span>
+
+<span class="n">logger</span> <span class="o">=</span> <span class="n">get_logger</span><span class="p">()</span>
+
+
+<div class="viewcode-block" id="InterroBotCrawler">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.crawler.InterroBotCrawler">[docs]</a>
+<span class="k">class</span> <span class="nc">InterroBotCrawler</span><span class="p">(</span><span class="n">BaseCrawler</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    A crawler implementation for InterroBot data sources.</span>
+<span class="sd">    Provides functionality for accessing and searching web content from InterroBot.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+<div class="viewcode-block" id="InterroBotCrawler.__init__">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.crawler.InterroBotCrawler.__init__">[docs]</a>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">datasrc</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Initialize the InterroBotCrawler with a data source path and required adapter functions.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            datasrc: Path to the data source</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">datasrc</span><span class="p">,</span> <span class="n">get_sites</span><span class="p">,</span> <span class="n">get_resources</span><span class="p">,</span> <span class="n">resource_field_mapping</span><span class="o">=</span><span class="n">INTERROBOT_RESOURCE_FIELD_MAPPING</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">datasrc</span><span class="o">.</span><span class="n">is_file</span><span class="p">()</span> <span class="ow">and</span> <span class="n">datasrc</span><span class="o">.</span><span class="n">suffix</span> <span class="o">==</span> <span class="s2">&quot;.db&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> datasrc must be a db file&quot;</span></div>
+
+
+<div class="viewcode-block" id="InterroBotCrawler.mcp_list_tools">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.crawler.InterroBotCrawler.mcp_list_tools">[docs]</a>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">mcp_list_tools</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Tool</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        List available tools for this crawler.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            List of Tool objects</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="c1"># get the default crawler tools, then override necessary fields</span>
+        <span class="n">all_sites</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SiteResult</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_get_sites</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_datasrc</span><span class="p">)</span>
+        <span class="n">all_sites_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">id</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">all_sites</span> <span class="k">if</span> <span class="n">s</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">id</span><span class="p">,</span> <span class="nb">int</span><span class="p">)]</span>
+        <span class="n">default_tools</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Tool</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_crawler_tools</span><span class="p">(</span><span class="n">sites</span><span class="o">=</span><span class="n">all_sites</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">default_tools</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">&quot;expected exactly 2 Tools: sites and resources&quot;</span>
+
+        <span class="c1"># can replace get_crawler_tools or extend, here it is overwritten from default</span>
+        <span class="c1"># you&#39;d think maybe pass changes in, but no, it&#39;s better ad hoc</span>
+        <span class="n">default_sites_tool</span><span class="p">:</span> <span class="n">Tool</span>
+        <span class="n">default_resources_tool</span><span class="p">:</span> <span class="n">Tool</span>
+        <span class="n">default_sites_tool</span><span class="p">,</span> <span class="n">default_resources_tool</span> <span class="o">=</span> <span class="n">default_tools</span>
+        <span class="n">sites_field_options</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">INTERROBOT_SITE_FIELD_MAPPING</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">INTERROBOT_SITE_FIELD_REQUIRED</span><span class="p">))</span>
+        <span class="n">dst_props</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">default_sites_tool</span><span class="o">.</span><span class="n">inputSchema</span><span class="p">[</span><span class="s2">&quot;properties&quot;</span><span class="p">]</span>
+        <span class="n">dst_props</span><span class="p">[</span><span class="s2">&quot;fields&quot;</span><span class="p">][</span><span class="s2">&quot;items&quot;</span><span class="p">][</span><span class="s2">&quot;enum&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">sites_field_options</span>
+
+        <span class="n">resources_sort_options</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">RESOURCES_DEFAULT_SORT_MAPPING</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+        <span class="n">all_sites_display</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">([</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">s</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> (site: </span><span class="si">{</span><span class="n">s</span><span class="o">.</span><span class="n">id</span><span class="si">}</span><span class="s2">)&quot;</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">all_sites</span><span class="p">])</span>
+
+        <span class="n">drt_props</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">default_resources_tool</span><span class="o">.</span><span class="n">inputSchema</span><span class="p">[</span><span class="s2">&quot;properties&quot;</span><span class="p">]</span>
+        <span class="n">drt_props</span><span class="p">[</span><span class="s2">&quot;fields&quot;</span><span class="p">][</span><span class="s2">&quot;items&quot;</span><span class="p">][</span><span class="s2">&quot;enum&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">RESOURCES_FIELDS_OPTIONS</span>
+        <span class="n">drt_props</span><span class="p">[</span><span class="s2">&quot;sort&quot;</span><span class="p">][</span><span class="s2">&quot;enum&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">resources_sort_options</span>
+        <span class="n">drt_props</span><span class="p">[</span><span class="s2">&quot;sites&quot;</span><span class="p">][</span><span class="s2">&quot;items&quot;</span><span class="p">][</span><span class="s2">&quot;enum&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">all_sites_ids</span>
+        <span class="n">drt_props</span><span class="p">[</span><span class="s2">&quot;sites&quot;</span><span class="p">][</span><span class="s2">&quot;description&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="s2">&quot;Optional &quot;</span>
+                <span class="s2">&quot;list of project ID to filter search results to a specific site. In 95% &quot;</span>
+                <span class="s2">&quot;of scenarios, you&#39;d filter to only one site, but many site filtering is offered &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;for advanced search scenarios. Available sites include </span><span class="si">{</span><span class="n">all_sites_display</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="p">[</span><span class="n">default_sites_tool</span><span class="p">,</span> <span class="n">default_resources_tool</span><span class="p">]</span></div>
+</div>
+
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, pragmar.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

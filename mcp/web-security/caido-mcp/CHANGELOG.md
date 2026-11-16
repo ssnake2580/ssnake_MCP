@@ -1,0 +1,270 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [Unreleased]
+
+## [4.4.0] - 2026-10-29
+
+Caido 0.58/0.59 support: native race testing through Replay Pipelines, TLS pass-through control, cURL input, and fixes found by testing against a live 0.59.0 server. Works with Caido 0.57+; `caido_race_pipeline` and `caido_passthrough_options` need 0.59.
+
+### Added
+- **Match & Replace: all four operation modes** on `caido_create_tamper_rule` / `caido_update_tamper_rule` via `operation.kind`: `updateRaw`, `updateValue`, `add`, `remove` (headers and query params by `name`). `updateRaw` gains `match_kind` (`regex`, `value` literal, `full` section) and a `workflow_id` replacer; `caido_list_tamper_rules` now reports each rule's `section`. Omitting `operation` keeps the old match/replace behaviour (#53).
+- **`caido_test_tamper_rule`** - dry-run a Match & Replace rule against a raw request and get the transformed request plus a `changed` flag. Persists nothing and sends no traffic (#53).
+- **`caido_race_pipeline`** - race-condition testing through Caido Replay Pipelines (Caido 0.59+): last-byte synchronization (default), single-packet attack (needs Caido's v2 network stack) or sequential, with the run filed as a Replay session and every request in history. Returns a status-code tally (`statusCounts`) and per-request results. `caido_race_window_send` stays for older Caido and raw-socket control.
+- **`caido_passthrough_options`** - read or update Caido 0.59 TLS pass-through: hosts on `passthroughList` are tunneled without interception or recording, and `outOfScope: true` does the same for everything outside the current scope. Omitted fields are left unchanged.
+- **`caido_send_request` accepts `curl`** - paste a cURL command (bash form, as from a browser's "Copy as cURL") instead of `raw`; host, port and TLS come from its URL. Unsupported options (multipart `-F`, `@file` bodies, unknown flags) are rejected instead of silently dropped.
+- **HTTPQL `header`/`body` fields** documented in `caido_list_requests` (Caido 0.58+), so agents match headers and bodies directly instead of scanning `raw`.
+- **`caido_send_request` can file a request as a titled session in a collection.** New `collectionId` and `name` params create a fresh replay session seeded with the request, place it in the collection, title it, and send it in one call. Cannot be combined with `sessionId`.
+- **`caido_rename_replay_session`** - retitle a replay session, e.g. one already filed under its numeric ID.
+
+### Changed
+- **Credentials are stored per Caido instance** (`~/.caido-mcp/tokens/<host>_<port>-<hash>.json`) instead of one global `token.json`, so switching between instances no longer forces a fresh login. Equivalent URL spellings map to the same file, and an existing `token.json` is migrated to the first instance used (#60, closes #57).
+- **Test mocks validate against the Caido 0.59.0 server schema** instead of the older copy bundled with sdk-go, and `TestSDKOperationsMatchSchema` fails if a Caido release breaks an sdk-go operation. The schema is introspected from a live 0.59.0 server by `scripts/caido-schema-sdl.py`: the file `caido/schemas` publishes for 0.59.0 does not match the released server (`HttpOnePipeline` vs `HttpPipeline`, `allowlist`/`denylist` vs `captureList`/`passthroughList`).
+
+### Fixed
+- **Tamper rules on `requestMethod`, `responseStatusCode` and `requestSNI` always failed.** The tools sent a `matcher` field those inputs do not declare, so Caido rejected every call; `remove` now rejects a replacement value locally with a clear message (#53).
+- **`caido_rename_replay_session` and `caido_move_replay_session` failed on Pipeline sessions.** Same sdk-go decoder limit as the list tools; both now use tolerant mutations. Found on a live 0.59.0 server, where renaming a new pipeline session failed even though Caido had applied it.
+- **`caido_create_project` reported `create project returned nil` when Caido refused.** It now says why, e.g. `PermissionDeniedUserError (ENTITLEMENT): the Caido plan's project limit is reached`.
+- **`caido_create_replay_session` left an unnamed session behind when the rename failed.** It is now deleted before the error is returned.
+- **Request bodies were altered before sending.** `NormalizeCRLF` rewrote the whole message: it appended `\r\n\r\n` after any body that did not already end that way (so `qty=2` went out as `qty=2\r\n\r\n`, 4 bytes past `Content-Length`) and turned every bare LF inside the body into CRLF (JSON, multipart, binary). Only the request line and headers are normalized now; the body is sent byte for byte. Affects `caido_send_request`, `caido_edit_request`, `caido_batch_send`, `caido_race_window_send` and the CLI.
+- **`caido_list_replay_sessions` and `caido_list_replay_collections` failed outright once a project held a Caido Pipeline session (0.58+).** The sdk-go decoders reject session kinds they were not generated for. Both tools now use tolerant queries that page through every result, and sessions report a `kind` (`http`, `ws`, `pipeline`) plus their collection. Reading a pipeline session or entry through the other tools now says what it is instead of surfacing the raw decoder error.
+- **Requests sent to a session from `caido_create_replay_session` ended up in an unnamed session in the default collection.** Caido 0.57 creates such sessions with no entry, so the send fell back to a brand-new session that dropped the name and collection and left the named session empty. The replacement session now inherits the original's collection and name, and the empty original is deleted. The same applies to `caido_edit_request`.
+- **Sending to a missing session silently created an unnamed session in the default collection.** A stale `sessionId` (deleted, or replaced by an earlier send to an empty session) now returns an error instead. The cached default session still falls back as before.
+- **A failed rename left a stray replay session.** When the replacement session was created but could not be renamed, it was never deleted. It is now removed before the error is returned.
+- **A failed task start on the fallback session deleted the original first.** The task now starts on the replacement before the original is deleted, and the error names the replacement session ID.
+- **A busy default replay session was deleted on fallback, breaking concurrent calls.** Only an empty default is deleted now, and the cached default is replaced with a compare-and-swap so a concurrent call that already replaced it is not overwritten.
+- **Cookie jar and response diff were lost when a request moved to a replacement session.** `caido_send_request` and `caido_edit_request` now carry the session's cookie jar and diff baseline to the new session, and drop the old ones only when the old session was deleted.
+- **`caido_send_request` with `collectionId`/`name` gave no reason for injecting no cookies.** `cookieJar.skipped` now reads `new session (empty jar)` (an explicit `Cookie` header still takes precedence).
+- **`caido_edit_request` hid response headers on a body-identical response.** Headers are kept, as in `caido_send_request`; only the repeated body is cleared.
+- **`caido_race_window_send` ignored cancellation and dialed serially.** The TLS dial now honours the context, connections dial in parallel, and cancelling the context closes live connections so reads return promptly.
+- **Manually dispatched Release built the branch head, not the requested tag.** The `workflow_dispatch` run now checks out the `tag` input, so assets match the tag they are published under.
+
+## [4.3.0] - 2026-07-31
+
+### Added
+- **MCP 2026-07-28 protocol conformance test.** `TestProtocolVersionNegotiation` asserts the server negotiates protocol version `2026-07-28` (the go-sdk v1.7.0 default; the server pins no version), guarding against a future SDK downgrade or an accidental version pin. No behavior change.
+- **Human-friendly `title` on all 66 MCP tools.** The `2026-07-28` spec first-classes a display `title` distinct from the machine `name`; clients that render titles now show readable labels (e.g. `Send HTTP Request`, `List WebSocket Streams`). A `schema_test` guard enforces a non-empty title on every tool. Additive, no behavior change.
+
+### Changed
+- **Static-token env var renamed to `CAIDO_ACCESS_TOKEN`.** This variable holds the local Caido app's GraphQL **access token** (from your login session), not a Caido Cloud Personal Access Token — the old `CAIDO_PAT` name was misleading. README now documents how to grab the access token from the Caido GUI.
+- **Trimmed `caido_send_request` / `caido_batch_send` tool descriptions** (~375 chars/call off every API call). The verbose response-fingerprint field reference now lives in the README "Response fingerprinting" section, pointed to from both descriptions. No behavior change.
+- **Declared input size/count limits in tool JSON Schemas** for 11 tools that already enforced them in handler code (e.g. `create_finding` title ≤500, `create_scope` allowlist ≤100, `batch_send`/`race_window_send` ≤50 requests, `send_request` raw ≤1MB). Clients now see the limit up front and oversized calls fail at the schema boundary with the same outcome as before — **no newly-rejected input** (bounds mirror the existing checks exactly; a new `schemaFor` helper sets them via explicit `InputSchema` since Go struct tags can't express constraints). Params that are clamped rather than rejected (e.g. `list_requests.limit`) and `edit_request` (no raw-size check) were intentionally left unconstrained.
+- **Declared `enum` on closed-set parameters** whose handlers already reject unknown values case-sensitively: `automate_task_control.action`, `intercept_control.action`, `run_workflow.type`, and `create_tamper_rule`/`update_tamper_rule.section`. Clients get the valid values up front and typo'd values fail at the schema boundary with the same outcome as before — **no newly-rejected input**. Params handled case-insensitively (`create_replay_session.kind`), passed through unvalidated to the backend (tamper `sources`), or accepted verbatim (`edit_request.method`) were intentionally left unconstrained.
+
+### Deprecated
+- **`CAIDO_PAT` is deprecated** in favor of `CAIDO_ACCESS_TOKEN`. It still works as a fallback, but the MCP server now prints a deprecation warning to stderr when it is used. It will be removed in a future release. (Supersedes the `CAIDO_PAT` guidance in [1.4.0].)
+
+## [4.2.1] - 2026-07-08
+
+### Changed
+- Bump `modelcontextprotocol/go-sdk` v1.4.1 -> v1.6.1. Tool and input-validation errors now surface as spec-compliant MCP `isError` results instead of transport (Go) errors; server-side required-field enforcement is unchanged (still validated against the tool's input schema). No API changes to this server's tools.
+
+## [4.2.0] - 2026-07-08
+
+### Security
+- **Bumped `modelcontextprotocol/go-sdk` v1.2.0 -> v1.4.1**, fixing 4 govulncheck-reported advisories (GO-2026-5771, GO-2026-4773, GO-2026-4770, GO-2026-4569). Requires Go 1.25+.
+- **Raw-HTTP credential redaction is now enforced everywhere output leaves the server.** The `caido://requests/{id}` resource and `caido_get_automate_session` previously emitted base64-decoded raw requests/responses (and fuzz templates) with `Authorization`, `Cookie`, and `Set-Cookie` in cleartext, bypassing the redaction that only lived inside `ParseRaw`. A new `httputil.RedactRawHeaders` choke-point redacts sensitive header values in any raw dump (still honoring the `CAIDO_ALLOW_SENSITIVE_HEADERS` opt-out).
+
+### Fixed
+- **Response diff no longer hides real changes.** Two responses that shared the first `bodyLimit` bytes but differed in total size were reported "identical to previous response" (the hash is computed over the truncated body); the diff now also compares full body size.
+- **Replay `send_request` no longer orphans an empty session.** The first send of each process auto-created a default replay session that was replaced but never deleted; the fallback now best-effort deletes it (and pool cleanup logs, rather than discards, delete errors).
+- **OAuth login is context-cancellable.** The WebSocket token read could hang past a cancelled/expired context; a watcher now closes the connection on cancellation.
+- **`caido_race_window_send` no longer stalls on keep-alive targets.** The response read was `io.ReadFull` on a fixed buffer with a 10s deadline, blocking ~10s per request against keep-alive servers; it is now EOF/idle-aware.
+
+### Added
+- **MCP tool annotations** on all tools (`readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`), so clients can distinguish read-only, destructive, and external-network tools (roadmap Chunk 5).
+- **`caido_is_in_scope`** - check whether a host/URL is in the project scope, returning the matching rule (roadmap Chunk 8).
+- **`caido_diff_responses`** - structural diff (status/size/body) of two Caido-native request IDs (roadmap Chunk 4).
+- **`caido://scopes`** and **`caido://project`** read-only resources (roadmap Chunks 8 and 3). Tool/resource totals: 64 -> 66 tools, 4 -> 6 resources.
+- **Richer response fingerprint** - `send_request`/`batch_send` now surface status, title, redirect target, Set-Cookie names, and word count; `includeBody` (default true single / false batch) and a `marker` reflected-in-response check (roadmap Chunk 4).
+- Opt out of sensitive-header redaction via the `CAIDO_ALLOW_SENSITIVE_HEADERS` env var (#29).
+
+### Changed
+- `caido_create_replay_session` exposes the required `kind` field (#28).
+- Internal DRY refactors (shared `clampLimit`/`pageCursor`/`DefaultPort` helpers, one `maxRawRequestBytes` constant) and new test coverage for `edit_request`, the replay-session `kind` GraphQL contract, the CLI token/request builders, and the `auth` package.
+
+## [4.1.0] - 2026-06-16
+
+### Fixed
+- **Caido 0.57.0 compatibility** - 0.57.0 reshaped the replay and filter GraphQL contracts, breaking `caido_send_request`, `caido_edit_request`, batch send, and `caido_create_filter`. Adapted to the new API:
+  - **Replay is now a draft-then-start flow.** `startReplayTask` dropped its `input` arg. Sending updates the active entry's draft on an existing session, or seeds a fresh session via `requestSource.raw` and then starts the task. A 0.57 session created with no request source has no entry, so an empty cached session transparently falls back to a seeded one.
+  - **`ReplaySession` / `ReplayEntry` are now GraphQL interfaces** (HTTP/WS variants). The SDK unwraps them into stable domain structs, so tool/resource code reads plain fields.
+  - **`@oneOf` inputs are strictly enforced** ("exactly one field"). This also broke `caido_create_filter` since `QueryInput` is `@oneOf`; fixed via hand-written `MarshalJSON` on the `@oneOf` inputs in sdk-go.
+  - `streams` swapped its `protocol` arg for a StreamQL `filter`, so `caido_list_ws_streams` now filters to WS client-side.
+
+### Changed (SDK alignment)
+- Bumped `caido-community/sdk-go` to the 0.57-aware build (`f03a805`): regenerated against the 0.57 schema, replay SDK unwraps the interface types into stable domain structs, added the draft/start methods, and the `@oneOf` marshaling fix.
+
+### Tests
+- Test fixtures updated to the 0.57 interface shape (`__typename` on session/entry, seeded-create, update-draft). Added a live MCP-level send test (gated on `CAIDO_IT_URL`) verified end-to-end against a `caido/caido:0.57.0` instance.
+
+## [4.0.0] - 2026-06-02
+
+### Added
+- **WebSocket history (read)** - exposes the WebSocket tab (the Go SDK did not wrap stream queries; see SDK alignment below):
+  - `caido_list_ws_streams` - list WebSocket streams (connections), filterable by scope
+  - `caido_list_ws_messages` - list frames of a stream with direction (CLIENT/SERVER), format (TEXT/BINARY), and decoded body (base64 `Blob` decoded, truncated to `body_limit`)
+- **`caido_convert_body`** - convert a request body between JSON, form-urlencoded, XML, and multipart/form-data. Pure stdlib; flat objects are lossless, nested JSON uses bracket notation (`a[b]=c`).
+- **`caido_race_window_send`** - fire multiple raw HTTP/1.1 requests with a synchronized last-byte send (single-packet / race-window style) for race-condition testing. Dials targets directly with raw sockets and parks all connections at a barrier before writing final bytes. NOTE: bypasses the Caido proxy, so these requests do not appear in Caido history.
+
+### Changed
+- Tool count 62 -> 64.
+
+### CI
+- **Release workflow** (`.github/workflows/release.yml`) - on a `v*` tag push, cross-compiles both binaries for 6 platforms via `scripts/build.sh`, generates `sha256sums.txt`, and publishes a GitHub Release with assets named to match `install.sh`.
+
+### Tests
+- Test coverage for the `internal/tools` package raised from ~23% to ~70%: new table-driven suites for Findings, Intercept, Workflows, Tamper, Projects/Scopes, Environments/Filters, Replay collections, Automate/Tasks, misc reads, and WebSocket tools. New `internal/httputil/bodyconvert` (92.9%) and `internal/raceattack` (88.0%) suites.
+
+### Internal
+- Documented the genqlient v0.8.1 oneof/omitempty limitation in `create_tamper_rule.go` as an upstream constraint (the `delete_findings`/`export_findings` tools use clean typed structs and need no workaround).
+
+### Changed (SDK alignment)
+- Added WebSocket/stream read queries to `caido-community/sdk-go` (new `StreamSDK`: `List`, `Get`, `ListWsMessages`) and bumped this server to that SDK build. `caido_list_ws_streams` and `caido_list_ws_messages` now use the typed SDK wrappers instead of hand-rolled raw GraphQL.
+
+## [3.0.0] - 2026-05-21
+
+### Added
+- **`caido_edit_request` MCP tool** - modify an existing request (method, path, headers, body) while preserving all auth cookies and session state, then send it. The most-requested feature for AI-driven pentesting.
+- **`caido_export_curl` MCP tool** - convert any request to a ready-to-use curl command for PoC reports.
+- **Replay Collections** - full CRUD:
+  - `caido_list_replay_collections` - list all collections
+  - `caido_create_replay_collection` - create a named collection
+  - `caido_rename_replay_collection` - rename a collection
+  - `caido_delete_replay_collection` - delete a collection
+- **`caido_delete_replay_sessions`** - bulk delete replay sessions by ID
+- **`caido_move_replay_session`** - move a session between collections
+- **Scope management** - full lifecycle:
+  - `caido_rename_scope` - rename a scope
+  - `caido_delete_scope` - delete a scope
+- **Project management** - full CRUD:
+  - `caido_create_project` - create a new project
+  - `caido_rename_project` - rename a project
+  - `caido_delete_project` - delete a project
+- **Environment management**:
+  - `caido_create_environment` - create a new environment
+  - `caido_delete_environment` - delete an environment
+- **Filter presets**:
+  - `caido_create_filter` - save an HTTPQL query as a named preset
+  - `caido_delete_filter` - delete a filter preset
+- **Install script auto-version** - `install.sh` now auto-detects the latest release via GitHub API (fixes #19, #20)
+
+### Changed
+- Tool count: 42 -> 60 (18 new tools)
+- Full CRUD coverage across all Caido resources (scopes, projects, environments, filters, replay collections)
+- Every Caido SDK operation is now exposed as an MCP tool
+
+## [2.0.0] - 2026-05-05
+
+### Added
+- **`caido_create_replay_session` MCP tool** - create named replay sessions with optional request seeding and collection assignment. Two-step flow: CreateSession then RenameSession.
+- **MCP Resources** - expose Caido data as read-only resources for zero-tool-call context:
+  - `caido://requests/{id}` - full request/response content
+  - `caido://replay-sessions/{id}` - session details with entry list
+  - `caido://sitemap` - root domains from sitemap
+  - `caido://findings` - security finding summaries
+- **Response fingerprinting** - responses include content kind (json/html/xml/text/binary) and content-type detection
+- **Adaptive body limits** - auto-scale response body limits by content type (4KB JSON, 3KB HTML, 200B binary) when no explicit limit set
+- **Response diff mode** - repeated identical responses in the same session return a compact diff summary instead of full body, saving agent tokens
+- **`caido_list_hosted_files` MCP tool** - list hosted files for payload serving
+- **`caido_list_tasks` MCP tool** - list running background tasks
+- **`caido_cancel_task` MCP tool** - cancel a running task by ID
+- **`caido_list_plugins` MCP tool** - list installed plugin packages
+- **`caido_update_tamper_rule` MCP tool** - update an existing Match & Replace rule without deleting and recreating it
+- **Windows binaries** - build pipeline now produces windows/amd64 and windows/arm64 .exe binaries
+- **Test infrastructure** - 115 tests with race detection, mock GraphQL server, MCP in-memory transport testing, schema contract tests, GitHub Actions CI
+
+### Changed
+- Upgraded to sdk-go v0.5.0 (Caido 0.56 Query union types, HTTPQL/StreamQL split)
+- Tool count: 37 -> 42 (5 new tools)
+- Build targets: 8 -> 12 binaries (added Windows amd64/arm64)
+
+## [1.5.0] - 2026-04-09
+
+### Added
+- **`caido_batch_send` MCP tool** - send multiple HTTP requests in parallel via session pool. Supports BAC token sweeps, parameter fuzzing, endpoint sweeps. Max 50 requests per batch, configurable concurrency (default 5, max 20). One tool call replaces N sequential `caido_send_request` calls.
+- **`caido batch` CLI subcommand** - parallel HTTP through Caido Replay API. Four modes: `sweep` (same endpoint, N tokens), `fuzz` (same endpoint, N values), `ep` (N URLs, same auth), `file` (JSON batch spec). Drop-in replacement for `burp-batch` with identical interface.
+- **Session pool** (`internal/replay/pool.go`) - manages N replay sessions for concurrent sends. Pre-creates sessions in parallel, acquire/release pattern with channel-based semaphore.
+- **Batch engine** (`internal/replay/batch.go`) - shared by MCP tool and CLI. Handles session acquisition, CRLF normalization, host resolution, parallel polling.
+- Auth mode support in CLI batch: `bearer` (default), `cookie:NAME`, `header:NAME` - matches `burp-batch` interface.
+
+### Changed
+- Upgraded sdk-go to v0.4.0 (`use_struct_references: false`) -- fixes 53 NON_NULL fields across generated types, removes manual GraphQL workarounds for `delete_findings`, `export_findings`, and `create_tamper_rule`.
+
+### Fixed
+- `caido_create_tamper_rule` -- nested oneof serialization for section, operation, matcher, and replacer fields now correct at all 4 levels of nesting.
+- `caido_create_tamper_rule` -- `sources` field sent as `[]` (empty array) instead of omitted -- Caido API requires non-null.
+- `caido_get_sitemap` -- null entries in sitemap response no longer cause a panic.
+- `caido_run_workflow` -- Blob-encoded workflow output decoded correctly.
+- `caido_list_environments` -- description field populated correctly.
+
+## [1.4.0] - 2026-04-09
+
+### Added
+- **PAT authentication** - set `CAIDO_PAT` env var to skip OAuth device flow entirely (recommended for automation)
+- **14 new MCP tools** (20 -> 34 total):
+  - `caido_run_workflow` - execute active or convert workflows
+  - `caido_toggle_workflow` - enable/disable automation workflows
+  - `caido_list_tamper_rules` - list Match & Replace rule collections
+  - `caido_create_tamper_rule` - create tamper rules with HTTPQL conditions
+  - `caido_toggle_tamper_rule` - enable/disable tamper rules
+  - `caido_delete_tamper_rule` - delete tamper rules
+  - `caido_intercept_status` - get intercept status (PAUSED/RUNNING)
+  - `caido_intercept_control` - pause or resume intercept
+  - `caido_list_intercept_entries` - list queued intercept entries with HTTPQL filtering
+  - `caido_forward_intercept` - forward intercepted request with optional modifications
+  - `caido_drop_intercept` - drop intercepted request
+  - `caido_list_environments` - list environments and variables
+  - `caido_select_environment` - switch active environment
+  - `caido_list_filters` - list saved HTTPQL filter presets
+- Sensitive header redaction (Authorization, Cookie, Set-Cookie, API keys) in all tool output
+- Input length validation on all string parameters
+- Request ID batch cap (max 20 per call)
+- Test coverage for header redaction
+
+### Changed
+- Bumped sdk-go to v0.3.0 (tamper rules SDK, workflow execution, WebSocket fix)
+- Removed WebSocket endpoint workaround (fixed upstream in sdk-go)
+- README rewritten with PAT auth as recommended setup, security section added
+
+## [1.1.0] - 2026-03-06
+
+### Added
+- `send_request` returns response inline (status code, headers, body) - no extra tool calls needed
+- Response body polling with 10s timeout and fallback to `get_replay_entry`
+- `get_replay_entry` now supports `bodyLimit` and `bodyOffset` parameters
+- Token auto-refresh mid-session via callback (no more expired token failures)
+- Replay session reuse - single session per server lifetime with automatic fallback
+- IPv6 host support (`[::1]:8080`)
+
+### Changed
+- `send_request` output now includes `requestId`, `entryId`, `statusCode`, `roundtripMs`, parsed `request`/`response`
+- `get_replay_entry` defaults to 2KB body limit (matching `get_request`)
+- `ParsedHTTPMessage` and `parseHTTPMessage` extracted to shared `http_utils.go`
+
+### Removed
+- Unused `urlEncode` function from send_request
+- Unused `RequestSummary` struct from types
+- `TaskID` field from send_request output (not useful to LLM callers)
+
+## [1.0.0] - 2026-01-30
+
+### Added
+- Initial release
+- OAuth authentication with automatic token refresh
+- 14 MCP tools for Caido integration:
+  - `caido_list_requests` - List proxied requests with HTTPQL filtering
+  - `caido_get_request` - Get request details with field selection
+  - `caido_send_request` - Send HTTP requests via Replay
+  - `caido_list_replay_sessions` - List Replay sessions
+  - `caido_get_replay_entry` - Get Replay entry details
+  - `caido_list_automate_sessions` - List Automate fuzzing sessions
+  - `caido_get_automate_session` - Get Automate session details
+  - `caido_get_automate_entry` - Get fuzzing results
+  - `caido_list_findings` - List security findings
+  - `caido_create_finding` - Create new findings
+  - `caido_get_sitemap` - Browse sitemap hierarchy
+  - `caido_list_scopes` - List target scopes
+  - `caido_create_scope` - Create new scopes
+- Pre-built binaries for macOS, Linux, Windows (amd64/arm64)

@@ -1,0 +1,572 @@
+---
+title: "Authenticated Scanning Reference"
+editUrl: false
+description: "Operator profile configuration, migration, and validation for guided authenticated scans."
+---
+This is the advanced operator reference. If this is your first target that
+requires login, start with
+[Optional: Form-Login Target Authentication](../../getting-started/form-login-target-authentication/)
+for the local Compose setup and a Cursor-ready example.
+
+Authenticated scans are where most business-critical vulnerabilities live. They are also where teams most often fool themselves.
+
+If authentication is not proven immediately before the crawl or attack, the scan is usually just an unauthenticated scan wearing a nicer label.
+
+## Recommended Path
+
+In `v0.10.0` and later, start with guided auth bootstrap:
+
+- `zap_auth_session_prepare`
+- `zap_auth_session_validate`
+- `zap_crawl_start` with `authSessionId`
+- `zap_attack_start` with `authSessionId`
+
+These tools are available in the guided catalog. Raw ZAP context and user mutation aliases are no longer exposed.
+
+The profile contract is available in `v0.10.0` and later. Traditional form-login
+support is limited to the HTTP spider and active scan paths; it does not imply
+OAuth, SSO, MFA, CAPTCHA, or JavaScript-heavy browser login support.
+
+In `v0.13.0`, browser profiles (`kind: browser`) support guided Client Spider crawling through ZAP's native browser authentication. They use the same operator-managed profile and credential-reference mechanism, with the scope described below.
+
+Treat guided profile contexts as managed state. Fix the operator profile and prepare a new session instead of altering its ZAP context behind the guided workflow.
+
+## Operator Secret Setup
+
+Guided auth uses operator-managed profiles. MCP callers select a profile and a target URL; they cannot choose or recombine its credential, login URL, or allowed origin.
+
+This is a deployment-level trust boundary, not tenant isolation:
+
+- every principal with `zap:auth:session:write` can select every auth profile configured in that deployment
+- profile IDs are selectors, not per-caller or per-workspace access controls
+- prepared session IDs are sensitive capabilities; do not log, share, or expose them beyond the scan workflow that created them
+- run separate MCP ZAP deployments for tenants or teams that must not share credential authority
+
+Keep the profile in external Spring configuration and keep the secret itself in an environment variable or mounted file:
+
+```yaml
+mcp:
+  server:
+    auth:
+      bootstrap:
+        profiles:
+          - id: shop-form
+            kind: form
+            allowed-origin: https://shop.example.com
+            credential-reference: env:TARGET_SCAN_PASSWORD
+            login-url: https://shop.example.com/login
+            username: zap-scan-user
+            zap-user-name: zap-scan-user
+            username-field: username
+            password-field: password
+            logged-in-indicator-regex: ".*Logout.*"
+            logged-out-indicator-regex: ".*Sign in.*"
+```
+
+Credential references are exact operator-owned values:
+
+- `env:NAME`
+- `file:/absolute/path`
+
+Wildcard references and inline secrets are not supported. Use one profile per application, environment, and credential. `allowed-origin` contains only scheme, host, and optional port; paths belong in `targetUrl` and `login-url`.
+
+The ZAP context name is derived from the unique profile ID with an `-auth` suffix. Its scope is the profile's immutable `allowed-origin`, so preparing the same profile for another path cannot rewrite the live scope behind an earlier session or queued job. Different profiles still receive different contexts.
+
+## Browser Authentication for Client Spider
+
+> **Version `v0.13.0`:** In this version, Client Spider supports guided browser authentication in direct and queued crawls. These features are not included in `v0.12.0`. Check [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases) and successful image publication before installing.
+
+Add a separate browser profile to the same deployment configuration:
+
+```yaml
+mcp:
+  server:
+    auth:
+      bootstrap:
+        profiles:
+          - id: shop-browser
+            kind: browser
+            allowed-origin: https://shop.example.com
+            credential-reference: env:TARGET_SCAN_PASSWORD
+            login-url: https://shop.example.com/login
+            username: zap-scan-user
+            logged-in-indicator-regex: ".*Logout.*"
+            logged-out-indicator-regex: ".*Sign in.*"
+```
+
+ZAP discovers the username/password fields and logs into headless Firefox. Browser profiles enable automatic session detection so ZAP can replay cookies or header tokens, including bearer tokens, when verifying authentication. Omit `username-field` and `password-field`; these HTTP form settings are rejected for browser profiles. The login URL and target must share the configured origin. This guided profile supports automatic username/password login, without custom authentication steps, client scripts, or MFA configuration.
+
+Set the existing `ZAP_API_READ_TIMEOUT_MS=60000` for browser-auth deployments (`mcp.zapClient.readTimeoutMs: 60000` in Helm). Validation launches Firefox and waits for login; the default 10-second API read timeout can expire before it finishes. This changes the existing ZAP API timeout, without adding a separate browser timeout.
+
+**Missing browser-storage findings:** If ZAP reports that a storage observation
+has no saved page record, follow the
+[browser-storage troubleshooting steps and native API example](../client-spider/#browser-storage-alerts-missing-during-login).
+You can ask the same ZAP session to visit the application's home page before
+browser login; a full spider run is not needed. The guided workflow does not
+perform this step automatically. It is a troubleshooting option, not an
+authentication prerequisite; still validate a fresh protected response below.
+
+1. Call `zap_auth_session_prepare` with `profileId: shop-browser` and a protected target URL whose response matches the configured logged-in indicator.
+2. Call `zap_auth_session_validate` with the returned session ID and confirm `Valid: true`. This configures ZAP's native authentication polling against the prepared target and logs in. Success requires both a positive ZAP verdict and a match for the configured logged-in indicator in the fresh response headers or body. A missing verdict or positive indicator leaves the result `Valid: false`, `Outcome: authentication_unconfirmed`; an explicit negative verdict is `authentication_failed`.
+3. Call `zap_crawl_start` with the target URL, `strategy: client`, and that `authSessionId`.
+4. Use the returned operation ID for `zap_crawl_status` and `zap_crawl_stop`. Verify that protected pages were reached and returned authenticated content before trusting crawl coverage; a stopped crawl or successful start response does not prove authentication. Wait for passive scanning before reviewing findings.
+
+Guided starts queue the crawl with the prepared ZAP context and user on either storage backend. Browser profiles currently support Client Spider only: `auto`, HTTP, AJAX, and guided active scans reject them. Keep a `kind: form` profile for the existing HTTP/active authentication paths. Authentication Helper, Client Side Integration, Selenium, Firefox, and WebDriver must be available in ZAP; API configuration of browser authentication requires ZAP 2.16.1 or newer.
+
+## Upgrade Migration: Profiles Are Explicit
+
+Replace the removed `MCP_AUTH_BOOTSTRAP_ALLOWED_CREDENTIAL_REFERENCES` and
+`MCP_AUTH_BOOTSTRAP_ALLOW_INLINE_SECRETS` settings. The new profile list defaults
+to empty. A deployment can therefore report healthy while exposing no guided auth
+profiles.
+
+Profiles are compiled only at process startup. After changing profile configuration
+or rotating its secret, restart the MCP process or pod and run the real prepare and
+validate check below. A health check alone is not migration evidence.
+
+The following non-secret profile file is shared by the executable-JAR and Compose
+recipes. Save it as `/etc/mcp-zap/auth-profiles.yml` and adjust the target-specific
+values:
+
+```yaml
+mcp:
+  server:
+    auth:
+      bootstrap:
+        profiles:
+          - id: shop-form
+            kind: form
+            allowed-origin: https://shop.example.com
+            credential-reference: ${TARGET_SCAN_CREDENTIAL_REFERENCE:env:TARGET_SCAN_PASSWORD}
+            login-url: https://shop.example.com/login
+            username: zap-scan-user
+            username-field: username
+            password-field: password
+            logged-in-indicator-regex: ".*Logout.*"
+            logged-out-indicator-regex: ".*Sign in.*"
+```
+
+### Executable JAR
+
+Inject the password through the existing service manager or secret store. This
+foreground example avoids placing it in shell history:
+
+```bash
+printf 'Target scan password: ' >&2
+IFS= read -r -s TARGET_SCAN_PASSWORD
+printf '\n' >&2
+export TARGET_SCAN_PASSWORD
+
+./gradlew bootJar
+APP_VERSION=$(./gradlew -q properties | awk '/^version:/ {print $2}')
+java -Dspring.ai.mcp.server.type=sync \
+  -jar "build/libs/mcp-zap-server-${APP_VERSION}.jar" \
+  --spring.config.additional-location=file:/etc/mcp-zap/auth-profiles.yml
+```
+
+Do not make the additional location optional: a missing profile file should fail
+the deployment. Stop and restart the process through its normal supervisor whenever
+the profile or secret changes. Prepared session IDs are in memory and do not survive
+that restart.
+
+### Docker Compose
+
+Keep the password in a host file outside the repository, readable by Docker, and
+use a Compose secret rather than a container environment variable. Reuse the
+checked-in
+[`auth-profiles.example.yml`](https://github.com/dtkmn/mcp-zap-server/blob/main/examples/authenticated-scanning/auth-profiles.example.yml)
+and
+[`docker-compose.auth-profile.yml`](https://github.com/dtkmn/mcp-zap-server/blob/main/examples/authenticated-scanning/docker-compose.auth-profile.yml)
+instead of maintaining another copy of the override. Copy and edit the profile
+outside the repository first.
+
+Set fully expanded absolute paths, validate the merged deployment, and recreate
+the MCP container:
+
+```bash
+export MCP_ZAP_AUTH_PROFILES_FILE=/etc/mcp-zap/auth-profiles.yml
+export MCP_ZAP_FORM_PASSWORD_FILE=/run/operator-secrets/shop-form-password
+test -r "$MCP_ZAP_AUTH_PROFILES_FILE" && test -r "$MCP_ZAP_FORM_PASSWORD_FILE"
+
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.dev.yml \
+  -f examples/authenticated-scanning/docker-compose.auth-profile.yml \
+  config --quiet
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.dev.yml \
+  -f examples/authenticated-scanning/docker-compose.auth-profile.yml \
+  up -d --build --force-recreate --wait --wait-timeout 180 mcp-server
+```
+
+This migration recipe uses the supported JVM image built by `Dockerfile`.
+Native-image builds are not supported in this revision. Recreate `mcp-server`
+after secret-only rotation. The secret target must be readable, and the
+`/zap/wrk` bind mount writable, by runtime UID/GID 1000.
+
+### Helm
+
+Create the runtime and target-auth Kubernetes Secrets from protected files:
+
+```bash
+export NAMESPACE=mcp-zap
+export MCP_ZAP_ZAP_API_KEY_FILE=/run/operator-secrets/zap-api-key
+export MCP_ZAP_API_KEY_FILE=/run/operator-secrets/mcp-api-key
+export MCP_ZAP_FORM_PASSWORD_FILE=/run/operator-secrets/shop-form-password
+test -s "$MCP_ZAP_ZAP_API_KEY_FILE" \
+  && test -s "$MCP_ZAP_API_KEY_FILE" \
+  && test -s "$MCP_ZAP_FORM_PASSWORD_FILE"
+
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n "$NAMESPACE" create secret generic mcp-zap-runtime \
+  --from-file=ZAP_API_KEY="$MCP_ZAP_ZAP_API_KEY_FILE" \
+  --from-file=MCP_API_KEY="$MCP_ZAP_API_KEY_FILE" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n "$NAMESPACE" create secret generic mcp-zap-auth-profile \
+  --from-file=TARGET_SCAN_PASSWORD="$MCP_ZAP_FORM_PASSWORD_FILE" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Each protected file must contain only the raw secret value, without a trailing
+newline.
+
+Merge this into the values used by the deployment as `auth-profile-values.yml`:
+
+```yaml
+zap:
+  config:
+    existingSecret:
+      name: mcp-zap-runtime
+      apiKeyKey: ZAP_API_KEY
+
+mcp:
+  security:
+    existingSecret:
+      name: mcp-zap-runtime
+      apiKeyKey: MCP_API_KEY
+  zapClient:
+    existingSecret:
+      name: mcp-zap-runtime
+      apiKeyKey: ZAP_API_KEY
+  env:
+    - name: SPRING_APPLICATION_JSON
+      value: |-
+        {
+          "mcp": {
+            "server": {
+              "auth": {
+                "bootstrap": {
+                  "profiles": [{
+                    "id": "shop-form",
+                    "kind": "form",
+                    "allowedOrigin": "https://shop.example.com",
+                    "credentialReference": "env:TARGET_SCAN_PASSWORD",
+                    "loginUrl": "https://shop.example.com/login",
+                    "username": "zap-scan-user",
+                    "usernameField": "username",
+                    "passwordField": "password",
+                    "loggedInIndicatorRegex": ".*Logout.*",
+                    "loggedOutIndicatorRegex": ".*Sign in.*"
+                  }]
+                }
+              }
+            }
+          }
+        }
+  envFrom:
+    - secretRef:
+        name: mcp-zap-auth-profile
+
+networkPolicy:
+  zap:
+    egress:
+      extraEgress:
+        - to:
+            - ipBlock:
+                cidr: 203.0.113.10/32 # REPLACE with the target's approved CIDR
+          ports:
+            - protocol: TCP
+              port: 443
+```
+
+`mcp.env` and `mcp.envFrom` are lists, so merge any existing entries rather than
+overwriting them. If `SPRING_APPLICATION_JSON` already exists, merge the profile
+object into that value; do not define the variable twice. The default ZAP NetworkPolicy
+permits DNS only, so target egress is mandatory. Private targets also require the
+deployment's explicit URL-policy approval. The commands below target chart
+`0.17.1` and image `v0.17.1` after publication; the profile contract was
+introduced in `v0.10.0`.
+Before deploying, check [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases)
+and verify that the release workflow has published the image to your registry.
+The unknown/disabled-tool response fix applies to `v0.11.1` and later.
+Main CI no longer publishes rolling `main` or `sha-*` tags. Do not use `v0.9.1`
+or earlier; those images do not contain the profile contract.
+
+The repository does not contain a `production-values.yml`. The example below
+uses only the profile values file. If you maintain another values file, add its
+real path with another `-f` argument.
+
+Render before applying, then wait for the MCP rollout:
+
+```bash
+(
+set -euo pipefail
+: "${NAMESPACE:?set NAMESPACE}"
+MCP_ZAP_IMAGE_TAG=v0.17.1
+[[ "$MCP_ZAP_IMAGE_TAG" == "v0.17.1" ]] || {
+  echo "MCP_ZAP_IMAGE_TAG must be the v0.17.1 release image tag" >&2
+  exit 1
+}
+
+helm lint helm/mcp-zap-server \
+  -f auth-profile-values.yml \
+  --set-string "mcp.image.tag=$MCP_ZAP_IMAGE_TAG"
+helm template mcp-zap helm/mcp-zap-server \
+  --namespace "$NAMESPACE" \
+  -f auth-profile-values.yml \
+  --set-string "mcp.image.tag=$MCP_ZAP_IMAGE_TAG" \
+  --show-only templates/mcp-deployment.yaml \
+  | grep -E "^[[:space:]]+image: \"[^\"]+:${MCP_ZAP_IMAGE_TAG}\"$" >/dev/null
+helm upgrade --install mcp-zap helm/mcp-zap-server \
+  --namespace "$NAMESPACE" \
+  -f auth-profile-values.yml \
+  --set-string "mcp.image.tag=$MCP_ZAP_IMAGE_TAG" \
+  --atomic --wait
+kubectl -n "$NAMESPACE" rollout status deployment \
+  -l app.kubernetes.io/instance=mcp-zap,app.kubernetes.io/name=mcp-server
+)
+```
+
+A Secret-only update does not change the pod template. Force the required restart:
+
+```bash
+kubectl -n "$NAMESPACE" rollout restart deployment \
+  -l app.kubernetes.io/instance=mcp-zap,app.kubernetes.io/name=mcp-server
+kubectl -n "$NAMESPACE" rollout status deployment \
+  -l app.kubernetes.io/instance=mcp-zap,app.kubernetes.io/name=mcp-server
+```
+
+The chart defaults to a ClusterIP service. After the final rollout, unless you
+already expose it through an approved ingress, keep this port-forward running in a
+second terminal before using the localhost verification URL below:
+
+```bash
+MCP_SERVICE=$(kubectl -n "$NAMESPACE" get service \
+  -l app.kubernetes.io/instance=mcp-zap,app.kubernetes.io/name=mcp-server \
+  -o jsonpath='{.items[0].metadata.name}')
+test -n "$MCP_SERVICE"
+kubectl -n "$NAMESPACE" port-forward "service/$MCP_SERVICE" 7456:7456
+```
+
+### Verify The Migrated Profile
+
+Run this after **every** JAR, Compose, or Helm restart. Use an API key whose client
+has `zap:auth:session:write` and `zap:auth:test`; for JWT mode, set
+`MCP_AUTH_HEADER="Authorization: Bearer $ACCESS_TOKEN"` with those scopes instead.
+The check requires `curl`, `jq`, and standard shell text utilities.
+
+```bash
+(
+set -euo pipefail
+export MCP_URL="${MCP_URL:-http://localhost:7456/mcp}"
+export MCP_AUTH_HEADER="${MCP_AUTH_HEADER:-X-API-Key: ${MCP_API_KEY:?set MCP_API_KEY or MCP_AUTH_HEADER}}"
+export MCP_PROTOCOL_VERSION="${MCP_PROTOCOL_VERSION:-2025-11-25}"
+
+INITIALIZE_REQUEST=$(jq -nc --arg protocolVersion "$MCP_PROTOCOL_VERSION" \
+  '{jsonrpc:"2.0",id:0,method:"initialize",params:{protocolVersion:$protocolVersion,capabilities:{},clientInfo:{name:"auth-profile-check",version:"1.0.0"}}}')
+SESSION_ID=$(curl -si --fail-with-body \
+  -H "$MCP_AUTH_HEADER" \
+  -H 'Accept: application/json,text/event-stream' \
+  -H 'Content-Type: application/json' \
+  "$MCP_URL" \
+  -d "$INITIALIZE_REQUEST" \
+  | awk -F': ' 'tolower($1) == "mcp-session-id" {print $2}' | tr -d '\r')
+test -n "$SESSION_ID"
+
+normalize_mcp_response() {
+  local raw_file=$1
+  local data
+  data=$(sed -n 's/^data:[[:space:]]*//p' "$raw_file" | tail -n 1)
+  if [ -n "$data" ]; then printf '%s' "$data"; else cat "$raw_file"; fi
+}
+
+PREPARE_RAW=$(mktemp)
+VALIDATE_RAW=$(mktemp)
+trap 'rm -f "$PREPARE_RAW" "$VALIDATE_RAW"' EXIT
+
+curl -sS --fail-with-body \
+  -H "$MCP_AUTH_HEADER" \
+  -H "Mcp-Session-Id: $SESSION_ID" \
+  -H "MCP-Protocol-Version: $MCP_PROTOCOL_VERSION" \
+  -H 'Accept: application/json,text/event-stream' \
+  -H 'Content-Type: application/json' \
+  "$MCP_URL" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"zap_auth_session_prepare","arguments":{"profileId":"shop-form","targetUrl":"https://shop.example.com"}}}' \
+  >"$PREPARE_RAW"
+
+PREPARE_JSON=$(normalize_mcp_response "$PREPARE_RAW")
+printf '%s' "$PREPARE_JSON" | jq -e '.result.isError == false' >/dev/null
+PREPARE_TEXT=$(printf '%s' "$PREPARE_JSON" | jq -er '
+  .result.content[] | select(.type == "text") | .text |
+  if startswith("\"") and endswith("\"") then fromjson else . end
+')
+printf '%s\n' "$PREPARE_TEXT" | grep -F 'Guided auth session prepared.'
+printf '%s\n' "$PREPARE_TEXT" | grep -F 'Auth Profile: shop-form'
+printf '%s\n' "$PREPARE_TEXT" | grep -F 'Authorized Origin: https://shop.example.com'
+AUTH_SESSION_ID=$(printf '%s\n' "$PREPARE_TEXT" | sed -n 's/^Session ID: //p')
+test -n "$AUTH_SESSION_ID"
+
+VALIDATE_REQUEST=$(jq -nc --arg sessionId "$AUTH_SESSION_ID" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"zap_auth_session_validate",arguments:{sessionId:$sessionId}}}')
+curl -sS --fail-with-body \
+  -H "$MCP_AUTH_HEADER" \
+  -H "Mcp-Session-Id: $SESSION_ID" \
+  -H "MCP-Protocol-Version: $MCP_PROTOCOL_VERSION" \
+  -H 'Accept: application/json,text/event-stream' \
+  -H 'Content-Type: application/json' \
+  "$MCP_URL" -d "$VALIDATE_REQUEST" >"$VALIDATE_RAW"
+
+VALIDATE_JSON=$(normalize_mcp_response "$VALIDATE_RAW")
+printf '%s' "$VALIDATE_JSON" | jq -e '.result.isError == false' >/dev/null
+VALIDATE_TEXT=$(printf '%s' "$VALIDATE_JSON" | jq -er '
+  .result.content[] | select(.type == "text") | .text |
+  if startswith("\"") and endswith("\"") then fromjson else . end
+')
+printf '%s\n' "$VALIDATE_TEXT" | grep -F 'Valid: true'
+printf '%s\n' "$VALIDATE_TEXT" | grep -F 'Outcome: authenticated'
+printf '%s\n' "$VALIDATE_TEXT" | grep -F 'likelyAuthenticated=true'
+)
+```
+
+If any assertion fails, the migration is incomplete. Inspect correlated operator
+logs, fix the profile, secret injection, URL policy, or ZAP egress, restart, and
+repeat. Do not run an authenticated crawl on a health-only or prepare-only signal.
+
+## Form-login Workflow
+
+Use a dedicated least-privilege scan account and a tight target scope.
+
+### 1. Prepare the Auth Session
+
+```json
+{
+  "tool": "zap_auth_session_prepare",
+  "arguments": {
+    "profileId": "shop-form",
+    "targetUrl": "https://shop.example.com"
+  }
+}
+```
+
+The response should include:
+
+- `Session ID`
+- `Auth Profile: shop-form`
+- `Auth Kind: form`
+- `Authorized Origin: https://shop.example.com`
+- `Provider: zap-form-login`
+- `Engine Binding: ZAP context/user ready`
+- `Context ID`
+- `User ID`
+
+It must not include the secret value.
+
+### 2. Validate Before Scanning
+
+```json
+{
+  "tool": "zap_auth_session_validate",
+  "arguments": {
+    "sessionId": "auth-session-id-from-prepare"
+  }
+}
+```
+
+Expected evidence:
+
+- `Valid: true`
+- `Outcome: authenticated`
+- `likelyAuthenticated=true`
+- the same context and user IDs from preparation
+
+If validation fails, resolve the failure before using the session for an
+authenticated scan.
+
+### 3. Crawl as the Prepared Session
+
+```json
+{
+  "tool": "zap_crawl_start",
+  "arguments": {
+    "targetUrl": "https://shop.example.com",
+    "strategy": "http",
+    "authSessionId": "auth-session-id-from-prepare"
+  }
+}
+```
+
+Guided authenticated crawl accepts prepared form-login sessions with `strategy=http` or `auto`, and prepared browser sessions with `strategy=client`. AJAX crawl (`strategy=browser`) with `authSessionId` is not supported. A browser session cannot currently be used for guided active scanning.
+
+### 4. Attack as the Prepared Session
+
+```json
+{
+  "tool": "zap_attack_start",
+  "arguments": {
+    "targetUrl": "https://shop.example.com",
+    "recurse": "true",
+    "policy": "Default Policy",
+    "authSessionId": "auth-session-id-from-prepare"
+  }
+}
+```
+
+After crawl or attack completion, wait for passive scanning before reading findings or generating reports:
+
+```json
+{
+  "tool": "zap_passive_scan_wait",
+  "arguments": {}
+}
+```
+
+## Bearer And API-key Sessions
+
+Auth profiles also accept:
+
+- `kind: bearer`
+- `kind: api-key`
+
+For those flows, validation proves the credential reference resolves. It does not prove the target accepts the header, and current guided ZAP execution does not automatically inject those headers into crawl or attack execution.
+
+Use bearer and API-key bootstrap for gateway credential-reference preparation today. Do not sell it as authenticated scan execution until header injection is implemented in the engine path.
+
+## Practical Best Practices
+
+1. Use one auth profile and prepared session per application, environment, and auth flow.
+2. Keep profile configuration operator-owned and keep raw secrets only in environment variables or mounted files.
+3. Bind every profile to one exact `allowed-origin`.
+4. Use non-admin scan accounts unless admin coverage is explicitly approved.
+5. Validate with `zap_auth_session_validate` before every major scan run.
+6. Treat every `likelyAuthenticated` value other than `true` as a hard stop.
+7. Exclude logout paths and destructive account-management paths from scan scope.
+8. Spider first, then active scan.
+9. Keep scan depth and duration conservative until the target is understood.
+10. Capture `correlationId`, a SHA-256 fingerprint of the session ID (never the raw ID), `Context ID`, and `User ID` as release evidence.
+
+## Unsupported Authentication Workflows
+
+Guided profiles do not provide arbitrary script or custom login-step configuration. Use a separately managed ZAP workflow when the supported form, browser or header profiles cannot express the required authentication. Do not silently continue an authenticated scan anonymously.
+
+## Common Pitfalls
+
+- `Unknown auth profile ID`: the requested profile is not configured.
+- `targetUrl origin is not authorized for auth profile`: the caller tried to use a profile outside its operator-approved origin.
+- `Auth profile ... is invalid`: fix the operator configuration before retrying.
+- `likelyAuthenticated` is not `true`: indicators, field names, credentials, target behavior, or ZAP diagnostics are wrong or indeterminate.
+- Header session validates but crawl is still unauthenticated: bearer/API-key header injection is not in the guided engine path yet.
+- Crawl strategy `browser` rejects auth: this selects AJAX Spider, which does not support guided `authSessionId`. For Client Spider, use `strategy=client` with a `kind: browser` profile as described above.
+
+If you are debugging an incident, use the
+[Auth Bootstrap Failure Runbook](https://github.com/dtkmn/mcp-zap-server/blob/main/docs/operator/runbooks/AUTH_BOOTSTRAP_FAILURE_RUNBOOK.md).

@@ -1,0 +1,824 @@
+package mcp.server.zap.core.gateway;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.stream.IntStream;
+import mcp.server.zap.core.exception.ZapApiException;
+import mcp.server.zap.core.gateway.EngineApiImportAccess.UrlImportRequest;
+import mcp.server.zap.core.gateway.EngineContextAccess.AuthenticationConfigRequest;
+import mcp.server.zap.core.gateway.EngineContextAccess.AuthenticationDiagnostics;
+import mcp.server.zap.core.gateway.EngineContextAccess.ContextMutation;
+import mcp.server.zap.core.gateway.EngineContextAccess.ContextMutationResult;
+import mcp.server.zap.core.gateway.EngineContextAccess.UserMutation;
+import mcp.server.zap.core.gateway.EngineContextAccess.UserMutationResult;
+import mcp.server.zap.core.gateway.EngineFindingAccess.AlertSnapshot;
+import mcp.server.zap.core.gateway.EngineReportAccess.ReportGenerationRequest;
+import mcp.server.zap.core.gateway.EngineRuntimeAccess.AddOn;
+import mcp.server.zap.core.gateway.EngineRuntimeAccess.NetworkDefaults;
+import mcp.server.zap.core.gateway.EngineRuntimeAccess.ScannerInventory;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
+import org.zaproxy.clientapi.core.ApiResponse;
+import org.zaproxy.clientapi.core.ApiResponseElement;
+import org.zaproxy.clientapi.core.ApiResponseList;
+import org.zaproxy.clientapi.core.ApiResponseSet;
+import org.zaproxy.clientapi.core.ClientApi;
+import org.zaproxy.clientapi.core.ClientApiException;
+import org.zaproxy.clientapi.gen.AjaxSpider;
+import org.zaproxy.clientapi.gen.Authentication;
+import org.zaproxy.clientapi.gen.Autoupdate;
+import org.zaproxy.clientapi.gen.Context;
+import org.zaproxy.clientapi.gen.Core;
+import org.zaproxy.clientapi.gen.Graphql;
+import org.zaproxy.clientapi.gen.Network;
+import org.zaproxy.clientapi.gen.Openapi;
+import org.zaproxy.clientapi.gen.Pscan;
+import org.zaproxy.clientapi.gen.Reports;
+import org.zaproxy.clientapi.gen.SessionManagement;
+import org.zaproxy.clientapi.gen.Soap;
+import org.zaproxy.clientapi.gen.Users;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
+
+class ZapEngineBoundaryAccessTest {
+
+    private org.zaproxy.clientapi.gen.Alert alert;
+    private Reports reports;
+    private Openapi openapi;
+    private Graphql graphql;
+    private Soap soap;
+    private Context context;
+    private Users users;
+    private Authentication authentication;
+    private SessionManagement sessionManagement;
+    private Pscan pscan;
+    private AjaxSpider ajaxSpider;
+    private Autoupdate autoupdate;
+    private Core core;
+    private Network network;
+    private ZapEngineFindingAccess findingAccess;
+    private ZapEngineReportAccess reportAccess;
+    private ZapEngineApiImportAccess importAccess;
+    private ZapEngineContextAccess contextAccess;
+    private ZapEnginePassiveScanAccess passiveScanAccess;
+    private ZapEngineAjaxSpiderExecution ajaxSpiderExecution;
+    private ZapEngineInventoryAccess inventoryAccess;
+    private ZapEngineRuntimeAccess runtimeAccess;
+
+    @BeforeEach
+    void setup() {
+        ClientApi clientApi = new ClientApi("localhost", 0);
+        alert = mock(org.zaproxy.clientapi.gen.Alert.class);
+        reports = mock(Reports.class);
+        openapi = mock(Openapi.class);
+        graphql = mock(Graphql.class);
+        soap = mock(Soap.class);
+        context = mock(Context.class);
+        users = mock(Users.class);
+        authentication = mock(Authentication.class);
+        sessionManagement = mock(SessionManagement.class);
+        pscan = mock(Pscan.class);
+        ajaxSpider = mock(AjaxSpider.class);
+        autoupdate = mock(Autoupdate.class);
+        core = mock(Core.class);
+        network = mock(Network.class);
+        clientApi.alert = alert;
+        clientApi.reports = reports;
+        clientApi.openapi = openapi;
+        clientApi.graphql = graphql;
+        clientApi.soap = soap;
+        clientApi.context = context;
+        clientApi.users = users;
+        clientApi.authentication = authentication;
+        clientApi.sessionManagement = sessionManagement;
+        clientApi.pscan = pscan;
+        clientApi.ajaxSpider = ajaxSpider;
+        clientApi.autoupdate = autoupdate;
+        clientApi.core = core;
+        clientApi.network = network;
+
+        findingAccess = new ZapEngineFindingAccess(clientApi);
+        reportAccess = new ZapEngineReportAccess(clientApi);
+        importAccess = new ZapEngineApiImportAccess(clientApi);
+        contextAccess = new ZapEngineContextAccess(clientApi);
+        passiveScanAccess = new ZapEnginePassiveScanAccess(clientApi);
+        ajaxSpiderExecution = new ZapEngineAjaxSpiderExecution(clientApi);
+        inventoryAccess = new ZapEngineInventoryAccess(clientApi);
+        runtimeAccess = new ZapEngineRuntimeAccess(clientApi);
+    }
+
+    @Test
+    void findingsAdapterParsesZapAlertsIntoGatewaySnapshots() throws Exception {
+        when(alert.alerts("http://target", "0", "-1", null, null, null))
+                .thenReturn(new ApiResponseList("alerts", List.of(
+                        alert("1", "40018", "SQL Injection", "High", "Medium", "http://target/a")
+                )));
+
+        List<AlertSnapshot> alerts = findingAccess.loadAlerts("http://target");
+
+        assertThat(alerts).hasSize(1);
+        assertThat(alerts.getFirst().pluginId()).isEqualTo("40018");
+        assertThat(alerts.getFirst().name()).isEqualTo("SQL Injection");
+        assertThat(alerts.getFirst().risk()).isEqualTo("High");
+    }
+
+    @Test
+    void reportAdapterCallsZapReportApiBehindBoundary() throws Exception {
+        when(reports.generate("title", "traditional-json-plus", "", "", "", "site", "", "", "",
+                "zap-report-1", "", "/tmp/reports", "false"))
+                .thenReturn(new ApiResponseElement("file", "/tmp/reports/zap-report-1.json"));
+
+        String reportPath = reportAccess.generateReport(new ReportGenerationRequest(
+                "title",
+                "traditional-json-plus",
+                "",
+                "",
+                "",
+                "site",
+                "",
+                "",
+                "",
+                "zap-report-1",
+                "",
+                "/tmp/reports",
+                "false"
+        ));
+
+        assertThat(reportPath).isEqualTo("/tmp/reports/zap-report-1.json");
+    }
+
+    @Test
+    void scopedRootReportsConstrainBareEnginePrefixesWithAnOutOfScopeContext() throws Exception {
+        String scopes = "https://target.example/|http://[2001:db8::1]:8090/|http://narrow.example/App.+/";
+        String engineSites = "https://target.example|http://[2001:db8::1]:8090|http://narrow.example/App.+/";
+        ReportGenerationRequest request = reportRequest(scopes);
+        when(reports.generate(eq("title"), eq("traditional-json-plus"), eq(""), eq(""), anyString(),
+                eq(engineSites), eq(""), eq(""), eq(""), eq("zap-report-1"), eq(""),
+                eq("/tmp/reports"), eq("false")))
+                .thenReturn(new ApiResponseElement("file", "/tmp/reports/zap-report-1.json"));
+
+        assertThat(reportAccess.generateScopedReport(request)).isEqualTo("/tmp/reports/zap-report-1.json");
+        assertThat(request.sites()).isEqualTo(scopes);
+
+        var ordered = inOrder(context, reports);
+        ArgumentCaptor<String> contextName = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> regexes = ArgumentCaptor.forClass(String.class);
+        ordered.verify(context).newContext(contextName.capture());
+        ordered.verify(context).setContextInScope(contextName.getValue(), "false");
+        ordered.verify(context, times(3)).includeInContext(eq(contextName.getValue()), regexes.capture());
+        ordered.verify(reports).generate("title", "traditional-json-plus", "", "", contextName.getValue(),
+                engineSites, "", "", "", "zap-report-1", "", "/tmp/reports", "false");
+        ordered.verify(context).removeContext(contextName.getValue());
+        ordered.verifyNoMoreInteractions();
+
+        // ZAP compiles includes case-insensitively, so exercise the API regexes with that flag.
+        Pattern root = Pattern.compile(regexes.getAllValues().get(0), Pattern.CASE_INSENSITIVE);
+        for (String uri : List.of("https://target.example", "https://target.example/",
+                "HTTPS://TARGET.EXAMPLE:443", "https://target.example:443/page",
+                "https://target.example?query=1")) {
+            assertThat(root.matcher(uri).matches()).as(uri).isTrue();
+        }
+        for (String uri : List.of("https://target.example.evil/", "https://target.example:8443/",
+                "https://target.example@evil.example/", "http://target.example/")) {
+            assertThat(root.matcher(uri).matches()).as(uri).isFalse();
+        }
+        Pattern ipv6 = Pattern.compile(regexes.getAllValues().get(1), Pattern.CASE_INSENSITIVE);
+        assertThat(ipv6.matcher("http://[2001:db8::1]:8090").matches()).isTrue();
+        assertThat(ipv6.matcher("HTTP://[2001:DB8::1]:8090/page").matches()).isTrue();
+        assertThat(ipv6.matcher("http://[2001:db8::1]:80901/").matches()).isFalse();
+        assertThat(ipv6.matcher("http://[2001:db8::2]:8090/").matches()).isFalse();
+        Pattern path = Pattern.compile(regexes.getAllValues().get(2), Pattern.CASE_INSENSITIVE);
+        assertThat(path.matcher("HTTP://NARROW.EXAMPLE:80/App.+/page").matches()).isTrue();
+        assertThat(path.matcher("http://narrow.example/app.+/page").matches()).isFalse();
+        assertThat(path.matcher("http://narrow.example/AppX+/page").matches()).isFalse();
+        assertThat(path.matcher("http://narrow.example/Other/").matches()).isFalse();
+        assertThat(path.matcher("http://narrow.example.evil/App.+/").matches()).isFalse();
+    }
+
+    @Test
+    void rootReportContextCreationFailureCannotFallBackToANativeReport() throws Exception {
+        ClientApiException failure = new ClientApiException("Cannot create context");
+        when(context.newContext(anyString())).thenThrow(failure);
+
+        assertThatThrownBy(() -> reportAccess.generateScopedReport(reportRequest("https://target.example/")))
+                .isInstanceOf(ZapApiException.class)
+                .hasCause(failure);
+        verify(context).newContext(anyString());
+        verifyNoMoreInteractions(context);
+        verifyNoInteractions(reports);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scope", "include"})
+    void rootReportContextSetupFailureCleansUpWithoutGenerating(String failedOperation) throws Exception {
+        ClientApiException failure = new ClientApiException("Cannot prepare report context");
+        if (failedOperation.equals("scope")) {
+            when(context.setContextInScope(anyString(), eq("false"))).thenThrow(failure);
+        } else {
+            when(context.includeInContext(anyString(), anyString())).thenThrow(failure);
+        }
+
+        assertThatThrownBy(() -> reportAccess.generateScopedReport(reportRequest("https://target.example/")))
+                .isInstanceOf(ZapApiException.class)
+                .hasCause(failure);
+        ArgumentCaptor<String> contextName = ArgumentCaptor.forClass(String.class);
+        var ordered = inOrder(context);
+        ordered.verify(context).newContext(contextName.capture());
+        ordered.verify(context).setContextInScope(contextName.getValue(), "false");
+        if (failedOperation.equals("include")) {
+            ordered.verify(context).includeInContext(eq(contextName.getValue()), anyString());
+        }
+        ordered.verify(context).removeContext(contextName.getValue());
+        ordered.verifyNoMoreInteractions();
+        verifyNoInteractions(reports);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void scopedReportGenerationFailureRemainsPrimaryWhenContextCleanupAlsoFails(boolean cleanupFails) throws Exception {
+        ClientApiException generationFailure = new ClientApiException("Cannot generate report");
+        when(reports.generate(anyString(), anyString(), anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenThrow(generationFailure);
+        ClientApiException cleanupFailure = new ClientApiException("Cannot remove context");
+        if (cleanupFails) {
+            when(context.removeContext(anyString())).thenThrow(cleanupFailure);
+        }
+
+        assertThatThrownBy(() -> reportAccess.generateScopedReport(reportRequest("https://target.example/")))
+                .isInstanceOf(ZapApiException.class)
+                .hasCause(generationFailure)
+                .satisfies(failure -> {
+                    if (cleanupFails) {
+                        assertThat(failure.getSuppressed()).hasSize(1);
+                        assertThat(failure.getSuppressed()[0]).hasCause(cleanupFailure);
+                    } else {
+                        assertThat(failure.getSuppressed()).isEmpty();
+                    }
+                });
+        ArgumentCaptor<String> contextName = ArgumentCaptor.forClass(String.class);
+        verify(context).newContext(contextName.capture());
+        verify(context).removeContext(contextName.getValue());
+        verify(reports).generate("title", "traditional-json-plus", "", "", contextName.getValue(),
+                "https://target.example", "", "", "", "zap-report-1", "", "/tmp/reports", "false");
+        verifyNoMoreInteractions(reports);
+    }
+
+    @Test
+    void successfulReportCannotReturnNormallyWhenItsContextCannotBeRemoved() throws Exception {
+        when(reports.generate(anyString(), anyString(), anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new ApiResponseElement("file", "/tmp/reports/zap-report-1.json"));
+        ClientApiException failure = new ClientApiException("Cannot remove context");
+        when(context.removeContext(anyString())).thenThrow(failure);
+
+        assertThatThrownBy(() -> reportAccess.generateScopedReport(reportRequest("https://target.example/")))
+                .isInstanceOf(ZapApiException.class)
+                .hasCause(failure);
+        ArgumentCaptor<String> contextName = ArgumentCaptor.forClass(String.class);
+        verify(context).newContext(contextName.capture());
+        verify(context).removeContext(contextName.getValue());
+        verify(reports).generate("title", "traditional-json-plus", "", "", contextName.getValue(),
+                "https://target.example", "", "", "", "zap-report-1", "", "/tmp/reports", "false");
+        verifyNoMoreInteractions(reports);
+    }
+
+    @Test
+    void pathOnlyScopedReportsRetainNativeFilteringWithoutCreatingAContext() throws Exception {
+        when(reports.generate("title", "traditional-json-plus", "", "", "", "https://target.example/App/",
+                "", "", "", "zap-report-1", "", "/tmp/reports", "false"))
+                .thenReturn(new ApiResponseElement("file", "/tmp/reports/zap-report-1.json"));
+
+        assertThat(reportAccess.generateScopedReport(reportRequest("https://target.example/App/")))
+                .isEqualTo("/tmp/reports/zap-report-1.json");
+        verifyNoInteractions(context);
+    }
+
+    private static ReportGenerationRequest reportRequest(String sites) {
+        return new ReportGenerationRequest("title", "traditional-json-plus", "", "", "", sites,
+                "", "", "", "zap-report-1", "", "/tmp/reports", "false");
+    }
+
+    @Test
+    void apiImportAdapterFlattensZapResponses() throws Exception {
+        when(openapi.importUrl("http://example.com/api.yaml", "host"))
+                .thenReturn(new ApiResponseList("imports", List.of(new ApiResponseElement("id", "9"))));
+
+        EngineApiImportAccess.ImportResult result =
+                importAccess.importOpenApiUrl(new UrlImportRequest("http://example.com/api.yaml", "host"));
+
+        assertThat(result.values()).containsExactly("9");
+    }
+
+    @Test
+    void contextAdapterCreatesContextAndAppliesScope() throws Exception {
+        when(context.contextList()).thenReturn(new ApiResponseList("contextList"));
+        when(context.context("api-auth")).thenReturn(set("context", Map.of(
+                "id", element("id", "11"),
+                "inScope", element("inScope", "true")
+        )));
+        when(context.includeRegexs("api-auth")).thenReturn(new ApiResponseList("includeRegexs",
+                List.of(element("regex", "https://api.example.com/.*"))));
+        when(context.excludeRegexs("api-auth")).thenReturn(new ApiResponseList("excludeRegexs",
+                List.of(element("regex", "https://api.example.com/logout.*"))));
+
+        ContextMutationResult result = contextAccess.upsertContext(new ContextMutation(
+                "api-auth",
+                List.of("https://api.example.com/.*"),
+                List.of("https://api.example.com/logout.*"),
+                true
+        ));
+
+        assertThat(result.created()).isTrue();
+        assertThat(result.context().contextId()).isEqualTo("11");
+        verify(context).newContext("api-auth");
+        verify(context).setContextRegexs(
+                "api-auth",
+                "[\"https://api.example.com/.*\"]",
+                "[\"https://api.example.com/logout.*\"]"
+        );
+        verify(context).setContextInScope("api-auth", "true");
+    }
+
+    @Test
+    void contextAdapterUpdatesExistingUser() throws Exception {
+        when(users.usersList("5")).thenReturn(new ApiResponseList("usersList", List.of(
+                set("user", Map.of(
+                        "id", element("id", "77"),
+                        "name", element("name", "scan-user"),
+                        "enabled", element("enabled", "false")
+                ))
+        )));
+        when(users.getUserById("5", "77")).thenReturn(set("user", Map.of(
+                "id", element("id", "77"),
+                "name", element("name", "scan-user"),
+                "enabled", element("enabled", "true")
+        )));
+
+        UserMutationResult result = contextAccess.upsertUser(new UserMutation(
+                "5",
+                "scan-user",
+                "username=scan-user&password=s3cr3t",
+                true
+        ));
+
+        assertThat(result.created()).isFalse();
+        assertThat(result.userId()).isEqualTo("77");
+        assertThat(result.enabled()).isTrue();
+        verify(users).setAuthenticationCredentials("5", "77", "username=scan-user&password=s3cr3t");
+        verify(users).setUserEnabled("5", "77", "true");
+    }
+
+    @Test
+    void contextAdapterConfiguresAutoDetectSessionManagement() throws Exception {
+        contextAccess.configureAutoDetectSessionManagement("1");
+
+        verify(sessionManagement).setSessionManagementMethod("1", "autoDetectSessionManagement", "");
+        verifyNoInteractions(authentication, users);
+    }
+
+    @Test
+    void contextAdapterPropagatesAutoDetectSessionManagementFailure() throws Exception {
+        ClientApiException failure = new ClientApiException("Session management method unavailable");
+        when(sessionManagement.setSessionManagementMethod("1", "autoDetectSessionManagement", ""))
+                .thenThrow(failure);
+
+        assertThatThrownBy(() -> contextAccess.configureAutoDetectSessionManagement("1"))
+                .isInstanceOf(ZapApiException.class)
+                .hasMessage("Failed to configure session management for context 1")
+                .hasCause(failure);
+        verifyNoInteractions(authentication, users);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"formBasedAuthentication", "browserBasedAuthentication"})
+    void expertAuthenticationConfigurationPreservesExistingSessionManagement(String authenticationMethod) throws Exception {
+        var result = contextAccess.configureContextAuthentication(new AuthenticationConfigRequest(
+                "1", authenticationMethod, "config=value", "Logout", "Sign in"));
+
+        assertThat(result.authMethodName()).isEqualTo(authenticationMethod);
+        verify(authentication).setAuthenticationMethod("1", authenticationMethod, "config=value");
+        verifyNoInteractions(sessionManagement);
+    }
+
+    @Test
+    void contextAdapterParsesAuthenticationDiagnostics() throws Exception {
+        when(users.authenticateAsUser("1", "7")).thenReturn(set("auth", Map.of(
+                "authSuccessful", element("authSuccessful", "true")
+        )));
+        when(users.getAuthenticationState("1", "7")).thenReturn(set("state", Map.of(
+                "lastPollResult", element("lastPollResult", "true")
+        )));
+
+        AuthenticationDiagnostics diagnostics = contextAccess.testUserAuthentication("1", "7");
+
+        assertThat(diagnostics.likelyAuthenticated()).isTrue();
+        assertThat(diagnostics.authResponse()).contains("authSuccessful");
+        assertThat(diagnostics.authState()).contains("lastPollResult");
+        verifyNoInteractions(context);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void contextAdapterVerifiesProtectedUrlWithFreshNativeUserPoll(boolean authenticated) throws Exception {
+        stubVerificationContext();
+        when(authentication.getLoggedInIndicator("1"))
+                .thenReturn(element("logged_in_regex", "Private account data"));
+        when(users.authenticateAsUser("1", "7")).thenReturn(element("Result", "OK"));
+        when(users.pollAsUser("1", "7")).thenReturn(set("poll", Map.of(
+                "pollSuccessful", element("pollSuccessful", Boolean.toString(authenticated)),
+                "requestHeader", element("requestHeader", "Cookie: session=private-session"),
+                "responseBody", element("responseBody", "Private account data")
+        )));
+        when(users.getAuthenticationState("1", "7")).thenReturn(set("state", Map.of(
+                "lastPollResult", element("lastPollResult", Boolean.toString(!authenticated))
+        )));
+
+        AuthenticationDiagnostics diagnostics = contextAccess.testUserAuthentication(
+                "1", "7", "https://shop.example.com/account");
+
+        assertThat(diagnostics.likelyAuthenticated()).isEqualTo(authenticated);
+        assertThat(diagnostics.authResponse()).isEqualTo("verifiedAuthenticated=" + authenticated)
+                .doesNotContain("private-session", "Private account data");
+        var ordered = inOrder(context, users);
+        ordered.verify(context).setContextCheckingStrategy("shop-browser-auth", "POLL_URL",
+                "https://shop.example.com/account", "", "", "60", "REQUESTS");
+        ordered.verify(users).authenticateAsUser("1", "7");
+        ordered.verify(users).pollAsUser("1", "7");
+        ordered.verify(users).getAuthenticationState("1", "7");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "malformed", "acknowledgement"})
+    void contextAdapterDoesNotInferPollSuccessFromOtherFieldsOrStaleState(String responseKind) throws Exception {
+        stubVerificationContext();
+        when(users.authenticateAsUser("1", "7")).thenReturn(set("auth", Map.of(
+                "authSuccessful", element("authSuccessful", "true")
+        )));
+        ApiResponse pollResponse = switch (responseKind) {
+            case "missing" -> set("poll", Map.of("success", element("success", "true")));
+            case "malformed" -> set("poll", Map.of("pollSuccessful", element("pollSuccessful", "OK")));
+            default -> element("Result", "OK");
+        };
+        when(users.pollAsUser("1", "7")).thenReturn(pollResponse);
+        when(users.getAuthenticationState("1", "7")).thenReturn(set("state", Map.of(
+                "lastPollResult", element("lastPollResult", "true")
+        )));
+
+        AuthenticationDiagnostics diagnostics = contextAccess.testUserAuthentication(
+                "1", "7", "https://shop.example.com/account");
+
+        assertThat(diagnostics.likelyAuthenticated()).isNull();
+        assertThat(diagnostics.authResponse()).isEqualTo("verifiedAuthenticated=null");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"error-response", "missing-response", "missing-indicator"})
+    void contextAdapterRequiresPositiveLoginEvidenceDespiteSuccessfulNativePoll(String scenario) throws Exception {
+        stubVerificationContext();
+        when(users.authenticateAsUser("1", "7")).thenReturn(element("Result", "OK"));
+        Map<String, ApiResponse> fields = new LinkedHashMap<>();
+        fields.put("pollSuccessful", element("pollSuccessful", "true"));
+        // Matching request content must never count as proof from the protected page's response.
+        fields.put("requestHeader", element("requestHeader", "X-Auth: Signed in as scan-user"));
+        fields.put("requestBody", element("requestBody", "Signed in as scan-user"));
+        if (!scenario.equals("missing-response")) {
+            fields.put("responseHeader", element("responseHeader", "HTTP/1.1 500 Internal Server Error"));
+            fields.put("responseBody", element("responseBody", "An unexpected error occurred"));
+        }
+        when(users.pollAsUser("1", "7")).thenReturn(set("poll", fields));
+        when(users.getAuthenticationState("1", "7"))
+                .thenReturn(set("state", Map.of("lastPollResult", element("lastPollResult", "true"))));
+        when(authentication.getLoggedInIndicator("1"))
+                .thenReturn(element("logged_in_regex", scenario.equals("missing-indicator") ? "" : "Signed in as scan-user"));
+
+        AuthenticationDiagnostics diagnostics = contextAccess.testUserAuthentication(
+                "1", "7", "https://shop.example.com/account");
+
+        assertThat(diagnostics.likelyAuthenticated()).isNull();
+        assertThat(diagnostics.authResponse()).isEqualTo("verifiedAuthenticated=null");
+    }
+
+    @Test
+    void contextAdapterRecognizesConfiguredLoginIndicatorInResponseHeaders() throws Exception {
+        stubVerificationContext();
+        when(users.authenticateAsUser("1", "7")).thenReturn(element("Result", "OK"));
+        when(users.pollAsUser("1", "7")).thenReturn(set("poll", Map.of(
+                "pollSuccessful", element("pollSuccessful", "true"),
+                "responseHeader", element("responseHeader", "HTTP/1.1 200 OK\r\nX-User: scan-user\r\n"))));
+        when(users.getAuthenticationState("1", "7")).thenReturn(set("state", Map.of()));
+        when(authentication.getLoggedInIndicator("1"))
+                .thenReturn(element("logged_in_regex", "(?im)^x-user: scan-user$"));
+
+        AuthenticationDiagnostics diagnostics = contextAccess.testUserAuthentication(
+                "1", "7", "https://shop.example.com/account");
+
+        assertThat(diagnostics.likelyAuthenticated()).isTrue();
+    }
+
+    @Test
+    void contextAdapterRejectsVerificationWhenContextIdCannotBeResolved() throws Exception {
+        when(context.contextList()).thenReturn(new ApiResponseList("contextList"));
+
+        assertThatThrownBy(() -> contextAccess.testUserAuthentication("1", "7", "https://shop.example.com/account"))
+                .isInstanceOf(ZapApiException.class).hasCauseInstanceOf(ClientApiException.class);
+
+        verifyNoInteractions(users);
+    }
+
+    private void stubVerificationContext() throws Exception {
+        when(context.contextList()).thenReturn(new ApiResponseList("contextList", List.of(
+                element("context", "other-context"), element("context", "shop-browser-auth"))));
+        when(context.context("other-context")).thenReturn(set("context", Map.of("id", element("id", "2"))));
+        when(context.context("shop-browser-auth")).thenReturn(set("context", Map.of("id", element("id", "1"))));
+    }
+
+    @Test
+    void passiveScanAdapterParsesBacklogSnapshot() throws Exception {
+        when(pscan.recordsToScan()).thenReturn(element("recordsToScan", "4"));
+        when(pscan.scanOnlyInScope()).thenReturn(element("scanOnlyInScope", "true"));
+        when(pscan.currentTasks()).thenReturn(new ApiResponseList("tasks", List.of(
+                element("task", "task-1"),
+                element("task", "task-2")
+        )));
+
+        EnginePassiveScanAccess.PassiveScanSnapshot snapshot = passiveScanAccess.loadPassiveScanSnapshot();
+
+        assertThat(snapshot.recordsToScan()).isEqualTo(4);
+        assertThat(snapshot.activeTasks()).isEqualTo(2);
+        assertThat(snapshot.scanOnlyInScope()).isTrue();
+        assertThat(snapshot.completed()).isFalse();
+    }
+
+    @Test
+    void ajaxSpiderAdapterStartsAndReadsBrowserSpiderStatus() throws Exception {
+        when(ajaxSpider.optionMaxDuration()).thenReturn(element("optionMaxDuration", "5"));
+        when(ajaxSpider.scan("http://target", "false", "", "")).thenReturn(element("Result", "OK"));
+        when(ajaxSpider.status()).thenReturn(element("status", "running"));
+        when(ajaxSpider.numberOfResults()).thenReturn(element("numberOfResults", "12"));
+
+        String scanId = ajaxSpiderExecution.startAjaxSpider(new EngineAjaxSpiderExecution.AjaxSpiderScanRequest("http://target"));
+        EngineAjaxSpiderExecution.AjaxSpiderStatus status = ajaxSpiderExecution.readAjaxSpiderStatus();
+
+        assertThat(scanId).startsWith("ajax-spider:");
+        assertThat(status.running()).isTrue();
+        assertThat(status.discoveredCount()).isEqualTo("12");
+        verify(core).accessUrl("http://target", "true");
+        verify(ajaxSpider).scan("http://target", "false", "", "");
+    }
+
+    @Test
+    void ajaxSpiderAdapterMapsExplicitBusyLaunchRejections() throws Exception {
+        when(ajaxSpider.optionMaxDuration()).thenReturn(element("optionMaxDuration", "5"));
+        ClientApiException failure = new ClientApiException("Scan In Progress", "scan_in_progress", null);
+        when(ajaxSpider.scan("http://target", "false", "", "")).thenThrow(failure);
+
+        assertThatThrownBy(() -> ajaxSpiderExecution.startAjaxSpider(
+                new EngineAjaxSpiderExecution.AjaxSpiderScanRequest("http://target")))
+                .isExactlyInstanceOf(EngineBusyException.class).hasCause(failure);
+    }
+
+    @Test
+    void ajaxSpiderAdapterPreservesOtherLaunchFailuresEvenWithBusyMessage() throws Exception {
+        when(ajaxSpider.optionMaxDuration()).thenReturn(element("optionMaxDuration", "5"));
+        ClientApiException internalError = new ClientApiException("Scan In Progress", "internal_error", null);
+        ClientApiException messageOnly = new ClientApiException("scan_in_progress");
+        when(ajaxSpider.scan("http://target", "false", "", "")).thenThrow(internalError, messageOnly);
+
+        assertThatThrownBy(() -> ajaxSpiderExecution.startAjaxSpider(
+                new EngineAjaxSpiderExecution.AjaxSpiderScanRequest("http://target")))
+                .isExactlyInstanceOf(ZapApiException.class).hasCause(internalError);
+        assertThatThrownBy(() -> ajaxSpiderExecution.startAjaxSpider(
+                new EngineAjaxSpiderExecution.AjaxSpiderScanRequest("http://target")))
+                .isExactlyInstanceOf(ZapApiException.class).hasCause(messageOnly);
+    }
+
+    @Test
+    void ajaxSpiderAdapterDoesNotClassifyReadStopOrAvailabilityFailuresAsBusyLaunchRejections() throws Exception {
+        ClientApiException failure = new ClientApiException("Scan In Progress", "scan_in_progress", null);
+        when(ajaxSpider.status()).thenThrow(failure);
+        when(ajaxSpider.stop()).thenThrow(failure);
+        when(ajaxSpider.optionMaxDuration()).thenThrow(failure);
+
+        assertThatThrownBy(() -> ajaxSpiderExecution.readAjaxSpiderStatus())
+                .isExactlyInstanceOf(ZapApiException.class).hasCause(failure);
+        assertThatThrownBy(() -> ajaxSpiderExecution.stopAjaxSpider())
+                .isExactlyInstanceOf(ZapApiException.class).hasCause(failure);
+        assertThatThrownBy(() -> ajaxSpiderExecution.startAjaxSpider(
+                new EngineAjaxSpiderExecution.AjaxSpiderScanRequest("http://target")))
+                .isExactlyInstanceOf(ZapApiException.class).hasCause(failure);
+    }
+
+    @Test
+    void inventoryAdapterParsesCoreAlertsAndSites() throws Exception {
+        when(core.alerts("http://target", "0", "-1")).thenReturn(new ApiResponseList("alerts", List.of(
+                set("alert", Map.of(
+                        "alert", element("alert", "Missing Header"),
+                        "risk", element("risk", "Low"),
+                        "url", element("url", "http://target/")
+                ))
+        )));
+        when(core.hosts()).thenReturn(new ApiResponseList("hosts", List.of(element("host", "target"))));
+        when(core.sites()).thenReturn(new ApiResponseList("sites", List.of(element("site", "http://target/"))));
+        when(core.urls("http://target")).thenReturn(new ApiResponseList("urls", List.of(element("url", "http://target/a"))));
+
+        assertThat(inventoryAccess.loadAlertSummaries("http://target").getFirst().name()).isEqualTo("Missing Header");
+        assertThat(inventoryAccess.listHosts()).containsExactly("target");
+        assertThat(inventoryAccess.listSites()).containsExactly("http://target/");
+        assertThat(inventoryAccess.listUrls("http://target")).containsExactly("http://target/a");
+    }
+
+    @Test
+    void runtimeAdapterReadsVersionAndAppliesNetworkDefaults() throws Exception {
+        when(core.version()).thenReturn(element("version", "2.17.0"));
+        when(network.getDefaultUserAgent()).thenReturn(element("defaultUserAgent", "ZAP"));
+        when(network.getConnectionTimeout()).thenReturn(element("connectionTimeout", "20"));
+        when(network.getDnsTtlSuccessfulQueries()).thenReturn(element("dnsTtlSuccessfulQueries", "0"));
+
+        String version = runtimeAccess.readVersion();
+        runtimeAccess.applyNetworkDefaults(new NetworkDefaults("MCP ZAP Server", 30, 60));
+
+        assertThat(version).isEqualTo("2.17.0");
+        verify(network).setDefaultUserAgent("MCP ZAP Server");
+        verify(network).setConnectionTimeout("30");
+        verify(network).setDnsTtlSuccessfulQueries("60");
+    }
+
+    @Test
+    void runtimeInventoryMapsOnlyMeasuredIdentityAndSortsInstalledAddOns() throws Exception {
+        when(core.version()).thenReturn(element("version", "2.17.0"));
+        when(autoupdate.installedAddons()).thenReturn(new ApiResponseList("installedAddons", List.of(
+                set("addon", Map.of(
+                        "id", element("id", "pscanrules"),
+                        "version", element("version", "76"),
+                        "status", element("status", "release"),
+                        "file", element("file", "/private/addons/pscanrules.zap"),
+                        "url", element("url", "https://user:secret@example.invalid/addon")
+                )),
+                addOn("automation", "0.61.0", "beta")
+        )));
+
+        var inventory = runtimeAccess.readScannerInventory();
+
+        assertThat(inventory.zapVersion()).isEqualTo("2.17.0");
+        assertThat(inventory.addOns()).containsExactly(
+                new AddOn("automation", "0.61.0", "beta"),
+                new AddOn("pscanrules", "76", "release")
+        );
+        assertThat(inventory.inventoryComplete()).isTrue();
+        verify(core).version();
+        verify(autoupdate).installedAddons();
+        verifyNoMoreInteractions(core, autoupdate);
+        verifyNoInteractions(network);
+    }
+
+    @Test
+    void runtimeInventoryRejectsMalformedAndAmbiguousAddOnIdentities() throws Exception {
+        when(core.version()).thenReturn(element("version", "2.17.0"));
+        when(autoupdate.installedAddons()).thenReturn(new ApiResponseList("installedAddons", List.of(
+                addOn("pscanrules", "75", "release"),
+                addOn("pscanrules", "76", "release"),
+                addOn("pscanrules", "77", "release"),
+                set("addon", Map.of("id", element("id", "missing-version"))),
+                set("addon", Map.of(
+                        "id", element("id", "nested-version"),
+                        "version", new ApiResponseList("version"),
+                        "status", element("status", "release")
+                )),
+                addOn("private-version", "https://user:secret@example.invalid", "release"),
+                addOn("invalid-status", "1", "unexpected"),
+                element("error", "private failure details"),
+                addOn("automation", "0.61.0", "beta")
+        )));
+
+        var inventory = runtimeAccess.readScannerInventory();
+
+        assertThat(inventory.zapVersion()).isEqualTo("2.17.0");
+        assertThat(inventory.addOns()).containsExactly(new AddOn("automation", "0.61.0", "beta"));
+        assertThat(inventory.inventoryComplete()).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"version", "addons"})
+    void runtimeInventoryAcquisitionFailuresRetainOnlyAvailableIdentity(String failedRead) throws Exception {
+        if (failedRead.equals("version")) {
+            when(core.version()).thenThrow(new ClientApiException("https://user:secret@example.invalid"));
+            when(autoupdate.installedAddons()).thenReturn(new ApiResponseList("installedAddons",
+                    List.of(addOn("automation", "0.61.0", "beta"))));
+        } else {
+            when(core.version()).thenReturn(element("version", "2.17.0"));
+            when(autoupdate.installedAddons()).thenThrow(new ClientApiException("https://user:secret@example.invalid"));
+        }
+
+        var inventory = runtimeAccess.readScannerInventory();
+
+        assertThat(inventory.inventoryComplete()).isFalse();
+        if (failedRead.equals("version")) {
+            assertThat(inventory.zapVersion()).isNull();
+            assertThat(inventory.addOns()).containsExactly(new AddOn("automation", "0.61.0", "beta"));
+        } else {
+            assertThat(inventory.zapVersion()).isEqualTo("2.17.0");
+            assertThat(inventory.addOns()).isEmpty();
+        }
+    }
+
+    @Test
+    void runtimeInventoryMalformedResponsesCannotClaimCompleteInventory() throws Exception {
+        when(core.version()).thenReturn(element("version", "https://user:secret@example.invalid"));
+        when(autoupdate.installedAddons()).thenReturn(element("error", "private failure details"));
+
+        assertThat(runtimeAccess.readScannerInventory()).isEqualTo(ScannerInventory.unknown());
+    }
+
+    @Test
+    void scannerInventoryCanonicalizesBaselineRecordsAndOwnsItsImmutableList() {
+        var records = new ArrayList<>(List.of(
+                new AddOn(" pscanrules ", " 76 ", " release "),
+                new AddOn("automation", "0.61.0", "beta"),
+                new AddOn("private-addon", "https://user:secret@example.invalid", "release")
+        ));
+        records.add(null);
+
+        var inventory = new ScannerInventory(" 2.17.0 ", records, true);
+        records.clear();
+
+        assertThat(inventory.zapVersion()).isEqualTo("2.17.0");
+        assertThat(inventory.addOns()).containsExactly(
+                new AddOn("automation", "0.61.0", "beta"), new AddOn("pscanrules", "76", "release"));
+        assertThat(inventory.inventoryComplete()).isFalse();
+        assertThatThrownBy(() -> inventory.addOns().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThat(new ScannerInventory("2.17.0", null, true)).isEqualTo(new ScannerInventory("2.17.0", List.of(), false));
+        assertThat(new ScannerInventory("2.17.0", List.of(), false).inventoryComplete()).isFalse();
+    }
+
+    @Test
+    void runtimeInventoryBoundsOversizedApiResponsesAndMarksThemIncomplete() throws Exception {
+        List<ApiResponse> addOns = IntStream.rangeClosed(0, ScannerInventory.MAX_ADD_ONS)
+                .mapToObj(index -> (ApiResponse) addOn("addon-" + index, "1", "release"))
+                .toList();
+        when(core.version()).thenReturn(element("version", "2.17.0"));
+        when(autoupdate.installedAddons()).thenReturn(new ApiResponseList("installedAddons", addOns));
+
+        var inventory = runtimeAccess.readScannerInventory();
+
+        assertThat(inventory.addOns()).hasSize(ScannerInventory.MAX_ADD_ONS);
+        assertThat(inventory.inventoryComplete()).isFalse();
+    }
+
+    private ApiResponseSet addOn(String id, String version, String status) {
+        return set("addon", Map.of(
+                "id", element("id", id),
+                "version", element("version", version),
+                "status", element("status", status)
+        ));
+    }
+
+    private ApiResponseSet alert(String id,
+                                 String pluginId,
+                                 String name,
+                                 String risk,
+                                 String confidence,
+                                 String url) {
+        return set("alert", Map.ofEntries(
+                Map.entry("id", element("id", id)),
+                Map.entry("pluginId", element("pluginId", pluginId)),
+                Map.entry("name", element("name", name)),
+                Map.entry("description", element("description", name + " description")),
+                Map.entry("risk", element("risk", risk)),
+                Map.entry("confidence", element("confidence", confidence)),
+                Map.entry("url", element("url", url)),
+                Map.entry("param", element("param", "id")),
+                Map.entry("attack", element("attack", "attack payload")),
+                Map.entry("evidence", element("evidence", "evidence sample")),
+                Map.entry("reference", element("reference", "https://example.com/reference")),
+                Map.entry("solution", element("solution", "Apply a fix")),
+                Map.entry("messageId", element("messageId", "101")),
+                Map.entry("cweid", element("cweid", "89")),
+                Map.entry("wascid", element("wascid", "19"))
+        ));
+    }
+
+    private ApiResponseElement element(String name, String value) {
+        return new ApiResponseElement(name, value);
+    }
+
+    private ApiResponseSet set(String name, Map<String, ApiResponse> values) {
+        return new ApiResponseSet(name, new LinkedHashMap<>(values));
+    }
+}

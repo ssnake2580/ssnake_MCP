@@ -1,0 +1,9 @@
+[project]
+name = "sqlmap-mcp"
+version = "0.1.0"
+description = "SQLMap MCP Server using FastMCP for automated SQL injection testing"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastmcp>=0.1.0",
+]

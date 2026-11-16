@@ -1,0 +1,101 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/c0tton-fluff/caido-mcp-server/v4/internal/auth"
+	caido "github.com/caido-community/sdk-go"
+	"github.com/spf13/cobra"
+)
+
+func loadToken(caidoURL string) (*auth.StoredToken, error) {
+	store, err := auth.NewTokenStore(caidoURL)
+	if err != nil {
+		return nil, err
+	}
+	token, err := store.Load()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"no token found for %s - run "+
+				"'caido-mcp-server login --url %s' first: %w",
+			store.ServerURL(), caidoURL, err,
+		)
+	}
+	if token == nil {
+		return nil, fmt.Errorf(
+			"no token found for %s - run "+
+				"'caido-mcp-server login --url %s' first",
+			store.ServerURL(), caidoURL,
+		)
+	}
+	return token, nil
+}
+
+func getCaidoURL(cmd *cobra.Command) (string, error) {
+	u, _ := cmd.Flags().GetString("url")
+	if u == "" {
+		u = os.Getenv("CAIDO_URL")
+	}
+	if u == "" {
+		return "", fmt.Errorf(
+			"caido URL required: set --url or CAIDO_URL env",
+		)
+	}
+	return u, nil
+}
+
+func newClient(cmd *cobra.Command) (*caido.Client, error) {
+	url, err := getCaidoURL(cmd)
+	if err != nil {
+		return nil, err
+	}
+	tok, err := loadToken(url)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := caido.NewClient(caido.Options{URL: url})
+	if err != nil {
+		return nil, fmt.Errorf("client init: %w", err)
+	}
+	client.SetAccessToken(tok.AccessToken)
+
+	tokenStore, err := auth.NewTokenStore(url)
+	if err != nil {
+		return nil, fmt.Errorf("token store: %w", err)
+	}
+
+	client.SetTokenRefresher(func(ctx context.Context) (string, error) {
+		t, err := tokenStore.Load()
+		if err != nil || t == nil {
+			return "", nil
+		}
+		if time.Now().Add(5 * time.Minute).Before(t.ExpiresAt) {
+			return t.AccessToken, nil
+		}
+		if t.RefreshToken == "" {
+			return "", fmt.Errorf("token expired, no refresh token")
+		}
+		// Use a bare client without a token refresher to avoid
+		// infinite recursion: the main client's authTransport
+		// calls this closure, so RefreshAndSave must not go
+		// through the same transport.
+		bareClient, err := caido.NewClient(caido.Options{URL: url})
+		if err != nil {
+			return "", fmt.Errorf("refresh client: %w", err)
+		}
+		bareClient.SetAccessToken(t.AccessToken)
+		stored, err := auth.RefreshAndSave(
+			ctx, bareClient, tokenStore, t.RefreshToken,
+		)
+		if err != nil {
+			return "", err
+		}
+		return stored.AccessToken, nil
+	})
+
+	return client, nil
+}

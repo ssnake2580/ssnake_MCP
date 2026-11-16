@@ -1,0 +1,388 @@
+package tools
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/c0tton-fluff/caido-mcp-server/v4/internal/httputil"
+	"github.com/c0tton-fluff/caido-mcp-server/v4/internal/replay"
+	caido "github.com/caido-community/sdk-go"
+	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// SendRequestInput is the input for the send_request tool
+type SendRequestInput struct {
+	Raw          string `json:"raw,omitempty" jsonschema:"Raw HTTP request including headers and body (one of raw or curl is required)"`
+	Curl         string `json:"curl,omitempty" jsonschema:"A curl command (e.g. browser Copy as cURL bash) to send instead of raw; host/port/tls come from its URL unless set"`
+	Host         string `json:"host,omitempty" jsonschema:"Target host (overrides Host header)"`
+	Port         int    `json:"port,omitempty" jsonschema:"Target port (default based on TLS)"`
+	TLS          *bool  `json:"tls,omitempty" jsonschema:"Use HTTPS (default true)"`
+	SessionID    string `json:"sessionId,omitempty" jsonschema:"Replay session ID (optional). Omit with collectionId/name to file the request as a new session."`
+	CollectionID string `json:"collectionId,omitempty" jsonschema:"Create a new replay session for this request inside this collection (from create_replay_collection or list_replay_collections). Cannot be combined with sessionId."`
+	Name         string `json:"name,omitempty" jsonschema:"Title for the new replay session created for this request (e.g. IDOR - read other user invoice). Cannot be combined with sessionId."`
+	BodyLimit    int    `json:"bodyLimit,omitempty" jsonschema:"Response body byte limit (default 2000)"`
+	BodyOffset   int    `json:"bodyOffset,omitempty" jsonschema:"Response body byte offset (default 0)"`
+	UseCookieJar *bool  `json:"useCookieJar,omitempty" jsonschema:"Auto-inject session cookies and persist Set-Cookie (default true). Set false to disable for this call only."`
+	IncludeBody  *bool  `json:"includeBody,omitempty" jsonschema:"Include response body text in output (default true). The response fingerprint (title, redirect target, cookie names, word count, notable headers) is always populated regardless of this setting."`
+	Marker       string `json:"marker,omitempty" jsonschema:"Optional string to search for in the response body; when set, output.reflected reports whether it was found"`
+}
+
+// SendRequestOutput is the output of the send_request tool
+type SendRequestOutput struct {
+	RequestID   string                  `json:"requestId,omitempty"`
+	EntryID     string                  `json:"entryId,omitempty"`
+	SessionID   string                  `json:"sessionId"`
+	StatusCode  int                     `json:"statusCode,omitempty"`
+	RoundtripMs int                     `json:"roundtripMs,omitempty"`
+	Request     *httputil.ParsedMessage `json:"request,omitempty"`
+	Response    *httputil.ParsedMessage `json:"response,omitempty"`
+	Diff        *httputil.DiffResult    `json:"diff,omitempty"`
+	CookieJar   *CookieJarStatus        `json:"cookieJar,omitempty"`
+	Reflected   *bool                   `json:"reflected,omitempty"`
+	Error       string                  `json:"error,omitempty"`
+}
+
+// CookieJarStatus reports cookie-jar activity for a single send.
+type CookieJarStatus struct {
+	Enabled         bool     `json:"enabled"`
+	InjectedCookies []string `json:"injectedCookies,omitempty"`
+	StoredCookies   []string `json:"storedCookies,omitempty"`
+	Skipped         string   `json:"skipped,omitempty"`
+}
+
+// cookiesToNames extracts the Name field from each cookie for output.
+// nil cookies and unnamed entries are skipped.
+func cookiesToNames(cookies []*http.Cookie) []string {
+	names := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		if c != nil && c.Name != "" {
+			names = append(names, c.Name)
+		}
+	}
+	return names
+}
+
+// carryOverSession moves per-session state (cookie jar, response-diff
+// digest) to the replacement when Send's fallback replaced oldID, so an
+// authenticated jar and the diff baseline survive. The old entries are
+// dropped only when Send deleted the old session; a kept (busy) session
+// still owns them.
+func carryOverSession(oldID string, res *replay.SendResult) {
+	if oldID == "" || res.SessionID == oldID {
+		return
+	}
+	replay.DefaultCookieStore().Copy(oldID, res.SessionID)
+	httputil.GlobalResponseCache().Copy(oldID, res.SessionID)
+	if res.DeletedOriginal {
+		replay.DefaultCookieStore().Clear(oldID)
+		httputil.GlobalResponseCache().Clear(oldID)
+	}
+}
+
+// curlToRaw translates input.Curl into input.Raw, filling host, port and
+// TLS from the curl URL where the caller did not set them.
+func curlToRaw(input *SendRequestInput) error {
+	if input.Curl == "" {
+		return nil
+	}
+	if input.Raw != "" {
+		return fmt.Errorf("pass either raw or curl, not both")
+	}
+	if err := checkRawSize("curl", input.Curl); err != nil {
+		return err
+	}
+	parsed, err := httputil.ParseCurl(input.Curl)
+	if err != nil {
+		return fmt.Errorf("curl: %w", err)
+	}
+	input.Raw = parsed.Raw
+	if input.Host == "" {
+		input.Host = parsed.Host
+		if input.Port == 0 {
+			input.Port = parsed.Port
+		}
+	}
+	if input.TLS == nil {
+		input.TLS = &parsed.TLS
+	}
+	return nil
+}
+
+// sendRequestHandler creates the handler function
+func sendRequestHandler(
+	client *caido.Client,
+) func(context.Context, *mcp.CallToolRequest, SendRequestInput) (*mcp.CallToolResult, SendRequestOutput, error) {
+	return func(
+		ctx context.Context,
+		req *mcp.CallToolRequest,
+		input SendRequestInput,
+	) (*mcp.CallToolResult, SendRequestOutput, error) {
+		if err := curlToRaw(&input); err != nil {
+			return nil, SendRequestOutput{}, err
+		}
+		if input.Raw == "" {
+			return nil, SendRequestOutput{}, fmt.Errorf(
+				"raw HTTP request (or curl) is required",
+			)
+		}
+		if err := checkRawSize("raw", input.Raw); err != nil {
+			return nil, SendRequestOutput{}, err
+		}
+
+		raw := httputil.NormalizeCRLF(input.Raw)
+
+		// Determine host
+		host := input.Host
+		if host == "" {
+			host = httputil.ParseHostHeader(input.Raw)
+		}
+		if host == "" {
+			return nil, SendRequestOutput{}, fmt.Errorf(
+				"host is required (provide in input or Host header)",
+			)
+		}
+
+		// Parse host:port
+		if h, p, err := net.SplitHostPort(host); err == nil {
+			host = h
+			if input.Port == 0 {
+				if port, pErr := strconv.Atoi(p); pErr == nil {
+					input.Port = port
+				}
+			}
+		}
+
+		// Determine TLS and port
+		useTLS := true
+		if input.TLS != nil {
+			useTLS = *input.TLS
+		}
+		port := input.Port
+		if port == 0 {
+			port = httputil.DefaultPort(useTLS)
+		}
+
+		// collectionId/name file the request as its own new session, so
+		// they are meaningless against an existing one.
+		newSession := input.CollectionID != "" || input.Name != ""
+		if newSession && input.SessionID != "" {
+			return nil, SendRequestOutput{}, fmt.Errorf(
+				"collectionId/name create a new session and cannot be combined with sessionId; " +
+					"use caido_move_replay_session to refile an existing one",
+			)
+		}
+
+		// A new session starts with an empty cookie jar, so there is
+		// nothing to resolve or inject until the send assigns its ID.
+		var sessionID string
+		if !newSession {
+			var err error
+			sessionID, err = replay.GetOrCreateSession(
+				ctx, client, input.SessionID,
+			)
+			if err != nil {
+				return nil, SendRequestOutput{}, err
+			}
+		}
+
+		// Cookie jar (RFC 6265): inject session cookies into raw when
+		// the user did not already set a Cookie header. Default ON.
+		useJar := true
+		if input.UseCookieJar != nil {
+			useJar = *input.UseCookieJar
+		}
+		jarStatus := &CookieJarStatus{Enabled: useJar}
+		reqURL := httputil.RequestURL(host, port, useTLS, raw)
+
+		if useJar && httputil.HasHeader(raw, "Cookie") {
+			jarStatus.Skipped = "explicit Cookie header preserved"
+		} else if useJar && newSession {
+			jarStatus.Skipped = "new session (empty jar)"
+		}
+		if useJar && !newSession {
+			if !httputil.HasHeader(raw, "Cookie") {
+				cookies := replay.DefaultCookieStore().Cookies(sessionID, reqURL)
+				if len(cookies) > 0 {
+					raw = httputil.InjectHeader(
+						raw, "Cookie", httputil.BuildCookieHeader(cookies),
+					)
+					jarStatus.InjectedCookies = cookiesToNames(cookies)
+				}
+			}
+		}
+
+		// Send via the 0.57 draft-then-start flow. When the default
+		// session was used, allow Send to replace the cached session on a
+		// busy/empty-session fallback.
+		conn := caido.ReplayConnection{Host: host, Port: port, IsTLS: useTLS}
+		var sendRes *replay.SendResult
+		var err error
+		if newSession {
+			sendRes, err = replay.SendNew(
+				ctx, client, raw, conn, input.CollectionID, input.Name,
+			)
+		} else {
+			sendRes, err = replay.Send(
+				ctx, client, sessionID, raw, conn, input.SessionID == "",
+			)
+		}
+		if err != nil {
+			return nil, SendRequestOutput{}, fmt.Errorf(
+				"failed to send request: %w", err,
+			)
+		}
+		carryOverSession(sessionID, sendRes)
+		sessionID = sendRes.SessionID
+
+		output := SendRequestOutput{
+			SessionID: sessionID,
+			CookieJar: jarStatus,
+		}
+
+		entry, pollErr := replay.PollForEntry(
+			ctx, client, sessionID, sendRes.PreviousEntryID,
+		)
+		if pollErr != nil {
+			output.Error = fmt.Sprintf(
+				"poll failed: %v (use get_replay_entry to retry)",
+				pollErr,
+			)
+			sess, sErr := client.Replay.GetSession(ctx, sessionID)
+			if sErr == nil && sess != nil && sess.ActiveEntryID != "" {
+				output.EntryID = sess.ActiveEntryID
+			}
+			return nil, output, nil
+		}
+
+		output.EntryID = entry.ID
+
+		if entry.Request != nil {
+			output.RequestID = entry.Request.ID
+			output.Request = httputil.ParseBase64(
+				entry.Request.Raw, true, false, 0, 0,
+			)
+			if entry.Request.Response != nil {
+				resp := entry.Request.Response
+				output.StatusCode = resp.StatusCode
+				output.RoundtripMs = resp.RoundtripTime
+
+				bodyLimit := input.BodyLimit
+				if bodyLimit == 0 {
+					headersOnly := httputil.ParseBase64(resp.Raw, true, false, 0, 0)
+					if headersOnly != nil && headersOnly.Fingerprint != nil {
+						bodyLimit = httputil.AdaptiveBodyLimit(*headersOnly.Fingerprint, 0)
+					} else {
+						bodyLimit = httputil.DefaultBodyLimit
+					}
+				}
+
+				output.Response = httputil.ParseBase64(
+					resp.Raw, true, true,
+					input.BodyOffset, bodyLimit,
+				)
+
+				// Decode the raw (undecoded, unredacted) response once.
+				// Set-Cookie header VALUES are replaced with "[REDACTED]"
+				// by ParseRaw's default sensitive-header handling, so the
+				// parsed output.Response.Headers cannot yield real cookie
+				// names; ExtractRawSetCookies works directly against the
+				// raw bytes instead, same as the existing jar logic below.
+				rawDecoded, rawDecodeErr := base64.StdEncoding.DecodeString(resp.Raw)
+				var setCookies []*http.Cookie
+				if rawDecodeErr == nil {
+					setCookies = httputil.ExtractRawSetCookies(rawDecoded)
+				}
+
+				// Enrich the fingerprint with response-only details
+				// (status code, title, redirect target, cookie names,
+				// word count) and check the reflection marker, before
+				// the dedup/includeBody logic below may clear the body.
+				if output.Response != nil {
+					if output.Response.Fingerprint != nil {
+						httputil.PopulateResponseDetails(
+							output.Response.Fingerprint, resp.StatusCode,
+							output.Response.Headers, []byte(output.Response.Body),
+						)
+						output.Response.Fingerprint.SetCookies = cookiesToNames(setCookies)
+					}
+					if input.Marker != "" {
+						reflected := strings.Contains(output.Response.Body, input.Marker)
+						output.Reflected = &reflected
+					}
+				}
+
+				// Diff against previous response in same session.
+				if output.Response != nil {
+					digest := httputil.ResponseDigest{
+						StatusCode: resp.StatusCode,
+						BodyHash:   httputil.HashBody([]byte(output.Response.Body)),
+						BodySize:   output.Response.BodySize,
+					}
+					diff := httputil.GlobalResponseCache().GetAndSet(sessionID, digest)
+					if diff != nil {
+						output.Diff = diff
+						if diff.Same {
+							// The digest hashes status + body only, so "Same"
+							// proves the BODY repeated, not the headers. Clear
+							// the (large) body to save context, but keep headers
+							// -- a header can appear or change on a byte-identical
+							// body (X-Flag, rate-limit counters, tokens) and is
+							// exactly the signal a body-only dedup must not hide.
+							output.Response.Body = ""
+						}
+					}
+				}
+
+				// Omit body text when the caller opts out. Default true
+				// preserves existing behavior; the fingerprint (already
+				// populated above) stays either way.
+				includeBody := true
+				if input.IncludeBody != nil {
+					includeBody = *input.IncludeBody
+				}
+				if output.Response != nil && !includeBody {
+					output.Response.Body = ""
+					output.Response.Truncated = false
+				}
+
+				// Persist Set-Cookie back into the session jar.
+				if useJar && len(setCookies) > 0 {
+					storeErr := replay.DefaultCookieStore().SetCookies(
+						sessionID, reqURL, setCookies,
+					)
+					if storeErr == nil {
+						jarStatus.StoredCookies = cookiesToNames(setCookies)
+					}
+				}
+			}
+		}
+
+		return nil, output, nil
+	}
+}
+
+// RegisterSendRequestTool registers the tool with the MCP server
+func RegisterSendRequestTool(
+	server *mcp.Server, client *caido.Client,
+) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "caido_send_request",
+		Title:       "Send HTTP Request",
+		Description: `Send an HTTP request; returns statusCode, headers, body, and a response fingerprint (title, redirect, cookie names, word count, notableHeaders). Polls up to 10s; on timeout returns entryId for get_replay_entry. Without sessionId, requests reuse one unnamed default session. To file a request as its own titled session inside a collection, pass collectionId and/or name instead of sessionId; reuse the returned sessionId for follow-ups. Session cookies auto-persist across calls with the same sessionId (useCookieJar:false to disable). includeBody:false omits body text; marker checks response body for reflection. See README "Response fingerprinting" for field details.`,
+		InputSchema: schemaFor[SendRequestInput](func(s *jsonschema.Schema) {
+			if p := prop(s, "raw"); p != nil {
+				p.MaxLength = intPtr(maxRawRequestBytes)
+			}
+			if p := prop(s, "curl"); p != nil {
+				p.MaxLength = intPtr(maxRawRequestBytes)
+			}
+		}),
+		Annotations: writeAnn(false, false, true),
+	}, sendRequestHandler(client))
+}

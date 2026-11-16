@@ -1,0 +1,778 @@
+package mcp.server.zap.core.service.policy;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import java.net.URI;
+import java.time.Clock;
+import java.time.DayOfWeek;
+import java.time.Instant;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import mcp.gateway.core.policybundle.PolicyBundleDecision;
+import mcp.gateway.core.policybundle.PolicyBundleEvaluationRequest;
+import mcp.gateway.core.policybundle.PolicyBundleEvaluationResult;
+import mcp.gateway.core.policybundle.PolicyBundleEvaluator;
+import mcp.gateway.core.policybundle.PolicyBundleMatch;
+import mcp.gateway.core.policybundle.PolicyBundleRule;
+import mcp.gateway.core.policybundle.PolicyBundleRuleEvaluation;
+import mcp.gateway.core.policybundle.PolicyBundleRuleset;
+import mcp.gateway.core.policybundle.PolicyBundleTimeWindow;
+import mcp.server.zap.core.service.authz.ToolScopeRegistry;
+import mcp.server.zap.extension.api.policy.PolicyBundleAccessBoundary;
+import mcp.server.zap.extension.api.policy.PolicyBundlePreviewer;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+/**
+ * Validates and dry-runs Policy Bundle v1 documents without enforcing them.
+ */
+@Service
+public class PolicyDryRunService implements PolicyBundlePreviewer {
+    public static final String DRY_RUN_CONTRACT_VERSION = "mcp.zap.policy.dry-run/v1";
+
+    private static final Set<String> RULE_DECISIONS = Set.of("allow", "deny");
+    private static final Set<String> DAY_NAMES = Set.of("mon", "tue", "wed", "thu", "fri", "sat", "sun");
+    private static final Set<String> TOP_LEVEL_KEYS = Set.of("apiVersion", "kind", "metadata", "spec");
+    private static final Set<String> METADATA_KEYS = Set.of("name", "displayName", "description", "owner", "labels");
+    private static final Set<String> SPEC_KEYS = Set.of("defaultDecision", "evaluationOrder", "timezone", "rules");
+    private static final Set<String> RULE_KEYS = Set.of("id", "description", "decision", "reason", "enabled", "match");
+    private static final Set<String> MATCH_KEYS = Set.of("tools", "hosts", "timeWindows");
+    private static final Set<String> WINDOW_KEYS = Set.of("days", "start", "end");
+
+    private final ObjectMapper objectMapper;
+    private final Set<String> knownActionNames;
+    private final Clock clock;
+    private PolicyBundleAccessBoundary policyBundleAccessBoundary;
+
+    @Autowired
+    public PolicyDryRunService(ObjectProvider<ObjectMapper> objectMapperProvider,
+                               ToolScopeRegistry toolScopeRegistry) {
+        this.objectMapper = objectMapperProvider.getIfAvailable(ObjectMapper::new);
+        this.knownActionNames = new LinkedHashSet<>(toolScopeRegistry.getRequiredScopesByTool().keySet());
+        this.knownActionNames.add(ToolScopeRegistry.TOOLS_LIST_ACTION);
+        this.clock = Clock.systemUTC();
+    }
+
+    public PolicyDryRunService(ObjectMapper objectMapper, ToolScopeRegistry toolScopeRegistry) {
+        this(objectMapper, toolScopeRegistry, Clock.systemUTC());
+    }
+
+    public PolicyDryRunService(ObjectMapper objectMapper,
+                               ToolScopeRegistry toolScopeRegistry,
+                               Clock clock) {
+        this.objectMapper = objectMapper;
+        this.knownActionNames = new LinkedHashSet<>(toolScopeRegistry.getRequiredScopesByTool().keySet());
+        this.knownActionNames.add(ToolScopeRegistry.TOOLS_LIST_ACTION);
+        this.clock = clock == null ? Clock.systemUTC() : clock;
+    }
+
+    @Autowired(required = false)
+    void setPolicyBundleAccessBoundary(PolicyBundleAccessBoundary policyBundleAccessBoundary) {
+        this.policyBundleAccessBoundary = policyBundleAccessBoundary;
+    }
+
+    @Override
+    public Map<String, Object> preview(String policyBundle,
+                                       String toolName,
+                                       String target,
+                                       String evaluatedAt) {
+        List<String> validationErrors = new ArrayList<>();
+        String normalizedTool = normalizeToolName(toolName, validationErrors);
+        NormalizedTarget normalizedTarget = normalizeTarget(target, validationErrors);
+        Instant evaluationInstant = parseEvaluationInstant(evaluatedAt, validationErrors);
+        ParseOutcome parseOutcome = parseBundle(policyBundle);
+        validationErrors.addAll(parseOutcome.errors());
+        if (parseOutcome.bundle() != null && policyBundleAccessBoundary != null) {
+            validationErrors.addAll(policyBundleAccessBoundary.validateCurrentRequesterAccess(
+                    parseOutcome.bundle().metadata().labels()
+            ));
+        }
+
+        if (!validationErrors.isEmpty()) {
+            Map<String, Object> response = invalidResponse(
+                    parseOutcome.bundle(),
+                    normalizedTool,
+                    normalizedTarget,
+                    evaluationInstant,
+                    validationErrors
+            );
+            return response;
+        }
+
+        return evaluate(parseOutcome.bundle(), normalizedTool, normalizedTarget, evaluationInstant);
+    }
+
+    private ParseOutcome parseBundle(String policyBundle) {
+        List<String> errors = new ArrayList<>();
+        if (policyBundle == null || policyBundle.isBlank()) {
+            errors.add("policyBundle must be a non-empty JSON document");
+            return new ParseOutcome(null, errors);
+        }
+
+        JsonNode root;
+        try {
+            root = objectMapper.readTree(policyBundle);
+        } catch (Exception e) {
+            errors.add("policyBundle must be valid JSON: " + e.getMessage());
+            return new ParseOutcome(null, errors);
+        }
+
+        if (root == null || !root.isObject()) {
+            errors.add("policyBundle must be a JSON object");
+            return new ParseOutcome(null, errors);
+        }
+
+        requireExactKeys(root, TOP_LEVEL_KEYS, "bundle", errors);
+
+        String apiVersion = requiredText(root, "apiVersion", "bundle", errors);
+        if (apiVersion != null && !"mcp.zap.policy/v1".equals(apiVersion)) {
+            errors.add("bundle.apiVersion must equal 'mcp.zap.policy/v1'");
+        }
+
+        String kind = requiredText(root, "kind", "bundle", errors);
+        if (kind != null && !"PolicyBundle".equals(kind)) {
+            errors.add("bundle.kind must equal 'PolicyBundle'");
+        }
+
+        JsonNode metadataNode = root.get("metadata");
+        PolicyBundleMetadata metadata = parseMetadata(metadataNode, errors);
+
+        JsonNode specNode = root.get("spec");
+        PolicyBundleSpec spec = parseSpec(specNode, errors);
+
+        if (!errors.isEmpty()) {
+            return new ParseOutcome(null, errors);
+        }
+
+        return new ParseOutcome(new PolicyBundle(apiVersion, kind, metadata, spec), errors);
+    }
+
+    private PolicyBundleMetadata parseMetadata(JsonNode metadataNode, List<String> errors) {
+        if (metadataNode == null || !metadataNode.isObject()) {
+            errors.add("bundle.metadata must be an object");
+            return null;
+        }
+
+        requireExactKeys(metadataNode, METADATA_KEYS, "bundle.metadata", errors);
+
+        String name = requiredText(metadataNode, "name", "bundle.metadata", errors);
+        if (name != null && !isKebabCase(name)) {
+            errors.add("bundle.metadata.name must be lowercase kebab-case");
+        }
+
+        String displayName = optionalText(metadataNode, "displayName", "bundle.metadata", errors);
+        String description = requiredText(metadataNode, "description", "bundle.metadata", errors);
+        String owner = requiredText(metadataNode, "owner", "bundle.metadata", errors);
+
+        Map<String, String> labels = new LinkedHashMap<>();
+        JsonNode labelsNode = metadataNode.get("labels");
+        if (labelsNode != null && !labelsNode.isNull()) {
+            if (!labelsNode.isObject()) {
+                errors.add("bundle.metadata.labels must be an object");
+            } else {
+                labelsNode.properties().forEach(entry -> {
+                    String key = entry.getKey();
+                    if (!isKebabCase(key)) {
+                        errors.add("bundle.metadata.labels key '" + key + "' must be lowercase kebab-case");
+                    }
+                    if (!entry.getValue().isString() || entry.getValue().asString().isBlank()) {
+                        errors.add("bundle.metadata.labels['" + key + "'] must be a non-empty string");
+                    } else {
+                        labels.put(key, entry.getValue().asString().trim());
+                    }
+                });
+            }
+        }
+
+        return new PolicyBundleMetadata(name, displayName, description, owner, labels);
+    }
+
+    private PolicyBundleSpec parseSpec(JsonNode specNode, List<String> errors) {
+        if (specNode == null || !specNode.isObject()) {
+            errors.add("bundle.spec must be an object");
+            return null;
+        }
+
+        requireExactKeys(specNode, SPEC_KEYS, "bundle.spec", errors);
+
+        String defaultDecision = requiredText(specNode, "defaultDecision", "bundle.spec", errors);
+        if (defaultDecision != null && !RULE_DECISIONS.contains(defaultDecision)) {
+            errors.add("bundle.spec.defaultDecision must be 'allow' or 'deny'");
+        }
+
+        String evaluationOrder = requiredText(specNode, "evaluationOrder", "bundle.spec", errors);
+        if (evaluationOrder != null && !"first-match".equals(evaluationOrder)) {
+            errors.add("bundle.spec.evaluationOrder must equal 'first-match'");
+        }
+
+        String timezoneId = requiredText(specNode, "timezone", "bundle.spec", errors);
+        ZoneId timezone = null;
+        if (timezoneId != null) {
+            try {
+                timezone = ZoneId.of(timezoneId);
+            } catch (Exception e) {
+                errors.add("bundle.spec.timezone must be a valid timezone ID");
+            }
+        }
+
+        JsonNode rulesNode = specNode.get("rules");
+        if (rulesNode == null || !rulesNode.isArray() || rulesNode.isEmpty()) {
+            errors.add("bundle.spec.rules must be a non-empty array");
+            return null;
+        }
+        List<PolicyBundleRule> rules = new ArrayList<>();
+        for (int index = 0; index < rulesNode.size(); index++) {
+            JsonNode ruleNode = rulesNode.get(index);
+            PolicyBundleRule rule = parseRule(ruleNode, index, errors);
+            if (rule != null) {
+                rules.add(rule);
+            }
+        }
+
+        PolicyBundleRuleset ruleset = null;
+        if (defaultDecision != null && RULE_DECISIONS.contains(defaultDecision) && !rules.isEmpty()) {
+            try {
+                ruleset = PolicyBundleRuleset.of(PolicyBundleDecision.fromWireValue(defaultDecision), rules);
+            } catch (IllegalArgumentException e) {
+                errors.add("bundle.spec.rules " + e.getMessage());
+            }
+        }
+        if (ruleset == null) {
+            return null;
+        }
+
+        return new PolicyBundleSpec(evaluationOrder, timezoneId, timezone, ruleset);
+    }
+
+    private PolicyBundleRule parseRule(JsonNode ruleNode,
+                                       int index,
+                                       List<String> errors) {
+        String prefix = "bundle.spec.rules[" + index + "]";
+        if (ruleNode == null || !ruleNode.isObject()) {
+            errors.add(prefix + " must be an object");
+            return null;
+        }
+
+        requireExactKeys(ruleNode, RULE_KEYS, prefix, errors);
+
+        String id = requiredText(ruleNode, "id", prefix, errors);
+        if (id != null && !isKebabCase(id)) {
+            errors.add(prefix + ".id must be lowercase kebab-case");
+        }
+
+        String description = requiredText(ruleNode, "description", prefix, errors);
+        String decision = requiredText(ruleNode, "decision", prefix, errors);
+        if (decision != null && !RULE_DECISIONS.contains(decision)) {
+            errors.add(prefix + ".decision must be 'allow' or 'deny'");
+        }
+        String reason = requiredText(ruleNode, "reason", prefix, errors);
+
+        boolean enabled = true;
+        JsonNode enabledNode = ruleNode.get("enabled");
+        if (enabledNode != null && !enabledNode.isNull()) {
+            if (!enabledNode.isBoolean()) {
+                errors.add(prefix + ".enabled must be a boolean");
+            } else {
+                enabled = enabledNode.asBoolean();
+            }
+        }
+
+        PolicyBundleMatch match = parseMatch(ruleNode.get("match"), prefix + ".match", errors);
+        // Description is required authoring metadata; runtime evaluation emits reason instead.
+        if (id == null || description == null || decision == null || reason == null || match == null) {
+            return null;
+        }
+        PolicyBundleDecision decisionValue = RULE_DECISIONS.contains(decision)
+                ? PolicyBundleDecision.fromWireValue(decision)
+                : PolicyBundleDecision.DENY;
+        return new PolicyBundleRule(id, decisionValue, reason, enabled, match);
+    }
+
+    private PolicyBundleMatch parseMatch(JsonNode matchNode, String prefix, List<String> errors) {
+        if (matchNode == null || !matchNode.isObject()) {
+            errors.add(prefix + " must be an object");
+            return null;
+        }
+
+        requireExactKeys(matchNode, MATCH_KEYS, prefix, errors);
+
+        JsonNode toolsNode = matchNode.get("tools");
+        JsonNode hostsNode = matchNode.get("hosts");
+        JsonNode timeWindowsNode = matchNode.get("timeWindows");
+        if ((toolsNode == null || toolsNode.isNull())
+                && (hostsNode == null || hostsNode.isNull())
+                && (timeWindowsNode == null || timeWindowsNode.isNull())) {
+            errors.add(prefix + " must include at least one selector dimension");
+        }
+
+        List<String> tools = parseTools(toolsNode, prefix + ".tools", errors);
+        List<String> hosts = parseHosts(hostsNode, prefix + ".hosts", errors);
+        List<PolicyBundleTimeWindow> timeWindows = parseTimeWindows(timeWindowsNode, prefix + ".timeWindows", errors);
+        if (tools.isEmpty() && hosts.isEmpty() && timeWindows.isEmpty()) {
+            if (!((toolsNode == null || toolsNode.isNull())
+                    && (hostsNode == null || hostsNode.isNull())
+                    && (timeWindowsNode == null || timeWindowsNode.isNull()))) {
+                errors.add(prefix + " must include at least one valid selector");
+            }
+            return null;
+        }
+
+        return PolicyBundleMatch.of(tools, hosts, timeWindows);
+    }
+
+    private List<String> parseTools(JsonNode toolsNode, String prefix, List<String> errors) {
+        if (toolsNode == null || toolsNode.isNull()) {
+            return List.of();
+        }
+        if (!toolsNode.isArray() || toolsNode.isEmpty()) {
+            errors.add(prefix + " must be a non-empty array");
+            return List.of();
+        }
+
+        List<String> tools = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (int index = 0; index < toolsNode.size(); index++) {
+            JsonNode toolNode = toolsNode.get(index);
+            if (!toolNode.isString() || toolNode.asString().isBlank()) {
+                errors.add(prefix + "[" + index + "] must be a non-empty string");
+                continue;
+            }
+            String tool = toolNode.asString().trim().toLowerCase(Locale.ROOT);
+            if (!seen.add(tool)) {
+                errors.add(prefix + " must not contain duplicate tools");
+                continue;
+            }
+            if (!knownActionNames.contains(tool)) {
+                errors.add(prefix + " contains unknown tool '" + tool + "'");
+            }
+            tools.add(tool);
+        }
+        return tools;
+    }
+
+    private List<String> parseHosts(JsonNode hostsNode, String prefix, List<String> errors) {
+        if (hostsNode == null || hostsNode.isNull()) {
+            return List.of();
+        }
+        if (!hostsNode.isArray() || hostsNode.isEmpty()) {
+            errors.add(prefix + " must be a non-empty array");
+            return List.of();
+        }
+
+        List<String> hosts = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (int index = 0; index < hostsNode.size(); index++) {
+            JsonNode hostNode = hostsNode.get(index);
+            if (!hostNode.isString() || hostNode.asString().isBlank()) {
+                errors.add(prefix + "[" + index + "] must be a non-empty string");
+                continue;
+            }
+            String host = hostNode.asString().trim().toLowerCase(Locale.ROOT);
+            if (host.contains("://") || host.contains("/") || host.contains("?") || host.contains("#") || host.contains(":")) {
+                errors.add(prefix + " must use hostnames only, without scheme, path, query, fragment, or port");
+                continue;
+            }
+            if (!isHostPattern(host)) {
+                errors.add(prefix + " contains invalid host pattern '" + host + "'");
+                continue;
+            }
+            if (!seen.add(host)) {
+                errors.add(prefix + " must not contain duplicate hosts");
+                continue;
+            }
+            hosts.add(host);
+        }
+        return hosts;
+    }
+
+    private List<PolicyBundleTimeWindow> parseTimeWindows(JsonNode timeWindowsNode, String prefix, List<String> errors) {
+        if (timeWindowsNode == null || timeWindowsNode.isNull()) {
+            return List.of();
+        }
+        if (!timeWindowsNode.isArray() || timeWindowsNode.isEmpty()) {
+            errors.add(prefix + " must be a non-empty array");
+            return List.of();
+        }
+
+        List<PolicyBundleTimeWindow> windows = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (int index = 0; index < timeWindowsNode.size(); index++) {
+            String windowPrefix = prefix + "[" + index + "]";
+            JsonNode windowNode = timeWindowsNode.get(index);
+            if (windowNode == null || !windowNode.isObject()) {
+                errors.add(windowPrefix + " must be an object");
+                continue;
+            }
+            requireExactKeys(windowNode, WINDOW_KEYS, windowPrefix, errors);
+
+            JsonNode daysNode = windowNode.get("days");
+            if (daysNode == null || !daysNode.isArray() || daysNode.isEmpty()) {
+                errors.add(windowPrefix + ".days must be a non-empty array");
+                continue;
+            }
+
+            List<String> dayNames = new ArrayList<>();
+            Set<String> seenDays = new LinkedHashSet<>();
+            for (int dayIndex = 0; dayIndex < daysNode.size(); dayIndex++) {
+                JsonNode dayNode = daysNode.get(dayIndex);
+                if (!dayNode.isString() || dayNode.asString().isBlank()) {
+                    errors.add(windowPrefix + ".days[" + dayIndex + "] must be a non-empty string");
+                    continue;
+                }
+                String day = dayNode.asString().trim().toLowerCase(Locale.ROOT);
+                if (!DAY_NAMES.contains(day)) {
+                    errors.add(windowPrefix + ".days contains invalid value '" + day + "'");
+                    continue;
+                }
+                if (!seenDays.add(day)) {
+                    errors.add(windowPrefix + ".days must not contain duplicates");
+                    continue;
+                }
+                dayNames.add(day);
+            }
+
+            String start = requiredText(windowNode, "start", windowPrefix, errors);
+            String end = requiredText(windowNode, "end", windowPrefix, errors);
+            LocalTime startTime = parseLocalTime(start, windowPrefix + ".start", errors);
+            LocalTime endTime = parseLocalTime(end, windowPrefix + ".end", errors);
+            boolean invalidWindow = false;
+            if (startTime != null && endTime != null && startTime.equals(endTime)) {
+                errors.add(windowPrefix + " start and end cannot be identical");
+                invalidWindow = true;
+            }
+
+            String signature = dayNames + "|" + start + "|" + end;
+            if (!seen.add(signature)) {
+                errors.add(prefix + " must not contain duplicate time windows");
+                continue;
+            }
+
+            if (!dayNames.isEmpty() && startTime != null && endTime != null && !invalidWindow) {
+                List<DayOfWeek> days = dayNames.stream().map(this::parseDayOfWeek).toList();
+                try {
+                    windows.add(PolicyBundleTimeWindow.of(days, startTime, endTime));
+                } catch (IllegalArgumentException ex) {
+                    errors.add(windowPrefix + " " + ex.getMessage());
+                }
+            }
+        }
+        return windows;
+    }
+
+    private Map<String, Object> invalidResponse(PolicyBundle bundle,
+                                                String normalizedTool,
+                                                NormalizedTarget normalizedTarget,
+                                                Instant evaluationInstant,
+                                                List<String> validationErrors) {
+        Map<String, Object> response = baseResponse(bundle, normalizedTool, normalizedTarget, evaluationInstant, false, validationErrors);
+
+        Map<String, Object> decision = new LinkedHashMap<>();
+        decision.put("result", "invalid");
+        decision.put("source", "validation");
+        decision.put("matchedRuleId", null);
+        decision.put("reason", "The request or policy bundle is invalid.");
+        response.put("decision", decision);
+        response.put("trace", List.of());
+        return response;
+    }
+
+    private Map<String, Object> evaluate(PolicyBundle bundle,
+                                         String toolName,
+                                         NormalizedTarget normalizedTarget,
+                                         Instant evaluationInstant) {
+        ZonedDateTime bundleTime = evaluationInstant.atZone(bundle.spec().timezone());
+        PolicyBundleEvaluationResult evaluation = PolicyBundleEvaluator.evaluate(
+                bundle.spec().ruleset(),
+                new PolicyBundleEvaluationRequest(toolName, normalizedTarget.normalizedHost(), bundleTime)
+        );
+        List<Map<String, Object>> trace = new ArrayList<>();
+        for (PolicyBundleRuleEvaluation ruleEvaluation : evaluation.trace()) {
+            trace.add(traceMap(ruleEvaluation));
+        }
+
+        Map<String, Object> response = baseResponse(bundle, toolName, normalizedTarget, evaluationInstant, true, List.of());
+        response.put("trace", trace);
+
+        Map<String, Object> decision = new LinkedHashMap<>();
+        decision.put("result", evaluation.decision().wireValue());
+        decision.put("source", evaluation.source().wireValue());
+        decision.put("matchedRuleId", evaluation.matchedRuleId());
+        decision.put("reason", evaluation.reason());
+        decision.put("defaultDecision", bundle.spec().defaultDecision());
+        response.put("decision", decision);
+        return response;
+    }
+
+    private Map<String, Object> traceMap(PolicyBundleRuleEvaluation evaluation) {
+        Map<String, Object> trace = new LinkedHashMap<>();
+        trace.put("ruleId", evaluation.ruleId());
+        trace.put("decision", evaluation.decision().wireValue());
+        trace.put("enabled", evaluation.enabled());
+        trace.put("matched", evaluation.matched());
+        trace.put("matchedSelectors", evaluation.matchedSelectors());
+        trace.put("failedSelectors", evaluation.failedSelectors());
+        trace.put("reason", evaluation.reason());
+        return trace;
+    }
+
+    private Map<String, Object> baseResponse(PolicyBundle bundle,
+                                             String toolName,
+                                             NormalizedTarget normalizedTarget,
+                                             Instant evaluationInstant,
+                                             boolean valid,
+                                             List<String> validationErrors) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("contractVersion", DRY_RUN_CONTRACT_VERSION);
+        Map<String, Object> bundleSummary = bundleSummary(bundle);
+        Map<String, Object> requestSummary = requestSummary(bundle, toolName, normalizedTarget, evaluationInstant);
+        if (policyBundleAccessBoundary != null) {
+            policyBundleAccessBoundary.enrichBundleSummary(
+                    bundleSummary,
+                    bundle == null ? Map.of() : bundle.metadata().labels()
+            );
+            policyBundleAccessBoundary.enrichRequestSummary(requestSummary);
+        }
+        response.put("bundle", bundleSummary);
+        response.put("request", requestSummary);
+
+        Map<String, Object> validation = new LinkedHashMap<>();
+        validation.put("valid", valid);
+        validation.put("errors", validationErrors);
+        response.put("validation", validation);
+        return response;
+    }
+
+    private Map<String, Object> bundleSummary(PolicyBundle bundle) {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        if (bundle == null) {
+            return summary;
+        }
+        summary.put("apiVersion", bundle.apiVersion());
+        summary.put("kind", bundle.kind());
+        summary.put("name", bundle.metadata().name());
+        summary.put("displayName", bundle.metadata().displayName());
+        summary.put("owner", bundle.metadata().owner());
+        summary.put("timezone", bundle.spec().timezoneId());
+        summary.put("ruleCount", bundle.spec().rules().size());
+        return summary;
+    }
+
+    private Map<String, Object> requestSummary(PolicyBundle bundle,
+                                               String toolName,
+                                               NormalizedTarget normalizedTarget,
+                                               Instant evaluationInstant) {
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("tool", toolName);
+        request.put("target", normalizedTarget.rawTarget());
+        request.put("normalizedHost", normalizedTarget.normalizedHost());
+        request.put("evaluatedAt", evaluationInstant.toString());
+
+        if (bundle != null && bundle.spec().timezone() != null) {
+            ZonedDateTime bundleTime = evaluationInstant.atZone(bundle.spec().timezone());
+            request.put("bundleTimezone", bundle.spec().timezoneId());
+            request.put("bundleLocalDay", formatDay(bundleTime.getDayOfWeek()));
+            request.put("bundleLocalTime", bundleTime.toLocalTime().withSecond(0).withNano(0).toString());
+        }
+        return request;
+    }
+
+    private String normalizeToolName(String toolName, List<String> errors) {
+        if (toolName == null || toolName.isBlank()) {
+            errors.add("toolName must be a non-empty exact MCP tool or action");
+            return null;
+        }
+
+        String normalized = toolName.trim().toLowerCase(Locale.ROOT);
+        if (!knownActionNames.contains(normalized)) {
+            errors.add("toolName must be an exact known MCP tool or action");
+        }
+        return normalized;
+    }
+
+    private NormalizedTarget normalizeTarget(String target, List<String> errors) {
+        if (target == null || target.isBlank()) {
+            return new NormalizedTarget(null, null);
+        }
+
+        String trimmed = target.trim();
+        try {
+            String host = extractHost(trimmed);
+            if (host == null || host.isBlank()) {
+                errors.add("target must be a hostname or absolute URL when provided");
+                return new NormalizedTarget(trimmed, null);
+            }
+            return new NormalizedTarget(trimmed, host.toLowerCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            errors.add(e.getMessage());
+            return new NormalizedTarget(trimmed, null);
+        }
+    }
+
+    private Instant parseEvaluationInstant(String evaluatedAt, List<String> errors) {
+        if (evaluatedAt == null || evaluatedAt.isBlank()) {
+            return clock.instant();
+        }
+
+        String trimmed = evaluatedAt.trim();
+        try {
+            return Instant.parse(trimmed);
+        } catch (DateTimeParseException ignored) {
+        }
+        try {
+            return OffsetDateTime.parse(trimmed).toInstant();
+        } catch (DateTimeParseException ignored) {
+        }
+        try {
+            return ZonedDateTime.parse(trimmed).toInstant();
+        } catch (DateTimeParseException ignored) {
+        }
+        errors.add("evaluatedAt must be a valid ISO-8601 instant or offset datetime");
+        return Instant.EPOCH;
+    }
+
+    private String extractHost(String target) {
+        if (target.contains("://")) {
+            try {
+                URI uri = URI.create(target);
+                if (uri.getHost() == null || uri.getHost().isBlank()) {
+                    throw new IllegalArgumentException("target must include a valid host when passed as a URL");
+                }
+                return uri.getHost();
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("target must be a valid absolute URL or hostname");
+            }
+        }
+
+        String candidate = target;
+        if (candidate.contains("/") || candidate.contains("?") || candidate.contains("#")) {
+            throw new IllegalArgumentException("target must be a hostname or absolute URL when provided");
+        }
+        if (candidate.contains(":")) {
+            candidate = candidate.substring(0, candidate.indexOf(':'));
+        }
+        if (!isHostPattern(candidate.toLowerCase(Locale.ROOT).replace("*.", ""))) {
+            throw new IllegalArgumentException("target must be a hostname or absolute URL when provided");
+        }
+        return candidate;
+    }
+
+    private String requiredText(JsonNode parent, String fieldName, String prefix, List<String> errors) {
+        JsonNode value = parent.get(fieldName);
+        if (value == null || value.isNull() || !value.isString() || value.asString().isBlank()) {
+            errors.add(prefix + "." + fieldName + " must be a non-empty string");
+            return null;
+        }
+        return value.asString().trim();
+    }
+
+    private String optionalText(JsonNode parent, String fieldName, String prefix, List<String> errors) {
+        JsonNode value = parent.get(fieldName);
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isString() || value.asString().isBlank()) {
+            errors.add(prefix + "." + fieldName + " must be a non-empty string when present");
+            return null;
+        }
+        return value.asString().trim();
+    }
+
+    private LocalTime parseLocalTime(String value, String prefix, List<String> errors) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return LocalTime.parse(value);
+        } catch (DateTimeParseException e) {
+            errors.add(prefix + " must use HH:MM 24-hour format");
+            return null;
+        }
+    }
+
+    private void requireExactKeys(JsonNode node, Set<String> allowedKeys, String prefix, List<String> errors) {
+        if (node == null || !node.isObject()) {
+            return;
+        }
+        node.propertyNames().forEach(fieldName -> {
+            if (!allowedKeys.contains(fieldName)) {
+                errors.add(prefix + " contains unsupported field '" + fieldName + "'");
+            }
+        });
+    }
+
+    private boolean isKebabCase(String value) {
+        return value != null && value.matches("^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$");
+    }
+
+    private boolean isHostPattern(String value) {
+        return value != null && value.matches("^(?:\\*\\.)?[a-z0-9-]+(?:\\.[a-z0-9-]+)*+$");
+    }
+
+    private DayOfWeek parseDayOfWeek(String day) {
+        return switch (day) {
+            case "mon" -> DayOfWeek.MONDAY;
+            case "tue" -> DayOfWeek.TUESDAY;
+            case "wed" -> DayOfWeek.WEDNESDAY;
+            case "thu" -> DayOfWeek.THURSDAY;
+            case "fri" -> DayOfWeek.FRIDAY;
+            case "sat" -> DayOfWeek.SATURDAY;
+            case "sun" -> DayOfWeek.SUNDAY;
+            default -> throw new IllegalArgumentException("Unsupported day: " + day);
+        };
+    }
+
+    private String formatDay(DayOfWeek dayOfWeek) {
+        return switch (dayOfWeek) {
+            case MONDAY -> "mon";
+            case TUESDAY -> "tue";
+            case WEDNESDAY -> "wed";
+            case THURSDAY -> "thu";
+            case FRIDAY -> "fri";
+            case SATURDAY -> "sat";
+            case SUNDAY -> "sun";
+        };
+    }
+
+    private record ParseOutcome(PolicyBundle bundle, List<String> errors) {
+    }
+
+    private record NormalizedTarget(String rawTarget, String normalizedHost) {
+    }
+
+    private record PolicyBundle(String apiVersion,
+                                String kind,
+                                PolicyBundleMetadata metadata,
+                                PolicyBundleSpec spec) {
+    }
+
+    private record PolicyBundleMetadata(String name,
+                                        String displayName,
+                                        String description,
+                                        String owner,
+                                        Map<String, String> labels) {
+    }
+
+    private record PolicyBundleSpec(String evaluationOrder,
+                                    String timezoneId,
+                                    ZoneId timezone,
+                                    PolicyBundleRuleset ruleset) {
+        private String defaultDecision() {
+            return ruleset.defaultDecision().wireValue();
+        }
+
+        private List<PolicyBundleRule> rules() {
+            return ruleset.rules();
+        }
+    }
+}

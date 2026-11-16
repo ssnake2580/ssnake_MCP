@@ -1,0 +1,238 @@
+spring:
+  ai:
+    mcp:
+      server:
+        name: mcp-zap-server
+        version: ${MCP_SERVER_VERSION:0.17.1}
+        instructions: "Use this server to interact with the ZAP API for security testing."
+        protocol: streamable
+        resource-change-notification: true
+        tool-change-notification: true
+        prompt-change-notification: true
+        streamable-http:
+          keep-alive-interval: 30s
+        type: async
+  flyway:
+    enabled: ${DB_MIGRATIONS_ENABLED:false}
+    locations: classpath:db/migration
+    url: ${DB_MIGRATIONS_POSTGRES_URL:${ZAP_SCAN_JOBS_STORE_POSTGRES_URL:${ZAP_SCAN_QUEUE_STORE_POSTGRES_URL:}}}
+    user: ${DB_MIGRATIONS_POSTGRES_USERNAME:${ZAP_SCAN_JOBS_STORE_POSTGRES_USERNAME:${ZAP_SCAN_QUEUE_STORE_POSTGRES_USERNAME:}}}
+    password: ${DB_MIGRATIONS_POSTGRES_PASSWORD:${ZAP_SCAN_JOBS_STORE_POSTGRES_PASSWORD:${ZAP_SCAN_QUEUE_STORE_POSTGRES_PASSWORD:}}}
+    validate-on-migrate: ${DB_MIGRATIONS_VALIDATE_ON_MIGRATE:true}
+    baseline-on-migrate: ${DB_MIGRATIONS_BASELINE_ON_MIGRATE:false}
+    baseline-version: ${DB_MIGRATIONS_BASELINE_VERSION:0}
+    clean-disabled: true
+
+logging:
+  level:
+    mcp.server.zap.service: DEBUG
+    mcp.server.zap.configuration: INFO
+    
+server:
+  port: 7456
+
+# MCP Server Security Configuration
+# Authentication Modes:
+#   - none: No authentication (explicit dev/test override only)
+#   - api-key: Simple API key authentication (default for HTTP deployments)
+#   - jwt: JWT token-based authentication (recommended for production)
+mcp:
+  server:
+    request:
+      maxBodyBytes: ${MCP_REQUEST_MAX_BODY_BYTES:262144}
+    security:
+      # Set authentication mode: none, api-key, or jwt
+      mode: ${MCP_SECURITY_MODE:api-key}
+      enabled: ${MCP_SECURITY_ENABLED:true}
+      authorization:
+        mode: ${MCP_SECURITY_AUTHORIZATION_MODE:enforce}
+        allowWildcard: ${MCP_SECURITY_AUTHORIZATION_ALLOW_WILDCARD:true}
+      # Explicit placeholder opt-in requires active profiles exclusively among local, dev, and test.
+      allowPlaceholderApiKey: ${MCP_SECURITY_ALLOW_PLACEHOLDER_API_KEY:false}
+    
+    # Multi-Client API Key Configuration
+    auth:
+      apiKeys:
+        - clientId: ${MCP_CLIENT_ID:default-client}
+          key: ${MCP_API_KEY:}
+          description: ${MCP_CLIENT_DESCRIPTION:Default MCP client}
+      
+      # JWT Token Configuration
+      jwt:
+        enabled: ${JWT_ENABLED:false}
+        secret: ${JWT_SECRET:jwt-secret-key-please-change-this-to-a-secure-random-value}
+        issuer: ${JWT_ISSUER:mcp-zap-server}
+        accessTokenExpiry: ${JWT_ACCESS_TOKEN_EXPIRATION:3600}
+        refreshTokenExpiry: ${JWT_REFRESH_TOKEN_EXPIRATION:604800}
+        revocation:
+          backend: ${JWT_REVOCATION_STORE_BACKEND:in-memory}
+          postgres:
+            url: ${JWT_REVOCATION_STORE_POSTGRES_URL:}
+            username: ${JWT_REVOCATION_STORE_POSTGRES_USERNAME:}
+            password: ${JWT_REVOCATION_STORE_POSTGRES_PASSWORD:}
+            table-name: ${JWT_REVOCATION_STORE_POSTGRES_TABLE_NAME:jwt_token_revocation}
+            # Only explicit expiration cleanup may be fail-soft; authentication never falls back.
+            fail-fast: ${JWT_REVOCATION_STORE_POSTGRES_FAIL_FAST:true}
+      bootstrap:
+        # Profiles are operator-owned configuration. Each profile binds one exact credential
+        # reference to one canonical HTTP(S) origin; callers provide only profileId + targetUrl.
+        profiles: []
+    protection:
+      enabled: ${MCP_PROTECTION_ENABLED:true}
+      retryAfterSeconds: ${MCP_PROTECTION_RETRY_AFTER_SECONDS:30}
+      rate-limit:
+        enabled: ${MCP_PROTECTION_RATE_LIMIT_ENABLED:true}
+        capacity: ${MCP_PROTECTION_RATE_LIMIT_CAPACITY:60}
+        refill-tokens: ${MCP_PROTECTION_RATE_LIMIT_REFILL_TOKENS:60}
+        refill-period-seconds: ${MCP_PROTECTION_RATE_LIMIT_REFILL_PERIOD_SECONDS:60}
+        max-tracked-clients: ${MCP_PROTECTION_RATE_LIMIT_MAX_TRACKED_CLIENTS:10000}
+      workspace-quota:
+        enabled: ${MCP_PROTECTION_WORKSPACE_QUOTA_ENABLED:true}
+        max-queued-or-running-scan-jobs: ${MCP_PROTECTION_WORKSPACE_QUOTA_MAX_QUEUED_OR_RUNNING_SCAN_JOBS:5}
+      backpressure:
+        enabled: ${MCP_PROTECTION_BACKPRESSURE_ENABLED:true}
+        max-tracked-scan-jobs: ${MCP_PROTECTION_BACKPRESSURE_MAX_TRACKED_SCAN_JOBS:20}
+        max-running-scan-jobs: ${MCP_PROTECTION_BACKPRESSURE_MAX_RUNNING_SCAN_JOBS:8}
+    observability:
+      audit:
+        enabled: ${MCP_OBSERVABILITY_AUDIT_ENABLED:true}
+        max-events: ${MCP_OBSERVABILITY_AUDIT_MAX_EVENTS:500}
+    policy:
+      mode: ${MCP_POLICY_MODE:off}
+      bundle: ${MCP_POLICY_BUNDLE:}
+      bundle-file: ${MCP_POLICY_BUNDLE_FILE:}
+
+# ZAP Configuration
+zap:
+  addons:
+    updates-enabled: ${ZAP_ADDON_UPDATES_ENABLED:false}
+    # Operator assertion: fresh dedicated engine, all activity through one controller.
+    exclusive-engine: ${ZAP_ADDON_EXCLUSIVE_ENGINE:false}
+    controller-replicas: ${ZAP_ADDON_CONTROLLER_REPLICAS:1}
+    allowed-addon-ids: ${ZAP_ADDON_ALLOWED_IDS:pscanrules}
+    operator-client-ids: ${ZAP_ADDON_OPERATOR_CLIENT_IDS:}
+    # Durable private state must survive MCP restarts; unresolved installs pause engine actions.
+    state-directory: ${ZAP_ADDON_STATE_DIRECTORY:${user.home}/.mcp-zap/addon-maintenance}
+  server:
+    url: ${ZAP_API_URL:localhost}
+    port: ${ZAP_API_PORT:8090}
+    apiKey: ${ZAP_API_KEY}
+    connect-timeout-ms: ${ZAP_API_CONNECT_TIMEOUT_MS:5000}
+    read-timeout-ms: ${ZAP_API_READ_TIMEOUT_MS:10000}
+  
+  scan:
+    # Scan Limits and Timeouts
+    limits:
+      maxActiveScanDurationInMins: ${ZAP_MAX_ACTIVE_SCAN_DURATION:30}
+      maxSpiderScanDurationInMins: ${ZAP_MAX_SPIDER_SCAN_DURATION:15}
+      maxConcurrentActiveScans: ${ZAP_MAX_CONCURRENT_ACTIVE_SCANS:3}
+      maxConcurrentSpiderScans: ${ZAP_MAX_CONCURRENT_SPIDER_SCANS:5}
+      threadPerHost: ${ZAP_THREAD_PER_HOST:10}
+      hostPerScan: ${ZAP_HOST_PER_SCAN:5}
+      spiderThreadCount: ${ZAP_SPIDER_THREAD_COUNT:5}
+      spiderMaxDepth: ${ZAP_SPIDER_MAX_DEPTH:10}
+      spiderMaxChildren: ${ZAP_SPIDER_MAX_CHILDREN:10}
+    
+    # Active Scan Configuration
+    active:
+      enableAllScanners: true
+      # enabledScannersPolicy: "Default Policy"
+      # enabledScannersIds: "400012,40014"
+    
+    # URL Validation and Security
+    url:
+      validation:
+        enabled: ${ZAP_URL_VALIDATION_ENABLED:true}
+      allowLocalhost: ${ZAP_ALLOW_LOCALHOST:false}
+      allowPrivateNetworks: ${ZAP_ALLOW_PRIVATE_NETWORKS:false}
+      # Comma-separated list of allowed domains (wildcards supported: *.example.com)
+      # If set, host must match whitelist AND still pass blacklist/private-network checks
+      whitelist: ${ZAP_URL_WHITELIST:}
+      # Explicit operator denies; local/private opt-ins never override these rules.
+      # Built-in address safety checks apply independently, even when this is blank.
+      blacklist: ${ZAP_URL_BLACKLIST:}
+
+    queue:
+      dispatch-interval-ms: ${ZAP_SCAN_QUEUE_DISPATCH_INTERVAL_MS:2000}
+      engine-busy-max-wait-ms: ${ZAP_SCAN_QUEUE_ENGINE_BUSY_MAX_WAIT_MS:180000}
+      cancel-max-wait-ms: ${ZAP_SCAN_QUEUE_CANCEL_MAX_WAIT_MS:${ZAP_SCAN_QUEUE_AJAX_CANCEL_MAX_WAIT_MS:${zap.scan.queue.ajax-cancel-max-wait-ms:30000}}}
+      claim-lease-ms: ${ZAP_SCAN_QUEUE_CLAIM_LEASE_MS:15000}
+      virtual-threads:
+        enabled: ${ZAP_SCAN_QUEUE_VIRTUAL_THREADS_ENABLED:false}
+      coordinator:
+        backend: ${ZAP_SCAN_QUEUE_COORDINATOR_BACKEND:single-node}
+        node-id: ${ZAP_SCAN_QUEUE_COORDINATOR_NODE_ID:${HOSTNAME:mcp-zap-node}}
+        postgres:
+          url: ${ZAP_SCAN_QUEUE_COORDINATOR_POSTGRES_URL:${ZAP_SCAN_JOBS_STORE_POSTGRES_URL:${ZAP_SCAN_QUEUE_STORE_POSTGRES_URL:}}}
+          username: ${ZAP_SCAN_QUEUE_COORDINATOR_POSTGRES_USERNAME:${ZAP_SCAN_JOBS_STORE_POSTGRES_USERNAME:${ZAP_SCAN_QUEUE_STORE_POSTGRES_USERNAME:}}}
+          password: ${ZAP_SCAN_QUEUE_COORDINATOR_POSTGRES_PASSWORD:${ZAP_SCAN_JOBS_STORE_POSTGRES_PASSWORD:${ZAP_SCAN_QUEUE_STORE_POSTGRES_PASSWORD:}}}
+          advisory-lock-key: ${ZAP_SCAN_QUEUE_COORDINATOR_POSTGRES_ADVISORY_LOCK_KEY:861001}
+          heartbeat-interval-ms: ${ZAP_SCAN_QUEUE_COORDINATOR_POSTGRES_HEARTBEAT_INTERVAL_MS:5000}
+          fail-fast: ${ZAP_SCAN_QUEUE_COORDINATOR_POSTGRES_FAIL_FAST:false}
+      retry:
+        active:
+          max-attempts: ${ZAP_SCAN_QUEUE_RETRY_ACTIVE_MAX_ATTEMPTS:3}
+          initial-backoff-ms: ${ZAP_SCAN_QUEUE_RETRY_ACTIVE_INITIAL_BACKOFF_MS:2000}
+          max-backoff-ms: ${ZAP_SCAN_QUEUE_RETRY_ACTIVE_MAX_BACKOFF_MS:30000}
+          multiplier: ${ZAP_SCAN_QUEUE_RETRY_ACTIVE_MULTIPLIER:2.0}
+        spider:
+          max-attempts: ${ZAP_SCAN_QUEUE_RETRY_SPIDER_MAX_ATTEMPTS:2}
+          initial-backoff-ms: ${ZAP_SCAN_QUEUE_RETRY_SPIDER_INITIAL_BACKOFF_MS:1000}
+          max-backoff-ms: ${ZAP_SCAN_QUEUE_RETRY_SPIDER_MAX_BACKOFF_MS:10000}
+          multiplier: ${ZAP_SCAN_QUEUE_RETRY_SPIDER_MULTIPLIER:2.0}
+    jobs:
+      launch-safety:
+        journal-directory: ${ZAP_SCAN_LAUNCH_JOURNAL_DIRECTORY:${user.home}/.mcp-zap/scan-launch-safety}
+      store:
+        backend: ${ZAP_SCAN_JOBS_STORE_BACKEND:${ZAP_SCAN_QUEUE_STORE_BACKEND:in-memory}}
+        postgres:
+          url: ${ZAP_SCAN_JOBS_STORE_POSTGRES_URL:${ZAP_SCAN_QUEUE_STORE_POSTGRES_URL:}}
+          username: ${ZAP_SCAN_JOBS_STORE_POSTGRES_USERNAME:${ZAP_SCAN_QUEUE_STORE_POSTGRES_USERNAME:}}
+          password: ${ZAP_SCAN_JOBS_STORE_POSTGRES_PASSWORD:${ZAP_SCAN_QUEUE_STORE_POSTGRES_PASSWORD:}}
+          table-name: ${ZAP_SCAN_JOBS_STORE_POSTGRES_TABLE_NAME:scan_jobs}
+          fail-fast: ${ZAP_SCAN_JOBS_STORE_POSTGRES_FAIL_FAST:${ZAP_SCAN_QUEUE_STORE_POSTGRES_FAIL_FAST:false}}
+    history:
+      backend: ${ZAP_SCAN_HISTORY_BACKEND:${ZAP_SCAN_JOBS_STORE_BACKEND:${ZAP_SCAN_QUEUE_STORE_BACKEND:in-memory}}}
+      retention-days: ${ZAP_SCAN_HISTORY_RETENTION_DAYS:180}
+      max-list-entries: ${ZAP_SCAN_HISTORY_MAX_LIST_ENTRIES:50}
+      max-export-entries: ${ZAP_SCAN_HISTORY_MAX_EXPORT_ENTRIES:500}
+      postgres:
+        url: ${ZAP_SCAN_HISTORY_POSTGRES_URL:${ZAP_SCAN_JOBS_STORE_POSTGRES_URL:${ZAP_SCAN_QUEUE_STORE_POSTGRES_URL:}}}
+        username: ${ZAP_SCAN_HISTORY_POSTGRES_USERNAME:${ZAP_SCAN_JOBS_STORE_POSTGRES_USERNAME:${ZAP_SCAN_QUEUE_STORE_POSTGRES_USERNAME:}}}
+        password: ${ZAP_SCAN_HISTORY_POSTGRES_PASSWORD:${ZAP_SCAN_JOBS_STORE_POSTGRES_PASSWORD:${ZAP_SCAN_QUEUE_STORE_POSTGRES_PASSWORD:}}}
+        table-name: ${ZAP_SCAN_HISTORY_POSTGRES_TABLE_NAME:scan_history_entries}
+        fail-fast: ${ZAP_SCAN_HISTORY_POSTGRES_FAIL_FAST:${ZAP_SCAN_JOBS_STORE_POSTGRES_FAIL_FAST:${ZAP_SCAN_QUEUE_STORE_POSTGRES_FAIL_FAST:false}}}
+  
+  report:
+    directory: ${ZAP_REPORT_DIRECTORY:/zap/wrk}
+
+  automation:
+    local-directory: ${ZAP_AUTOMATION_LOCAL_DIRECTORY:/zap/wrk/automation}
+    zap-directory: ${ZAP_AUTOMATION_ZAP_DIRECTORY:/zap/wrk/automation}
+
+  openapi:
+    content-import:
+      enabled: ${ZAP_OPENAPI_CONTENT_ENABLED:false}
+      local-directory: ${ZAP_OPENAPI_CONTENT_LOCAL_DIRECTORY:}
+      zap-directory: ${ZAP_OPENAPI_CONTENT_ZAP_DIRECTORY:}
+      max-retained-imports: ${ZAP_OPENAPI_CONTENT_MAX_RETAINED_IMPORTS:64}
+      retention-minutes: ${ZAP_OPENAPI_CONTENT_RETENTION_MINUTES:60}
+  
+  # ZAP Network API defaults reconciled at startup, readiness and outbound starts.
+  initialization:
+    userAgent: ${ZAP_USER_AGENT:Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36}
+    connectionTimeoutInSecs: ${ZAP_INIT_CONNECTION_TIMEOUT:${ZAP_CONNECTION_TIMEOUT:300}}
+    dnsTtlSuccessfulQueries: ${ZAP_DNS_TTL:60}
+
+# Actuator Configuration
+management:
+  metrics:
+    tags:
+      application: ${spring.ai.mcp.server.name:mcp-zap-server}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,auditevents
+  endpoint:
+    health:
+      show-details: never

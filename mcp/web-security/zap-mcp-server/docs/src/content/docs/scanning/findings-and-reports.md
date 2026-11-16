@@ -1,0 +1,216 @@
+---
+title: "Findings and Reports"
+editUrl: false
+description: "Use guided findings and report tools for triage, evidence, baselines, and artifacts."
+---
+MCP ZAP Server supports multiple findings and report layers. The right tool depends on whether you want a fast summary, grouped detail, raw evidence, or a stable artifact.
+
+## Required Findings Scope
+
+Findings reads require a nonblank `baseUrl` for the scanned target and visible
+scan-history evidence for that target. This applies to guided summary/details
+as well as snapshots and diffs. Supply the target
+you scanned, such as `http://juice-shop:3000`; other supported filters narrow
+that target's findings. Missing `baseUrl` or visible evidence is rejected.
+
+These tools do not provide a global read of the shared ZAP session. A target
+scope also does not isolate results to one scan ID; see
+[Client Spider findings](#client-spider-findings) below.
+
+## Guided Tools
+
+Guided findings and report tools:
+
+- `zap_findings_summary`
+- `zap_findings_details`
+- `zap_findings_snapshot`
+- `zap_findings_diff`
+- `zap_report_generate`
+- `zap_report_read`
+- `zap_report_read_chunk` (introduced in `v0.15.0`)
+
+Use these when:
+
+- you want quick triage with less tool selection overhead
+- you want report generation and readback without selecting a raw ZAP template
+- you want snapshots and diffs for reviewed baselines
+
+## Summary Layer
+
+Use:
+
+- `zap_findings_summary`
+
+This is the first-pass risk picture. It is the cheapest place to start.
+
+## Grouped Details
+
+Use:
+
+- `zap_findings_details` for grouped detail or bounded instances
+
+Choose grouped detail when you need description, remediation guidance, CWE, WASC, or alert-family context before drilling into raw evidence.
+
+## Raw Instances
+
+Use:
+
+- `zap_findings_details` with `includeInstances=true`
+
+Choose raw instances when you need:
+
+- concrete URLs
+- params
+- evidence
+- attack samples
+- message IDs
+
+Raw records retain ZAP's `nodeName`, HTTP `method`, and alert `tags` when
+available. `nodeName` identifies a full structural location, including its
+origin and path; it is not just the final path segment.
+
+The `SYSTEMIC` tag marks findings that are typically site-wide. Their counts
+describe recorded examples, not the total number of affected endpoints. ZAP
+may limit additional examples; the tag alone does not prove a limit was reached.
+
+## Snapshot And Diff
+
+Guided snapshot tools:
+
+- `zap_findings_snapshot`
+- `zap_findings_diff`
+
+Use them when:
+
+- you want a stable baseline after a known-good scan
+- you need before/after comparison for CI or release gates
+- you want to focus on net-new findings instead of total backlog size
+
+Snapshots from `v0.16.0` use version 3 and include measured scanner inventory.
+See the
+[release and upgrade guide](/mcp-zap-server/releases/0.16.0/) before updating
+the server and gate together. Version 3 retains version 2 finding identity:
+comparisons prefer the full `nodeName`
+plus HTTP method, falling back to the raw URL when `nodeName` is unavailable.
+Rule, risk, confidence, and parameter differences still distinguish findings.
+This avoids treating changing parameter values as new locations when ZAP maps
+them to the same structural node. Keep the same ZAP context and site-structure
+configuration when comparing scans. See [ZAP's alert de-duplication guidance](https://www.zaproxy.org/blog/2025-09-30-alert-de-duplication/).
+
+Snapshots preserve individual example records; diffs count unique finding
+identities. Several exported records can therefore count as one finding.
+
+Version 1 and 2 baselines remain readable. Version 1 uses the previous URL-based
+algorithm and shows a legacy notice; version 2 retains node identity. Neither
+old format records scanner provenance, so its comparison is marked `unknown`.
+Update the bundled CI gate alongside the server and update external snapshot
+readers for version 3 before accepting a reviewed replacement baseline.
+
+The `scanner` object records the measured ZAP version and installed add-on
+IDs, versions and maturity, plus available server build identity. Missing
+revision or image digests remain `null`; configured image tags are not measured
+image identities. Failed, malformed or changing inventory reads make
+`inventoryComplete` false while findings remain readable.
+
+New/resolved counts require complete matching engine/add-on inventories.
+Changed or unknown inventories show informational added/removed/retained
+observations instead. A disappeared alert after a rule update is therefore not
+reported as an application fix. In the CI gate, `baseline-mode: enforce` with
+`fail-on-new-findings: true` fails for an incomparable baseline; `seed` permits
+review. Accepted baselines are never automatically overwritten.
+
+Inventory is measured around snapshot export, not reconstructed from past
+scan history. Keep the engine and add-ons fixed during the scan/report run;
+matching inventory alone proves neither identical coverage nor remediation.
+See the repository's [CI gate contracts](https://github.com/dtkmn/mcp-zap-server/blob/main/docs/scanning/CI_GATE_CONTRACTS.md)
+for the versioned evidence fields and baseline migration.
+
+## Report Artifacts
+
+The scoped-report protection and paged readback below are introduced in
+`v0.15.0`. They are not included in `v0.14.0`. Check `tools/list` on your running
+server before using `zap_report_read_chunk`.
+
+Available tools:
+
+- `zap_report_generate`
+- `zap_report_read`
+- `zap_report_read_chunk` (introduced in `v0.15.0`)
+
+Guided report generation accepts `baseUrl`, `format` (`html` or `json`), and
+`theme`, and returns the artifact path. Supply `baseUrl` for an absolute HTTP(S)
+origin or path prefix. A scoped report includes that target's alert evidence and
+omits shared-session insights, statistics, sequences and automation diagnostics.
+JSON retains engine identity and generation timestamps. Scoped HTML uses the
+standard template's default appearance; light/dark themes apply to full-session
+HTML. A path filter remains a prefix filter, not a scan-ID boundary.
+
+The root-origin preservation fix is included in released `v0.16.0`:
+reports generated with that version treat `https://target.example` and `https://target.example/`
+equally, including alerts ZAP records with an empty root path. Other hosts,
+schemes and ports remain excluded. Non-root path prefixes are case-sensitive.
+
+Report templates group alert families and instances. Their totals are not
+necessarily interchangeable with individual alert records returned by the
+findings API. Compare the concrete URLs and evidence when investigating a
+difference; a count difference alone does not establish missing findings.
+
+Omitting `baseUrl` explicitly requests the full ZAP session. The guided interface supports HTML and JSON output; raw template selection is not exposed. Reports generated outside this MCP path use their own isolation and sanitization rules. Use separate ZAP sessions or engines when workloads require client isolation.
+
+### Preview Or Complete Retrieval
+
+Pass the generated path as `reportPath` to `zap_report_read` for a preview. Its
+default is 20,000 UTF-16 characters and its maximum is 200,000; `Truncated: yes`
+means the complete artifact has not been retrieved.
+
+For complete retrieval, call `zap_report_read_chunk`:
+
+```json
+{
+  "reportPath": "<path returned by zap_report_generate>",
+  "offset": 0,
+  "maxChars": 20000
+}
+```
+
+The JSON result contains `content`, `offset`, `nextOffset`, `endOfFile`,
+`charactersReturned`, `totalCharacters`, `offsetUnit` and `artifactSha256`.
+Append `content` exactly, preserving newlines. On each subsequent call, use the
+returned `nextOffset` and supply the first page's hash as `expectedSha256`.
+Stop when `endOfFile` is true (`nextOffset` is then null). A changed file is
+rejected; restart retrieval rather than combining pages from different reports.
+
+Offsets and page sizes count **Unicode code points**. Supplementary Unicode
+characters count as one code point; pages never split a UTF-16 surrogate pair.
+Joined or multi-character emoji can span pages; append the content exactly to
+reconstruct them. The default page is 20,000 code points, capped
+at 200,000. Reports must be valid UTF-8 and at most **50 MiB**. Each page streams
+the file to verify its complete SHA-256 and length while retaining only the
+requested page in memory. This bounds memory; reading many small pages still
+requires repeated file processing. The hash covers the original UTF-8 bytes.
+
+Both read tools enforce the caller's report directory. They reject traversal,
+symbolic-link paths, generation staging files and multiple hard links where the
+file system exposes link counts. The report directory must remain controlled by
+trusted server processes.
+
+## Client Spider Findings
+
+In `v0.13.0`, [Client Spider](../client-spider/) uses these same findings and report tools. Wait for crawl completion and `zap_passive_scan_wait`, then filter the summary, details, and report by the target's `baseUrl`.
+
+These tools read the shared ZAP session, not an exclusive set of findings for one crawl. A `baseUrl` filter narrows the target but does not isolate a scan ID. Other crawls, authentication checks, and active scans against that target can contribute alerts. Recorded alert instances are not necessarily distinct confirmed vulnerabilities.
+
+There is no dedicated crawler results-list or Client Map export tool in the guided catalog. Use separate ZAP sessions or instances when a comparison requires results attributable to one crawler.
+
+## Typical Flow
+
+```text
+1. Finish crawl or attack work
+2. Run zap_passive_scan_wait
+3. Read findings summary with the scanned target's baseUrl
+4. Drill into grouped details using the same baseUrl
+5. Expand to raw instances only when you need evidence
+6. Generate a report artifact
+7. Retrieve the complete report, following page offsets if the preview truncates
+8. Snapshot or diff findings for later comparison
+```

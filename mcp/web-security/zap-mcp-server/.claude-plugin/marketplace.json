@@ -1,0 +1,14 @@
+{
+  "name": "mcp-zap-connect",
+  "description": "Local MCP ZAP Server setup with the MCP ZAP Connect plugin.",
+  "owner": {
+    "name": "Daniel Tse"
+  },
+  "plugins": [
+    {
+      "name": "mcp-zap-connect",
+      "source": "./plugins/mcp-zap-connect",
+      "description": "Guided local MCP ZAP setup, pre-scan readiness checks and explicit recovery for Codex, Cursor and Claude Code."
+    }
+  ]
+}

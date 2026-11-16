@@ -1,0 +1,164 @@
+# GitHub CI Pack Pilot Install Runbook
+
+Use this runbook when turning the bundled GitHub Actions security gate into a
+pilot install for another repository.
+
+The goal is not to prove every enterprise workflow. The goal is to give a team
+one copyable GitHub path that starts the gateway, runs a ZAP-backed scan through
+MCP, emits evidence, and fails or warns on net-new findings.
+
+Use this runbook for installation mechanics. Use the
+[Seeded API Gate Playbook](../../scanning/SEEDED_API_GATE_PLAYBOOK.md) for the
+team process: seed mode, artifact review, baseline acceptance, and enforcement.
+
+## What Ships Today
+
+- Composite action: `.github/actions/zap-security-gate`
+- Copyable workflow: `examples/github-actions/zap-security-gate.yml`
+- Validation workflow: `.github/workflows/zap-security-gate-juice-shop.yml`
+- Optional webhook callback action: `.github/actions/zap-webhook-callback`
+- Artifact contracts in the updated implementation: `ci_gate_result/v2`,
+  `ci_gate_findings_snapshot/v3`, `ci_gate_findings_diff/v3`, and
+  `ci_gate_artifact_manifest/v1`. These provenance contracts are included in
+  released `v0.16.0`; upgrade the server and action together.
+  See the [release and upgrade guide](../../releases/RELEASE_NOTES_0.16.0.md).
+- Legacy v1/v2 snapshots remain readable and retain their identity mode when
+  normalized into v3, but missing scanner provenance means unknown
+  comparability. See [CI Gate Contracts](../../scanning/CI_GATE_CONTRACTS.md).
+
+## Preflight
+
+1. Choose a target URL that the ZAP container can reach.
+2. Choose whether the action starts the bundled stack or points at an existing
+   MCP server.
+3. Choose a release image tag or digest for `mcp-server-image`.
+4. Decide whether the first run should be crawl-only:
+   `run-active-scan: "false"` is safer for onboarding.
+5. Decide whether the first run should block pull requests:
+   `fail-on-new-findings: "false"` is better for the first baseline run.
+6. Use `baseline-mode: seed` until the first baseline is reviewed. Switch to
+   `baseline-mode: enforce` when the gate is meant to block on missing or
+   mistyped baseline evidence and changed or unknown scanner provenance.
+
+Do not use mutable image tags such as `latest`, `dev`, `main`, `nightly`,
+`edge`, or `canary`. The action rejects them because a pilot gate must be
+reproducible.
+
+## 30-Minute Pilot Checklist
+
+Use this as the first-pass install checklist. If you cannot finish these steps
+without custom engineering, the pack is not ready for that pilot yet.
+
+- [ ] Pick one repository and one low-risk target service.
+- [ ] Copy `examples/github-actions/zap-security-gate.yml` into
+  `.github/workflows/zap-security-gate.yml`.
+- [ ] Replace the local action reference with the release action ref, such as
+  `dtkmn/mcp-zap-server/.github/actions/zap-security-gate@<release-tag>`,
+  or vendor `.github/actions/zap-security-gate` into the pilot repository.
+- [ ] Copy `examples/github-actions/docker-compose.app-under-test.yml` if the
+  target service should start inside the workflow.
+- [ ] Replace the example `app` image with the pilot service image.
+- [ ] Set `target-url` to the compose service address, such as `http://app:80`.
+- [ ] Add `seed-requests-file` when the target surface needs JSON `POST` or
+  other API requests a spider cannot discover.
+- [ ] Pin `mcp-server-image` to a release tag or digest.
+  The action rejects the literal `<release-tag>` placeholder.
+- [ ] Keep `run-active-scan: "false"` for the first onboarding run.
+- [ ] Keep `baseline-mode: seed` until the first baseline is reviewed.
+- [ ] Keep `fail-on-new-findings: "false"` until the first baseline is reviewed.
+- [ ] Run the workflow manually.
+- [ ] Retain `zap-artifacts` in access-controlled CI storage for operator review.
+- [ ] Review `current-findings.json`, `gate-metadata.json`, and
+  `artifact-manifest.json`.
+- [ ] Confirm the snapshot records the running ZAP version and complete
+  installed add-on inventory. Review scanner comparability before using diff
+  counts; a disappearing alert with changed or unknown provenance is not
+  labelled resolved.
+- [ ] Commit a baseline only after the pilot owner accepts the current security
+  state.
+
+## Verify This Repository Before Installing
+
+Run the CI helper behavior tests:
+
+```bash
+python3 -m pip install PyYAML==6.0.3
+python3 -m unittest discover -s tests/python -p 'test_*.py'
+```
+
+These tests cover helper behavior and execute both GitHub and GitLab gate
+entrypoints. Use the Juice Shop workflow to check the action, Compose stack,
+MCP server, ZAP and generated artifacts in your environment.
+Use Python 3.9+, Helm and Docker Compose; PyYAML is only needed for these tests.
+The Compose checks render configuration without starting containers.
+
+## Install In A Pilot Repository
+
+1. Copy `examples/github-actions/zap-security-gate.yml` into the target
+   repository as `.github/workflows/zap-security-gate.yml`.
+2. Replace the local action reference with the release tag:
+
+   ```yaml
+   uses: dtkmn/mcp-zap-server/.github/actions/zap-security-gate@<release-tag>
+   ```
+
+3. Set `mcp-server-image` to the same release tag or a digest.
+4. If the app under test is not externally reachable, add a compose override
+   and include the app service in `compose-services`. Start from
+   `examples/github-actions/docker-compose.app-under-test.yml` and replace the
+   example `nginx:1.27-alpine` image with the pilot service image.
+5. If the meaningful surface is an API endpoint, add a seed request file and
+   pass it as `seed-requests-file`.
+6. Start with:
+
+   ```yaml
+   run-active-scan: "false"
+   baseline-mode: seed
+   fail-on-new-findings: "false"
+   ```
+
+7. Run the workflow manually and inspect `zap-artifacts`.
+8. Commit the generated `current-findings.json` as the accepted baseline only
+   after review.
+9. Enable blocking mode only after the baseline and suppressions are agreed:
+   set `baseline-mode: enforce` and `fail-on-new-findings: "true"` together.
+   Different or unknown scanner provenance then fails enforcement. If ZAP or
+   its add-ons change, review fresh seed-mode evidence and explicitly accept
+   a replacement baseline; the action never overwrites it automatically.
+
+## Rollback
+
+If the gate blocks unexpectedly:
+
+1. Set `fail-on-new-findings: "false"` to keep evidence generation while
+   unblocking delivery.
+2. Keep uploading `zap-artifacts`; do not remove the gate completely unless the
+   action cannot start.
+3. Pin back to the last known good action release and image tag.
+4. Review `gate-metadata.json`, `findings-diff.json`, and
+   `artifact-manifest.json` before changing the baseline.
+
+## Evidence To Collect
+
+Keep these in access-controlled operator or CI records:
+
+- workflow run URL
+- `gate-metadata.json`
+- `current-findings.json`
+- `findings-diff.json` when a baseline was used
+- `artifact-manifest.json`
+- copied report artifact under `zap-artifacts/reports`
+
+These records can contain target-specific data. Do not copy raw results or
+internal testing history into public issues, release notes or documentation.
+Share only reviewed, redacted diagnostics when requesting support.
+
+## Exit Criteria
+
+The GitHub CI pack is credible for a pilot when:
+
+- a fresh repository can copy the workflow and run it without custom glue
+- the target is scanned through the MCP-backed gateway, not raw ZAP scripts
+- artifacts are uploaded and readable
+- the baseline/diff behavior is understood by the pilot operator
+- rollback is documented before blocking mode is enabled

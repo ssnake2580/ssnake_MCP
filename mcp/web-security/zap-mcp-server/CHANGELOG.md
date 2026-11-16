@@ -1,0 +1,580 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.17.1]
+
+### Changed
+
+- Align scanner, chart, Registry-source and fresh-install defaults to `0.17.1` / `v0.17.1`. Existing selected versions and settings are preserved. Desktop connector `0.1.0`, plugin `0.5.0` and Gateway Core `0.11.0` retain independent versions.
+- Add a read-only draft-release preflight and an explicit Desktop-assets-first publishing procedure. Verify all four downloaded Desktop files before publishing an immutable release; the image-release workflow cannot attach missing assets afterward.
+- Carry forward the `0.17.0` product changes and upgrade requirements. The published `v0.17.0` release lacks Desktop downloads and its image-release workflow did not complete. Check the [0.17.1 upgrade guide](./docs/releases/RELEASE_NOTES_0.17.1.md) and actual image publication before installing this version. The separate zlib finding remains open.
+
+## [0.17.0]
+
+Check [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases) and
+image publication before installing this version. Source version metadata does
+not publish images, registry entries or Desktop downloads. Read the
+[upgrade guide](./docs/releases/RELEASE_NOTES_0.17.0.md) for the explicit-deny
+migration, installation defaults and separate client versions.
+
+### Fixed
+
+- Describe empty findings as currently recorded alerts without inferring scan completion, coverage or safety. Keep useful in-progress reads and existing evidence authorization.
+- Make explicit operator target denies authoritative over localhost/private-network opt-ins and overlapping allow rules. Separate blank-by-default operator rules from built-in address guards; preserve configured restrictions, case-insensitive hostname matching and equivalent numeric IP literals.
+- Build the shell-free healthcheck with Go `1.27.3` for its `crypto/x509` fix, and align the standalone extension example's compile-only Spring dependency with the application's patched Boot `4.1.1` / Framework `7.0.9` baseline.
+- Refresh the signed Java 25 / Debian 13 runtime base to include Expat `2.9.0-1~deb13u1` for Linux AMD64 and ARM64. The separate zlib finding remains; package updates are not a claim that all dependency findings are cleared.
+- Override the Claude Desktop MCPB builder's transitive `tmp` dependency to `0.2.7`, covering path traversal, symbolic-link handling and the `0.2.6` non-string path bypass. Reject affected lockfile copies before packaging and in the rebuilt archive. The dependency remains build-only.
+- Pin Zod `4.6.7` across Claude Desktop runtime and build dependencies to address `SNYK-JS-ZOD-20510278`. Reject affected lockfile resolutions and check the rebuilt MCPB's runtime version. Earlier preview artifacts containing Zod `3.25.76` must be rebuilt before publication.
+
+### Added
+
+- Add Claude Desktop MCPB packaging, local prerequisite/setup/readiness tools, a matching setup guide and checksums for normal scanner releases. The connector uses the official MCP SDK transport and bundled Docker bootstrap/doctor resources; installation alone does not start containers or replace an existing scanner's settings.
+- Add Claude Code packaging and a marketplace index alongside Codex and Cursor support in MCP ZAP Connect `0.5.0`. Shared setup preserves other clients' settings and verifies the intended client's authenticated connection separately.
+- Add scanner-readiness checks before requested scan workflows, with actionable recovery guidance and no automatic repair or scan replay. Tool readiness remains separate from scan completion.
+
+### Changed
+
+- Filter guided next-action suggestions by the caller's effective tool scopes while preserving existing authorization enforcement.
+- Align active scanner/application, chart, registry-source and installation defaults to `0.17.0` / `v0.17.0`. Preserve existing selected versions and explicit restrictions. Gateway Core/WebFlux remains `0.11.0`; Flyway migrations remain V1–V8.
+- Select scanner `v0.17.0` in fresh Desktop setup resources after image publication. Connector `0.1.0` and plugin `0.5.0` remain independently versioned.
+
+## [0.16.0]
+
+This version is [released](https://github.com/dtkmn/mcp-zap-server/releases/tag/v0.16.0),
+with Linux AMD64/ARM64 images published on GHCR and Docker Hub and MCP Registry
+`0.16.0` active/latest. Chart `0.16.0` is included in the tagged source. Read the
+[release and upgrade guide](./docs/releases/RELEASE_NOTES_0.16.0.md) before
+updating CI consumers or Automation Framework plans; it includes the immutable
+image digest and separate Mac/plugin availability.
+
+### Added
+
+- Record measured ZAP engine/add-on inventory and available server build identity in v3 findings snapshots, CI diffs and gate summaries. Legacy snapshots remain readable with unknown comparability; unavailable metadata is explicitly unknown.
+- Validate whole-plan Automation Framework durations and runtime capabilities before dispatch. Declaring `env.parameters.maxDuration` requires ZAP `2.17.0` and Automation Framework `0.61.0` or newer; invalid durations and unsupported authentication `pollMethod` configurations are rejected.
+- Add Cursor onboarding and native plugin metadata to MCP ZAP Connect's shared Docker setup skill, with private client configuration, status-only verification and linked terms. Use the source installation instructions when the plugin is unavailable in the public directory.
+- Add an unsigned Apple Silicon CLI preview with a private Java runtime, HTTP-focused ZAP, persistent private settings, generated credentials, owned-process lifecycle and authenticated doctor checks. Add private Codex TOML output, packaged runtime notices and a checksum-linked source companion with documented library replacement. No public Mac binary is attached to `v0.16.0`.
+- Add optional private ChatGPT tunnel support with local API-key authentication and a shared connection guide.
+
+### Fixed
+
+- Require complete matching ZAP engine/add-on inventories before reporting new or resolved findings. Changed or unknown scanner identity produces informational observations; enforced CI gates fail until a reviewed comparable baseline is supplied.
+- Stop inferring Automation Framework success from a finish timestamp and an empty error list. Report `Successful` as `pending` while running, `no` on finished plans with reported errors, or `unknown` otherwise; native cancellation does not prove a completed scan.
+- Enforce containment and link restrictions for Automation Framework plans and artifacts, validate literal report output directories/filenames before ZAP dispatch, use no-follow file reads, reject multiple hard links where supported and bound previews. These checks require trusted local writers and do not protect against concurrent hostile filesystem ancestor swaps.
+- Preserve empty-path root alert evidence in target-scoped reports while excluding other origins and ports. Temporary report contexts stay outside scan scope and are removed afterward; existing artifact authorization and session-metadata filtering remain enforced.
+- Remove an unreachable HTTP-method fallback from request logging; supported Spring server requests always provide a method.
+
+### Changed
+
+- Version CI snapshots/diffs as `/v3` and gate results as `/v2`, with nullable comparison counts. Preserve node identity and suppression behavior. Upgrade server and gate together; review a fresh v3 baseline before restoring enforcement against legacy v1/v2 evidence.
+- Set a 300-second whole-plan limit and explicit always-run report job in the canonical Automation Framework example. Document cooperative expiry, requestor/report work beyond the budget, passive analysis remaining active and possible Spider starts after expiry during slow seed preparation.
+- Start the local Docker quick start from published versioned image `v0.16.0`, preserving settings/keys and cached images. Generate settings atomically and require container health plus authenticated MCP probes before reporting readiness; retain source builds in the development override.
+- Use the current user's macOS service manager for preview processes so they survive terminal/agent completion. Explicit stop removes registrations; login startup and automatic crash restarts stay disabled. Bound doctor HTTP requests, keep keys out of process arguments and avoid raw server errors in diagnostics.
+- Keep Mac packaging/source archives in the manual workflow; owner-triggered `main` builds can attach the four-file set to an existing draft release after tag validation, while publication stays manual. Automatic PR package builds are disabled. HAR, packet-capture and ModSecurity import/export are unavailable in this preview.
+- Generate JaCoCo XML/HTML coverage from existing Java tests, combine Docker results when available and import through authenticated CI-based SonarQube analysis. Retain fork coverage artifacts without adding a minimum coverage gate.
+- Update PostgreSQL JDBC to `42.7.14` for its upstream security fixes and the docs lockfile's Zod to `4.6.7`. Refresh the macOS runtime notices for the JDBC update and its Checker Framework qualifier dependency.
+- Align current application, chart, registry metadata, local extension proof and installation references to `0.16.0` / `v0.16.0`. No database migration is added beyond V1–V8, and Gateway Core/WebFlux stays `0.11.0`.
+
+### Documentation
+
+- Clarify crawler routing without changing it: `auto` uses HTTP, with AJAX fallback only after an unauthenticated direct start fails; JavaScript apps should explicitly select Client Spider. Document native scan IDs, the global AJAX lifecycle, Client `0.33.0` idle expiry and separate crawler/rule coverage; remove unsupported WAF-bypass and completion claims.
+- Consolidate Docker onboarding into start, connect and report steps, with source builds in the contributor guide. Document Mac data retention and private client/tunnel setup separately from build/release instructions.
+- Update cloud walkthroughs for published versioned images, private access, storage preservation and operator-managed network boundaries.
+
+## [0.15.0]
+
+These changes describe version `v0.15.0`; release preparation and a merge to
+`main` do not publish its release or images. Check
+[GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases) and the
+release image workflow before deploying. Read the
+[upgrade notes](./docs/releases/RELEASE_NOTES_0.15.0.md) for storage, image and
+client changes.
+
+### Added
+
+- Add an infrastructure-only CloudFormation starter for a dedicated single-worker EKS cluster in an existing VPC, with explicit operator access, managed networking/storage add-ons and an encrypted gp3 StorageClass. Its shared repository/website walkthrough covers Helm handoff, verification and retained-volume cleanup.
+- Add opt-in client-supplied OpenAPI content import through guided `zap_target_import` with `definitionType=openapi` and `sourceKind=content`. Validate bounded, self-contained Swagger/OpenAPI JSON or YAML and an explicit destination-policy-approved `hostOverride` before staging on a dedicated shared filesystem and dispatching to ZAP. The feature is disabled by default; attachment contents must be supplied by the MCP client.
+- Add `zap_report_read_chunk` on both MCP surfaces for complete paged UTF-8 report retrieval, Unicode-safe offsets and SHA-256 verification between pages. It uses the existing `zap:report:read` permission.
+- Add independent `ZAP_SPIDER_MAX_CHILDREN` configuration and Compose/Helm pass-through, defaulting to 10 alongside the depth limit; zero remains unlimited.
+- Add `zap.persistence.automationSubdirectory` to configure Helm automation files inside a client's report workspace while preserving the existing default directory.
+- Add opt-in Helm OpenAPI content staging on sibling PVC directories, with nonroot initialization, read-only ZAP access and a single MCP writer using `Recreate`. Existing PVC users must migrate report/automation files before selecting `workspaceSubPath`; the default root layout is unchanged.
+
+### Fixed
+
+- Apply the actual ZAP depth setting before HTTP crawls instead of passing depth into the child-count parameter, including authenticated crawl defaults.
+- Publish target-scoped MCP reports without shared-session insights, statistics, sequence data or automation diagnostics. Scoped JSON is filtered before publication; scoped HTML uses the standard template, and unsupported scoped templates are rejected.
+- Bound report-read memory and artifact size, reject unsafe workspace link paths and protect report generation staging files from MCP readback. Existing report previews remain available.
+- Reconcile ZAP outbound defaults during health checks and outbound operation starts so delayed engine startup and engine restarts do not silently skip mandatory user-agent/timeout settings. Failed mandatory configuration leaves MCP unready; unsupported optional DNS TTL configuration remains compatible.
+- Redact webhook destination credentials, paths, queries and fragments from delivery diagnostics. Record transport failure categories without raw exception messages while preserving the original delivery URL and authentication.
+- Bound passive scan waits to 1–300 seconds, polling intervals to 1–10,000 milliseconds and four concurrent waits per MCP server instance. Apply the caller's deadline across polling and slow engine reads; report completion as unknown if no status read finishes before the deadline.
+- Repair durable scan queues using current transactionally locked state instead of an earlier snapshot. Preserve concurrent accepted-scan and cancellation updates, and keep lease renewal active for in-flight engine starts and polls when the queue refreshes.
+
+### Changed
+
+- Align Spring Boot and CycloneDX build-tool Jackson dependencies to `3.1.7` and `2.22.3` through separate Gradle buildscript BOMs. Application runtime Jackson remains `3.2.3`; plugin versions and Gateway Core/WebFlux dependencies are unchanged.
+- Document EKS storage/CNI prerequisites, explicit ZAP web egress and background passive-rule requests, content staging and existing-PVC migration.
+- Require an operator-supplied, digest-pinned `MCP_ZAP_IMAGE` in the EC2 Compose example. Obtain the matching public release digest after image publication; the example no longer silently starts the older `v0.14.0` image.
+- Align application, MCP server, Helm chart, MCP Registry package, local extension API proof metadata and current installation examples to `0.15.0` / `v0.15.0`. The extension API remains `experimental-local`; release images and Registry publication remain separate operations.
+
+## [0.14.0]
+
+Release preparation and a merge to `main` do not publish this version or its
+images. Check [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases)
+and the release image workflow for availability. This upgrade changes accepted
+configuration and inputs; read the
+[upgrade notes](./docs/releases/RELEASE_NOTES_0.14.0.md) before deploying.
+
+### Changed
+
+- Remove the legacy `mcp.server.apiKey` fallback. Register every key in `mcp.server.auth.apiKeys`; `MCP_API_KEY` still configures the packaged default client. Reject nonblank removed-property values at startup, require a key in API-key/JWT modes, and restrict explicit placeholder opt-in to active `local`/`dev`/`test` profiles. See the [API-key migration guide](./docs/src/content/docs/security-modes/index.md#registered-api-keys-in-v0140) for client and workspace mapping.
+- Use the existing atomic `TokenBucketRateLimiter.attempt` result for MCP client rate decisions and rejection retry delays, with one policy snapshot per attempt. The atomic API was introduced in gateway-core `0.10.0`.
+- Upgrade the published Gateway Core and Spring WebFlux adapter dependencies to `0.11.0`. Keep ZAP's explicit Jackson `3.2.3` BOM and configured authorization/wildcard policies.
+- Derive the active catalog and validate all exposed-tool permission mappings together through `McpToolAccessRegistry.activeToolRegistry`, using the same `ToolCallbackProvider` as server registration. Remove the duplicate startup validator; missing mappings are reported together, and invalid or duplicate active names fail startup.
+- Adopt `McpGatewayAuditObservers` once per governance signal, composing it with metrics-only callbacks. Authentication, policy and tool-completion events still use ZAP's existing audit sink. Add typed adapter-rejection audits and the bounded `mcp.zap.adapter.rejections` reason counter.
+- Align governance audits with the shared schema: authorization includes `reason` and scope lists even when empty; protection uses outcome `rejected` with a separate `errorCode`; invalid-request and adapter diagnostics use outcome `rejected` and omit unavailable workspace/tool identities. Governance records no longer repeat the principal as `data.clientId`, and protection no longer includes `data.toolFamily`; tool-family metrics remain available. The Actuator sink retains its `anonymous` fallback for absent principals. Update audit queries using the previous fields/outcomes; see the [observability guide](./docs/src/content/docs/operations/observability.md#gateway-0110-audit-schema-in-v0140).
+- Update runtime Jackson from `3.2.1` to `3.2.3`, Netty from `4.2.17.Final` to `4.2.18.Final`, and Logback from `1.5.36` to `1.6.4`. Update Gradle to `9.8.0`, the CycloneDX build plugin to `3.4.1`, documentation dependencies, and pinned CI actions. Build plugins resolve their own dependencies; these runtime upgrades do not resolve every dependency advisory.
+- Align application, MCP server, Helm chart, MCP Registry package, local extension API proof metadata, and current versioned installation examples to `0.14.0` / `v0.14.0`. Java 25 and the configured ZAP `2.17.0` baseline are unchanged; no new database migration is required from `0.13.0`.
+
+### Fixed
+
+- Correct Helm migration hook ordering and share report/automation storage between MCP and ZAP. Add existing-claim and PVC retention settings, validate potential autoscaling and shared JWT revocation, and change cloud references to private single-replica or TLS-ingress/shared-state configurations. Existing Helm users must review the [upgrade guidance](./helm/mcp-zap-server/README.md#upgrading), including typed revocation settings and RWX requirements for multiple replicas.
+- Bound `mcp.zap.http.requests` to at most 1,024 timer series. Use matched route patterns or `/unmatched` instead of raw paths, normalize extension methods, and retain excess requests in bounded overflow series. Raw paths remain in structured logs; update metric queries using the old labels.
+- Bound inline and workspace Automation Framework YAML before construction or dispatch: 1 MiB UTF-8 input and normalized output, one mapping-root document, 10,000 expanded nodes, depth 50, expanded scalar and collection-alias limits. Reject cyclic aliases and collection mapping keys. Inline requests also remain subject to the HTTP body limit, which defaults to 256 KiB. See [YAML limits](./docs/src/content/docs/scanning/automation-framework.md#yaml-limits).
+- Apply the ordinary scan destination policy to supported Automation Framework plans from inline YAML and workspace files before materialization and engine dispatch. Validate declared context, requestor, scan, login, and polling URLs; reject destination substitutions, unsupported jobs/authentication, and engine configuration overrides. See the [supported plan contract](./docs/src/content/docs/scanning/automation-framework.md#destination-policy).
+- Render an empty MCP ingress rule list in Helm when same-namespace access is disabled and no explicit ingress peers are configured. Preserve the configured peer selectors and MCP port in other combinations; see [network policy guidance](./helm/mcp-zap-server/README.md#network-policy).
+- Apply the configured destination policy to OpenAPI target overrides for URL and file imports. Preserve overrides naming an explicit host; reject scheme-only and path-only overrides with guidance to supply a full HTTP(S) target. Omitted overrides retain ZAP's definition-derived behavior and require trusted definitions and engine egress controls. See [OpenAPI target policy](./docs/src/content/docs/scanning/api-schema-imports.md#openapi-target-policy).
+- Keep JWT revocations and used refresh tokens effective through the validator's existing 60-second clock-skew allowance in both stores, without changing stored expiration values or requiring a schema migration. Reject JWTs without `exp` and requests that exceed this lifetime during revocation enforcement; server-issued tokens already include `exp`. See the [lifetime and upgrade guidance](./docs/src/content/docs/security-modes/jwt-authentication.md#jwt-expiration-and-revocation-lifetime-in-v0140).
+- Make PostgreSQL authoritative for JWT revocation and refresh-token consumption, with no process-local fallback. Backend failures return sanitized HTTP `503` responses for protected JWT requests and token refresh, revoke, and validate endpoints; uncertain writes return no token pair or success acknowledgment. Reject invalid backend configuration at startup and default `failFast` to `true`; `false` only relaxes expired-record cleanup. See the [failure and recovery guidance](./docs/src/content/docs/security-modes/jwt-authentication.md#postgresql-failure-behavior-in-v0140).
+- Mark `baseUrl` as required in the guided and expert findings-read tool schemas, matching the existing runtime requirement for a target with visible scan-history evidence. Update the findings workflow documentation; existing target/visibility checks and optional filters are retained.
+- Correct the JWT deployment guidance to use the supplied Compose configuration and required JWT enablement settings. Clarify that JWT authentication does not isolate the shared ZAP engine; deployments require a dedicated ZAP instance per trust boundary.
+- Correct the scan workflow and tool-surface guidance for Client Spider browser authentication, guided report reads, and expert-only controls. Use the `spiderAjax` add-on installation identifier.
+- Clarify protected MCP header authentication versus token-management request bodies, and trace errors through the returned correlation header without assuming every error body includes correlation fields.
+- Generate the first-run guide, production simulation runbook, seeded API gate playbook, extension release policy, and security policy website pages from their canonical repository documents. Preserve their routes and section anchors, and reconcile Codex setup, evidence exports, and rollback/restore guidance into the shared sources.
+
+## [0.13.0]
+
+Version-specific changes are listed below. Release preparation and a merge to
+`main` do not publish this version. Check
+[GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases) and the release
+image workflow for availability. See the
+[upgrade notes](./docs/releases/RELEASE_NOTES_0.13.0.md) before deploying.
+
+### Added
+
+- Added Client Spider crawling through guided `strategy=client` and expert tools in direct and queued modes. Native ZAP scan IDs identify each crawl for status and cancellation; crawls reuse the existing spider duration setting and queue concurrency, retry, and cancellation handling. See [execution modes and prerequisites](./docs/src/content/docs/scanning/scan-execution-modes.md).
+- Added operator-managed `kind: browser` authentication profiles for Client Spider, using existing credential references in both execution modes. Validation requires a positive ZAP verdict and the configured logged-in indicator in a fresh response before reporting success. See [browser authentication setup](./docs/src/content/docs/scanning/authenticated-scanning-best-practices.md#browser-authentication-for-client-spider), including the required ZAP API timeout setting.
+
+### Fixed
+
+- Enabled automatic session detection for guided browser authentication profiles so verification can replay cookies or header tokens, including bearer tokens used by Juice Shop. Browser login could previously succeed while verification failed because the token was missing from the verification request.
+- Reject malformed crawl-depth values in stored Client Spider jobs with a clear error before launching a crawl.
+
+### Changed
+
+- Aligned application, MCP server, Helm chart, MCP Registry package, local extension API proof metadata, and versioned installation examples to `0.13.0` / `v0.13.0`.
+- Documented Client Spider prerequisites, browser login verification, queue rollout, and shared findings and report boundaries. Upgrade every worker sharing a scan queue before submitting `CLIENT_SPIDER` jobs; no new database migration is required when upgrading from `0.12.0`.
+
+## [0.12.0]
+
+Version-specific changes are listed below. Publication dates and availability
+are recorded in [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases).
+See the [upgrade notes](./docs/releases/RELEASE_NOTES_0.12.0.md) before deploying.
+
+### Fixed
+
+- Made queue cancellation durable and retryable for active scans, traditional spiders, and AJAX Spider. Late successful starts are tracked and stopped without discarding their ownership or targeting a newer scan.
+- Serialized managed AJAX lifecycle operations around ZAP's global crawler and retained occupied capacity while cancellation remains unconfirmed. Active scans and traditional spiders continue to use their native scan IDs and configured concurrency.
+- Stopped reporting an AJAX stopped state as proof of successful completion or meaningful percentage progress.
+- Preserved ZAP finding node names, HTTP methods, tags, and recorded examples, and used structural endpoint identity to reduce false new/resolved findings caused by changing URL values.
+- Prevented stack overflow when policy dry-run validates long host patterns, and allowed unexpected token-validation backend failures to return a sanitized HTTP `500` instead of an invalid-token response.
+- Applied the configured ZAP target connection timeout at startup, corrected the AJAX add-on installation hint to `spiderAjax`, and permitted ZAP's API hostname in the default Helm API access expression.
+
+### Added
+
+- Configurable ZAP API connection/read timeouts, bounded waiting after explicit engine-busy responses, and one shared cancellation/cleanup retry window.
+- PostgreSQL migrations V7 and V8 for persisted busy-wait and cancellation state. Migration execution remains opt-in.
+- Configurable ZAP image references in Compose and Docker tests, plus optional ZAP image digests in Helm.
+
+### Changed
+
+- Advanced findings exports and CI findings contracts to version 2 while retaining version 1 baseline support. External snapshot consumers may need updating.
+- Updated project descriptions and the engine display name to the current ZAP name, and clarified MCP client installation guidance.
+- Aligned application, MCP server, Helm chart, MCP Registry package, local extension API proof metadata, and versioned installation examples to `0.12.0` / `v0.12.0`.
+
+## [0.11.1]
+
+Version-specific changes are listed below. Publication dates and availability
+are recorded in [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases).
+
+### Fixed
+
+- Fixed [#227](https://github.com/dtkmn/mcp-zap-server/issues/227): unknown tools and tools disabled by the selected surface now return the same HTTP `200` JSON-RPC `-32602` (`Unknown tool`) response, without an authentication challenge or disclosure of required scopes. Authentication still runs first; enabled tools with insufficient scope still return HTTP `403` when authorization is enforced.
+- Derived the adapter's active tool registry from the callbacks actually registered by ZAP, reusing existing tool descriptors. Availability checks remain active in authorization `off`/`warn` and security `none` modes; a wildcard scope does not enable disabled tools.
+- Prevented id-less `tools/call` messages from executing: they receive HTTP `202` with no body. Invalid tool-call IDs receive HTTP `400` with JSON-RPC `-32600`.
+
+### Changed
+
+- Upgraded `mcp-gateway-core` and `mcp-gateway-spring-webflux` from ZAP `v0.11.0`'s `0.8.0` to `0.10.0`, and adopted the adapter's named builder configuration.
+- Updated Spring Boot to `4.1.1`, Spring AI to `2.0.1`, Gradle to `9.7.1`, documentation dependencies, pinned GitHub Actions, and the distroless runtime image digest.
+- Updated Netty to `4.2.17.Final` and the documentation build's Undici dependency to `8.10.2` for upstream security fixes. The health probe now requires Go `1.26.6` or later and selects Go `1.27.1` by default, matching the container builder.
+- Aligned application, MCP server, Helm chart, MCP Registry package, local extension API proof metadata, and versioned installation examples to `0.11.1` / `v0.11.1`.
+
+### Added
+
+- Regression coverage for unavailable-tool responses, authentication and permission boundaries, guided/expert discovery consistency, request IDs, and startup registry validation.
+
+### Removed
+
+- Removed custom extension API POM/JAR structure checks and their mandatory build hook. The standalone extension build is optional; API packaging and local Maven publication remain available.
+- Removed descriptor object-identity assertions and Java-parameter reflection checks from tests, retaining tool capability checks and testing guided-auth inputs through the generated MCP schema.
+
+## [0.11.0] - 2026-07-27
+
+### Changed
+- Bumped runtime, MCP server metadata, Helm chart metadata, MCP Registry package metadata, extension proof defaults, and current installation examples to `0.11.0` / `v0.11.0`.
+- Updated `mcp-gateway-core` and `mcp-gateway-spring-webflux` from `0.7.2` to `0.8.0` and migrated application JSON handling and WebFlux governance wiring to Jackson 3 data binding, managed through the Jackson `3.2.1` BOM.
+- Kept compilation, bytecode, and runtime on Java 25 while moving the final JVM image from Temurin Alpine to a digest-pinned distroless Java 25 Debian 13 runtime. Docker health checks now use a static HTTP probe instead of `curl`; Kubernetes continues to use native HTTP probes.
+- Updated Netty from `4.2.15.Final` to `4.2.16.Final`, PostgreSQL JDBC to `42.7.12`, Logback to `1.5.36`, and the CycloneDX plugin to `3.3.0`.
+- Pinned the active Docker Compose and standalone installation paths to OWASP ZAP `2.17.0`, matching Helm and Docker-backed integration coverage.
+- Main-branch CI now verifies and builds the AMD64 container without publishing rolling `main` or `sha-*` tags. Versioned multi-architecture image publication remains release-only.
+- Updated the documentation stack to Astro `7.1.3`, Starlight `0.41.4`, and refreshed supporting packages.
+
+### Removed
+- Removed the unsupported native-image deployment facade: `Dockerfile.native`, `docker-compose.prod.yml`, `prod.sh`, and the active native-image performance guide. Supported production paths now use the versioned JVM image or Helm, and the retired guide URL redirects to the production checklist.
+- Removed the legacy repository-only `bin/github-ci-pack-verify.sh` aggregate verifier. CI-helper behavior remains covered by Python unit tests and the live Juice Shop workflow.
+
+### Fixed
+- Aligned the authoritative tool registry with the existing guided runtime exposure of `zap_scan_history_get` and `zap_scan_history_export`.
+
+### Security
+- Pinned the container build, health-probe, runtime, and release BuildKit inputs by digest, and added Cosign verification of the upstream distroless base image in main and release workflows.
+- Hardened GitHub and GitLab security-gate image validation so malformed SHA-256 digests are rejected before workspace directories are created.
+- Made Helm explicitly run the MCP container as UID/GID `1000`.
+
+## [0.10.1] - 2026-07-16
+
+### Changed
+- Bumped runtime, MCP server metadata, Helm chart metadata, MCP Registry package metadata, extension proof defaults, and current install examples to `0.10.1` / `v0.10.1`.
+- Updated `mcp-gateway-core` and `mcp-gateway-spring-webflux` from `0.7.1` to `0.7.2`.
+- Expanded CodeQL coverage to Java, JavaScript/TypeScript, Python, and GitHub Actions, with an explicit Java build and `main`-focused triggers.
+- Aligned policy dry-run partial-rule construction with the existing required-description validation and added regression coverage for missing descriptions.
+
+### Fixed
+- Restored Streamable HTTP responses to server-initiated requests so Cursor keepalive replies reach the downstream MCP runtime and complete with HTTP `202` instead of being rejected as methodless requests.
+
+## [0.10.0] - 2026-07-15
+
+### Changed
+- Bumped runtime, MCP server metadata, Helm chart metadata, MCP Registry package metadata, extension proof defaults, and install examples to `0.10.0` / `v0.10.0`.
+- Changed `zap_auth_session_prepare` to accept only `profileId` and `targetUrl`. Deployments must replace `MCP_AUTH_BOOTSTRAP_ALLOWED_CREDENTIAL_REFERENCES` and `MCP_AUTH_BOOTSTRAP_ALLOW_INLINE_SECRETS` with operator-managed `mcp.server.auth.bootstrap.profiles` configuration.
+- Added executable-JAR, Compose, and Helm migration recipes with secret injection, required restart behavior, and live prepare/validate verification.
+- Updated to Boot-managed Testcontainers `2.0.5` modules and run tagged Docker integration tests before main and release image publication.
+- Updated Spring Boot to `4.1.0` and aligned the standalone extension and CI dependency-resolution proofs with the managed runtime.
+- Updated the runtime to consume `io.github.dtkmn:mcp-gateway-core` and `io.github.dtkmn:mcp-gateway-spring-webflux` `0.7.1`.
+- Limited continuous container publication to successful `main` pushes while keeping CI builds on development and feature branches.
+
+### Security
+- Bound each guided-auth credential and login configuration to one operator-approved canonical origin, removed caller-selected credentials and login settings, and rechecked that origin before validation and authenticated crawl or attack dispatch.
+- Made each guided profile's ZAP context scope immutable and origin-wide, validated login indicators before secret resolution or engine mutation, and kept credential-source metadata out of MCP caller errors.
+- Made form-login validation fail closed unless ZAP reports `likelyAuthenticated=true`, and reject terminal-dot target hosts before URL policy checks or engine dispatch.
+- Made the JVM container run as UID/GID 1000 and made the authenticated-profile Helm migration verify and deploy the exact main-commit image tag.
+- Hardened release provenance so only immutable releases from reviewed `main` history can publish, and pinned every remote GitHub Action to a verified full commit SHA.
+
+## [0.9.1] - 2026-06-26
+
+### Changed
+- Bumped runtime, MCP server metadata, Helm chart metadata, MCP Registry package metadata, and install examples to `0.9.1` / `v0.9.1`.
+- Updated the runtime to consume `io.github.dtkmn:mcp-gateway-core` and `io.github.dtkmn:mcp-gateway-spring-webflux` `0.5.10`.
+- Updated Spring Boot to `4.0.7`, Spring AI to `2.0.0`, Gradle to `9.6.0`, and docs dependencies including Astro `7.0.3`.
+- Moved archived release notes under `docs/releases/` and added an archive index.
+
+### Security
+- Overrode Spring Boot's Jackson 2 BOM to `2.22.0` so the runtime no longer resolves `com.fasterxml.jackson.core:jackson-databind` `2.21.4`.
+- Hardened the Snyk workflow by requiring `SNYK_ORG`, checking for generated SARIF files, and keeping monitor steps bounded.
+
+### Fixed
+- Corrected the README latest-release section so `v0.9.0` release notes remain historically accurate.
+
+## [0.9.0] - 2026-06-10
+
+### Added
+- Added reusable GitHub Actions for ZAP security gates and webhook callbacks, including CI contract tests and a Juice Shop pilot workflow.
+- Added GitLab CI examples, seeded API request fixtures, and runbooks for installing and rolling back the CI security gate pack.
+- Added self-serve local bootstrap and doctor scripts with first-run documentation for MCP client setup.
+- Added gateway-core audit and policy adapters plus Spring WebFlux adapter configuration backed by the `mcp-gateway-spring-webflux` adapter module for shared MCP policy, abuse-protection, and audit handling.
+
+### Changed
+- Bumped runtime, MCP server metadata, Helm chart metadata, MCP Registry package metadata, and install examples to `0.9.0` / `v0.9.0`.
+- Updated the runtime to consume `io.github.dtkmn:mcp-gateway-core` and `io.github.dtkmn:mcp-gateway-spring-webflux` `0.5.9`.
+- Updated Spring AI to `2.0.0-RC1`, Netty to `4.2.15.Final`, and docs dependencies including Astro `6.4.5`.
+- Reworked tool-scope authorization, policy dry-run, rate limiting, workspace resolution, and audit-event publishing around the shared gateway-core adapter model.
+
+### Security
+- Replaced bespoke MCP authorization and abuse-protection WebFlux filters with shared gateway-core adapter enforcement.
+- Added Snyk scanning workflow coverage for open-source and container security checks.
+- Strengthened CI gate image-reference validation so release examples reject mutable MCP server image tags.
+
+### Fixed
+- Improved MCP client timeout handling for CI gate orchestration.
+- Improved report path mapping so generated evidence paths stay inside the expected workspace contract.
+- Removed legacy URL-scope and policy decision classes after moving the corresponding boundaries into gateway-core.
+
+## [0.8.0] - 2026-05-10
+
+### Added
+- Added public-preview extension API publication under `io.github.dtkmn:mcp-zap-extension-api`, including artifact-shape verification and standalone extension build validation.
+- Added standalone and in-repository policy metadata extension examples that compile against the public extension API artifact.
+- Added extension documentation for the OSS extension model, compatibility boundaries, release policy, and external extension repository shape.
+- Added `zap_scan_history_release_evidence` and `zap_scan_history_customer_handoff` for internal evidence bundles and customer-safe Markdown handoff summaries.
+- Added HA queue claim fencing, dispatcher/result-applier/normalizer boundaries, and Postgres race coverage for safer multi-replica queue execution.
+- Added MCP Registry OCI package metadata, agent install notes, and Docker image labels for registry/catalog discovery.
+
+### Changed
+- Changed the project license for future releases from MIT to Apache License 2.0. Existing releases remain available under their original MIT license terms.
+- Changed the Docker build to package exactly one executable application JAR, avoiding extension API and sample-extension artifacts in the runtime image.
+- Changed Helm release metadata to `0.8.0` with `appVersion` set to the `v0.8.0` image tag shape used by the release workflow.
+- Updated extension API group and repository metadata for public-preview publication.
+- Tightened README, security, marketplace, scan-history, and production-readiness docs around durable scan-job state, raw evidence redaction, customer-facing handoff packaging, and supported install paths.
+- Updated docs dependencies, GitHub Pages configuration, and release workflow validation for Compose manifests, extension API publication, and standalone extension builds.
+
+### Security
+- Added auth endpoint rate limiting coverage and strengthened API-key property handling.
+- Documented that OCI package installs require a separately running OWASP ZAP daemon reachable from the MCP container.
+
+### Fixed
+- Fixed Docker Compose workspace defaults so generated Compose configuration binds to the repo-local workspace unless operators override it.
+- Fixed native Dockerfile port metadata to expose the actual MCP port, `7456`.
+
+## [0.7.0] - 2026-05-05
+
+### Added
+- Added Policy Bundle v1 dry-run and runtime enforcement support, including `zap_policy_dry_run`, policy preview contracts, shared-core enforcement hooks, and example policy bundles.
+- Added guided auth session bootstrap tools for form-login, bearer-token, and API-key flows, with prepared session validation.
+- Added a scan history ledger with in-memory and Postgres backends, release-evidence export tools, and the `V5__create_scan_history_entries.sql` migration.
+- Added a gateway boundary layer around ZAP engine access, including capability-specific interfaces and record types for scans, findings, targets, and artifacts.
+- Added production and auth-bootstrap runbooks, Prometheus alerts, a Grafana dashboard, and expanded architecture, unit, and integration coverage.
+
+### Changed
+- Bumped the runtime, MCP server, and Helm chart release metadata to `0.7.0`.
+- Removed the vendored WebFlux streamable MCP transport shim and expanded streamable HTTP regression coverage.
+- Refactored core services to use explicit gateway capability interfaces instead of direct ZAP client coupling.
+- Upgraded Gradle to `9.5.0` and refreshed docs dependencies, including Astro and `@astrojs/compiler`.
+- Bound Docker Compose-published ports to loopback by default via `MCP_ZAP_BIND_ADDRESS`.
+
+### Security
+- Added early MCP request body limiting through `McpRequestBodyLimitWebFilter`.
+- Hardened guided auth credential references with operator-managed allowlists, path containment checks, and inline-secret controls.
+- Added same-origin form-login validation, URL-encoded ZAP auth config serialization, stricter field-name validation, and quoted context regex literals.
+- Added stricter Helm session-affinity validation and MCP/ZAP egress NetworkPolicy boundaries.
+- Kept malformed upstream ZAP progress values out of client-visible exception messages.
+
+### Fixed
+- Fixed multi-replica Helm defaults that could break streamable MCP sessions without sticky affinity.
+- Fixed credential allowlist wildcard sibling-prefix and symlink escape handling.
+- Fixed mixed-case Helm session affinity provider values silently rendering no affinity.
+- Fixed ZAP form-auth parameter injection and context scope regex overmatching risks.
+- Fixed CodeQL findings around deprecated JSON field iteration and ignored access-boundary parameters.
+
+### Documentation
+- Added release notes for `0.7.0`.
+- Added scan history ledger documentation and updated production, observability, JWT, tool-scope authorization, security mode, security policy, and Helm docs.
+
+## [0.6.1] - 2026-04-28
+
+### Changed
+- Upgraded Spring Boot, Gradle, AspectJ, CycloneDX, Astro, and Starlight patch-level dependencies used by the runtime, build, SBOM, and docs site.
+- Updated Docker and Compose defaults, including Gradle build image alignment and container healthcheck/configuration refinements.
+- Improved CI, release, Pages, dependency-submission, and branch-image publishing workflows, including newer GitHub Actions versions, manual release inputs, release image tagging, and multi-platform release image builds.
+- Added CodeQL analysis for Java and JavaScript to improve repository security scanning coverage.
+- Aligned documented ZAP addon configuration with Helm values.
+
+### Fixed
+- Fixed streamable HTTP MCP responses returning `500 Internal Server Error` after `initialize` because the WebFlux SSE transport passed a null message id to Spring Framework 7.
+- Restored `tools/list`, `prompts/list`, and `resources/list` event-stream responses after a successful Streamable HTTP MCP handshake.
+
+### Documentation
+- Added contribution guidelines, pull request template, issue templates, CODEOWNERS, and Contributor Covenant Code of Conduct.
+- Refined README positioning, usage guidance, vulnerability reporting instructions, and security policy documentation.
+
+### Tests
+- Added regression coverage for the `initialize` -> `tools/list` streamable HTTP flow.
+
+
+## [0.6.0] - 2026-03-20
+
+### Added
+- Default guided MCP tool surface with a separate expert surface for raw ZAP workflows, controlled by `MCP_SERVER_TOOLS_SURFACE`.
+- Guided security workflow tools for target import, crawl start/status/stop, attack start/status/stop, findings summary/details, and guided report generation.
+- Expert tool groups for inventory, direct scans, queue lifecycle management, API imports, findings/reporting, authenticated scanning setup, and Automation Framework plans.
+- Passive scan status/wait tools, findings snapshots/diffs, bounded alert instance views, API schema imports for OpenAPI/GraphQL/SOAP, active-scan policy controls, and queued AJAX Spider support.
+- Tool-scope authorization with configurable `off`, `warn`, and `enforce` modes, plus startup validation for public tool scope mappings.
+- Abuse-protection controls for request throttling, workspace quotas, and overload shedding of MCP traffic.
+- Structured request correlation via `X-Correlation-Id`, centralized observability services, audit-event publishing, and Prometheus-ready metrics for auth, authorization, tools, queue, and protection flows.
+- Expanded Flyway migrations and shared-state handling for queue idempotency, claim ownership, and recovery metadata.
+- Helm enhancements including HA value presets, cloud values, migration jobs, network policies, and supporting shared database migration assets.
+- Architecture, unit, integration, and Docker/Testcontainers coverage for the expanded tool surface, queue model, schema imports, automation plans, findings/reporting, and passive scan behavior.
+
+### Changed
+- The default MCP experience now favors the smaller guided tool surface instead of exposing the full raw control plane by default.
+- Multi-replica queue execution now centers on claim-based worker ownership and recovery rather than a simple single-dispatcher leadership model.
+- `application.yml` and runtime configuration now expose broader controls for authorization, protection, observability, queue coordination, revocation, and tool-surface behavior.
+- `ScanJob`, `ScanJobStore`, `ScanJobQueueService`, and Postgres-backed queue state handling were expanded for idempotent admission, durable claims, recovery, dead-letter replay, and richer job status visibility.
+- `McpServerApplication` now assembles the MCP tool surface from guided, passive-scan, and expert tool groups instead of relying on tool annotations directly on core services.
+- README, root quick-start guidance, and the docs site were rewritten to match the current runtime, auth flow, streamable MCP session behavior, and queue semantics.
+
+### Fixed
+- Removed stale documentation examples that implied fake HTTP scan endpoints or invalid client auth patterns.
+- Corrected queue and HA documentation to match the implemented claim-based execution model.
+- Improved traceability of auth, authorization, validation, and protection failures through correlation IDs and bounded error payloads.
+
+### Documentation
+- Added public docs for tool surfaces, tool-scope authorization, abuse protection, observability, structured logging, scan execution modes, passive scan handling, API schema imports, scan policy controls, findings/reporting, and Automation Framework support.
+- Expanded legacy `.html` redirect coverage so older doc links continue to resolve to the current Astro/Starlight site.
+
+## [0.5.0] - 2026-03-14
+
+### Added
+- Persistent scan job orchestration via `ScanJob`, `ScanJobQueueService`, and `ScanJobStore` implementations for in-memory and Postgres backends.
+- `ContextUserService` for managing ZAP contexts, users, and authentication setup for more advanced scan workflows.
+- Queue leadership coordination with single-node and Postgres advisory lock strategies for multi-replica deployments.
+- Flyway migrations and Postgres schema readiness validation for shared queue and token revocation state.
+- `TokenRevocationStore` backends plus `TokenBlacklistService` support for pluggable JWT revocation persistence.
+- `SecurityStartupValidator` for safer startup defaults and auth configuration validation.
+
+### Changed
+- Reorganized core runtime classes under the `mcp.server.zap.core` package for clearer separation of concerns.
+- Enhanced URL validation, scan queue configuration, retry/backoff behavior, and scheduling support for scan execution.
+- Upgraded the Gradle wrapper and Docker build image to `9.4.0`.
+- Upgraded the CycloneDX plugin to `3.2.2` and added Flyway/PostgreSQL runtime dependencies.
+- Migrated the public docs site from Jekyll to Astro + Starlight while preserving legacy `.html` entry points via redirects.
+
+### Fixed
+- Fail-fast validation for insecure placeholder API key configurations in stricter deployments.
+- Markdown rendering issue in the authenticated scanning guide that previously broke the Pages build.
+
+### Documentation
+- Expanded public documentation with authenticated scanning best practices, production readiness guidance, HA Compose simulation, queue coordination, retry policy, and JWT rotation guidance.
+- Updated the README, docs site structure, and Pages workflow for the Astro-based documentation stack.
+
+## [0.4.0] - 2026-02-26
+
+### Added
+- New `zap_get_findings_summary` tool in `ReportService` to generate token-optimized Markdown summaries grouped by risk level and alert type.
+- `ZapHealthIndicator` for reactive ZAP API connectivity checks via Spring Boot Actuator.
+- `GlobalExceptionHandler` with consistent JSON error responses for ZAP API, validation, and unexpected server errors.
+- CycloneDX SBOM generation and artifact upload steps in both CI and release workflows.
+- Manual `workflow_dispatch` support for CI and release workflows, including custom version input for release builds.
+
+### Changed
+- Upgraded Spring Boot plugin to `4.0.3`.
+- Upgraded Spring AI BOM to `1.1.2`.
+- Upgraded Gradle wrapper to `9.3.1` and Docker build image to `gradle:9.3.1-jdk25`.
+- Upgraded ZAP client API to `1.17.0` and added `spring-boot-starter-validation`.
+- Updated release workflow image tagging/version resolution and Docker registry publishing behavior (versioned + `latest` tags).
+- Updated CI Docker publishing to include `dev` tags and SBOM artifacts.
+- Updated `docker-compose.yml` images for MCP ZAP Server (`dtkmn/mcp-zap-server`), Juice Shop (`v19.1.1`), and Petstore (`1.0.27`).
+
+### Fixed
+- Resolved transitive `org.jdom` conflict by excluding legacy `jdom` and explicitly adding `org.jdom:jdom2:2.0.6.1`.
+- Hardened Actuator health endpoint exposure by setting `management.endpoint.health.show-details: never`.
+- Clarified URL whitelist/blacklist behavior comments in `application.yml`.
+
+### Documentation
+- Added non-affiliation/project-positioning note and expanded enterprise/commercial support details in `README.md`.
+- Added commercial/private vulnerability reporting section to `SECURITY.md`.
+- Added commercial support contact section to docs homepage (`docs/index.md`).
+
+## [0.3.0] - 2025-11-22
+
+### Changed
+- **Framework**: Upgraded Spring Boot from 3.5.7 to 4.0.0
+- **Security**: Migrated from JJWT to Spring Security OAuth2 JWT for GraalVM native image compatibility
+- **Security**: CSRF protection now disabled in `none` mode for MCP protocol compatibility
+- **Security**: CSRF protection enabled by default in `api-key` and `jwt` modes (Spring Security default)
+- **Security**: Changed default security mode to disabled (`MCP_SECURITY_ENABLED=false`) in docker-compose for development
+- **Performance**: Added GraalVM native image support
+- **Docker**: Added healthcheck to Dockerfile.native for container orchestration
+- **Docker**: Added curl to runtime dependencies for healthcheck support
+- **Tests**: Removed deprecated `@AutoConfigureWebTestClient` annotation (auto-configured in Spring Boot 4.0.0)
+
+### Added
+- GraalVM native image build support via `Dockerfile.native`
+- Spring Security OAuth2 JWT library for native-image-ready JWT handling
+- Comprehensive CSRF documentation in README, SECURITY_MODES.md, and JWT_AUTHENTICATION.md
+- Development and production Docker Compose profiles (`docker-compose.dev.yml` and `docker-compose.prod.yml`)
+- Quick start scripts (`dev.sh` for JVM builds, `prod.sh` for native builds)
+- Native image performance documentation (`docs/NATIVE_IMAGE_PERFORMANCE.md`)
+
+### Removed
+- JJWT library (incompatible with GraalVM native images)
+- Native-image reflection configuration files (no longer needed with Spring Security OAuth2)
+- Deprecated `@AutoConfigureWebTestClient` annotation from tests
+
+## [0.2.1] - 2025-10-24
+
+### Changed
+- Updated healthcheck command in `docker-compose.yml` for the `zap` service.
+- Updated various GitHub Actions to newer versions in build and release workflows.
+- Enabled multi-platform Docker builds for `linux/amd64` and `linux/arm64`.
+- Upgraded Gradle from 8.14.2 to 9.1.0.
+- Upgraded Spring Boot from 3.5.3 to 3.5.7.
+- Switched from `spring-ai-starter-mcp-server-webmvc` to `spring-ai-starter-mcp-server-webflux`.
+- Updated ZAP API key configuration to be mandatory.
+
+### Added
+- A new test profile `application-test.yml` for testing.
+
+
+## [0.2.0] – 2025-06-27
+
+### Added
+
+- Dependabot configuration for automated dependency updates.
+- Custom `ZapApiException` for ZAP API related errors.
+
+### Changed
+
+- Updated CI/CD workflows for improved automation.
+- Modified Dockerfile and Docker Compose configurations.
+- Updated Gradle build configuration and wrapper version.
+- Refinements to the main application class (`McpServerApplication.java`).
+- Adjusted application properties in `application.yml`.
+
+## [0.1.1] – 2025-06-11
+
+### Added
+
+- Initial project configuration files (`.dockerignore`, `.gitignore`, `SECURITY.md`).
+- Basic application test class (`McpServerApplicationTests.java`).
+
+### Changed
+
+- Updated CI/CD workflows.
+- Updated Docker Compose configuration.
+
+## [0.1.0] – 2025-05-27
+
+### Added
+
+- Expose OWASP ZAP actions (spider, active scan, import OpenAPI specs, HTML/JSON report generation) as MCP tools in a Spring Boot application.
+
+- Eliminate manual CLI calls by integrating ZAP with MCP-compatible AI agents (e.g., Claude Desktop, Cursor, Windsurf).
+
+- Support remote OpenAPI specification import into ZAP for automated scanning workflows.
+
+- Docker Compose orchestration for ZAP, MCP server, MCP File System, Open Web-UI, Juice Shop, and Swagger Petstore services.
+
+- Secure configuration using ZAP_API_KEY and MCP_API_KEY environment variables.
+
+- Provide both STDIO (-Dspring.ai.mcp.server.stdio=true) and HTTP SSE transport modes for MCP communication.
+
+- Offer Web UI panels to configure OpenAI/Ollama API connections and MCP server endpoints.
+
+- Include prompt examples for orchestrating ZAP scans and retrieving scan results via any MCP-compatible AI agent.
+
+- Manual build support via Gradle (./gradlew clean build) and log management commands (docker-compose logs -f).

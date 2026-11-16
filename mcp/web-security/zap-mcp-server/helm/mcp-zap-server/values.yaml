@@ -1,0 +1,451 @@
+# Default values for mcp-zap-server
+# This is a YAML-formatted file.
+
+# Global settings
+global:
+  # Environment (dev, staging, prod)
+  environment: dev
+
+# ZAP Proxy Configuration
+zap:
+  enabled: true
+  replicaCount: 1  # Usually keep at 1, ZAP is stateful
+  
+  image:
+    repository: zaproxy/zap-stable
+    pullPolicy: IfNotPresent
+    tag: "2.17.0"
+    # Optional sha256 digest overrides tag and pins the image, not runtime add-ons.
+    digest: ""
+  
+  service:
+    type: ClusterIP
+    port: 8090
+    targetPort: 8090
+    annotations: {}
+  
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "1000m"
+    limits:
+      memory: "4Gi"
+      cpu: "2000m"
+  
+  # ZAP specific configuration
+  config:
+    apiKey: ""  # Required unless zap.config.existingSecret.name is set
+    existingSecret:
+      name: ""
+      apiKeyKey: ZAP_API_KEY
+    api:
+      # Restrict the ZAP API to loopback and RFC1918 sources by default.
+      # ZAP also checks the Host header. The default permits its special API
+      # hostname "zap" and the chart-managed ZAP service hostname.
+      # Custom expressions must permit the client source and API hostname.
+      allowedAddrRegex: ""
+    addons:
+      - spiderAjax
+      - client
+      - graphql
+      - soap
+      - automation
+    extraArgs: []
+      # Flat list of extra CLI args. Keep "-config" pairs as separate items.
+      # - -config
+      # - connection.timeoutInSecs=300
+  
+  persistence:
+    enabled: true
+    existingClaim: ""  # Reuse an operator-provisioned PVC; no chart PVC is created.
+    shareWithMcp: true  # Required for guided report readback.
+    retainOnDelete: true  # Retain the chart PVC on Helm uninstall; namespace deletion still removes it.
+    storageClass: ""  # Use default storage class
+    accessMode: ReadWriteOnce
+    size: 10Gi
+    mountPath: /zap/wrk
+    # Empty preserves the existing PVC-root workspace layout. A nonempty value
+    # selects a directory within the PVC; migrate existing workspace files first.
+    workspaceSubPath: ""
+    # Retained operator-managed automation directory, relative to the shared mount.
+    # For one default client, workspaces/default-client/automation keeps native
+    # reports within its report-read boundary. No MCP plan tools are exposed.
+    # Keep this root separate from content-import staging and private launch journals.
+    automationSubdirectory: automation
+    # Opt-in shared staging for self-contained OpenAPI content imports.
+    # Set workspaceSubPath to a separate sibling (e.g. workspace), and use one
+    # MCP replica with deploymentStrategy.type=Recreate. Requires UID/GID 1000
+    # and fsGroupChangePolicy=OnRootMismatch for protected staging permissions.
+    contentImport:
+      enabled: false
+      subPath: content-imports
+      mountPath: /zap/imports
+  
+  # Liveness and readiness probes
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /
+      port: 8090
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /
+      port: 8090
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  
+  # Node selector, tolerations, and affinity
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# MCP Server Configuration
+mcp:
+  enabled: true
+  replicaCount: 1  # Streamable MCP sessions are in-memory; scale only with explicit affinity.
+  
+  image:
+    repository: ghcr.io/dtkmn/mcp-zap-server  # Override for your own registry if needed
+    pullPolicy: IfNotPresent
+    tag: ""  # Defaults to chart appVersion; verify v0.17.1 publication before installing
+  
+  service:
+    type: ClusterIP  # Expose via ingress or load balancer only when needed
+    port: 7456
+    targetPort: 7456
+    annotations: {}
+    # Multi-replica streamable MCP requires sticky-session/client-affinity at the
+    # exposure layer. If you expose MCP via Service type=LoadBalancer, set
+    # controller-specific affinity annotations here.
+    # AWS Load Balancer Controller example (NLB source-IP affinity):
+    # service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: "stickiness.enabled=true,stickiness.type=source_ip"
+    # For AWS: service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    # For GCP: cloud.google.com/load-balancer-type: "Internal"
+  
+  # Ingress configuration (optional, alternative to LoadBalancer)
+  ingress:
+    enabled: false
+    className: "nginx"
+    annotations: {}
+      # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: mcp-zap.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+      # - secretName: mcp-zap-tls
+      #   hosts:
+      #     - mcp-zap.example.com
+
+  # Streamable MCP is stateful per replica in the OSS/local HA path.
+  # When mcp.replicaCount > 1, enable a supported session-affinity preset so
+  # follow-up MCP requests land on the same backend replica.
+  streamableHttp:
+    sessionAffinity:
+      enabled: false
+      provider: ""  # Supported: aws-nlb, ingress-nginx, service-client-ip
+      serviceClientIp:
+        timeoutSeconds: 10800
+      ingressNginx:
+        upstreamHashBy: "$remote_addr$http_user_agent"
+        proxyReadTimeout: "3600"
+        proxySendTimeout: "3600"
+        proxyBuffering: "off"
+        proxyRequestBuffering: "off"
+      awsLoadBalancer:
+        type: nlb
+        scheme: internal
+        targetGroupAttributes: "stickiness.enabled=true,stickiness.type=source_ip"
+  
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+  
+  # Horizontal Pod Autoscaler
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 1
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  
+  # Security Configuration
+  security:
+    mode: "api-key"  # Options: none, api-key, jwt
+    enabled: true
+    apiKey: ""  # Required unless mcp.security.existingSecret.name is set
+    allowPlaceholderApiKey: false  # Fail fast on insecure placeholder keys by default
+    existingSecret:
+      name: ""
+      apiKeyKey: MCP_API_KEY
+      jwtSecretKey: JWT_SECRET
+    
+    # JWT endpoints are enabled by jwt.enabled, independently of the auth mode.
+    jwt:
+      enabled: false
+      secret: ""  # Generate with: openssl rand -base64 32
+      issuer: "mcp-zap-server"
+      accessTokenExpiry: 3600
+      refreshTokenExpiry: 604800
+      revocation:
+        backend: in-memory  # Multi-replica JWT requires postgres.
+        postgres:
+          url: ""
+          tableName: jwt_token_revocation
+          failFast: true
+          existingSecret:
+            name: ""  # Optional when the JDBC URL supplies the database identity.
+            usernameKey: username
+            passwordKey: password
+  
+  # ZAP Client Configuration (connects to ZAP pod)
+  zapClient:
+    url: ""  # Defaults to the chart-managed ZAP service name when empty
+    port: 8090
+    connectTimeoutMs: 5000  # MCP -> ZAP API; must be positive
+    readTimeoutMs: 10000   # Response read inactivity; must be positive
+    apiKey: ""  # Defaults to zap.config.apiKey when blank and no secret is configured
+    existingSecret:
+      name: ""
+      apiKeyKey: ZAP_API_KEY
+  
+  # Scan Configuration
+  scan:
+    jobs:
+      store:
+        # Empty uses in-memory. Set explicitly when envFrom could contain backend selection.
+        backend: ""
+    limits:
+      maxActiveScanDurationInMins: 30
+      maxSpiderScanDurationInMins: 15
+      maxConcurrentActiveScans: 3
+      maxConcurrentSpiderScans: 5
+      threadPerHost: 10
+      hostPerScan: 5
+      # ZAP target timeout reconciled at startup/readiness/outbound starts
+      # (ZAP_CONNECTION_TIMEOUT), separate from MCP-to-ZAP API timeouts.
+      connectionTimeoutInSecs: 60
+      spiderThreadCount: 5
+      spiderMaxDepth: 10  # HTTP and Client Spider depth; 0 means unlimited
+      spiderMaxChildren: 10  # HTTP Spider children per node; 0 means unlimited
+    
+    url:
+      validationEnabled: true
+      allowLocalhost: false
+      allowPrivateNetworks: false
+      whitelist: ""
+      # Explicit denies override the allow flags and whitelist. Built-in guards are separate.
+      blacklist: ""
+
+  launchSafety:
+    # Preserve private launch safety storage when using the in-memory job store.
+    persistence:
+      existingClaim: ""
+      accessMode: ReadWriteOnce
+      size: 64Mi
+      storageClass: ""
+      retainOnDelete: true
+  
+  # Liveness and readiness probes
+  livenessProbe:
+    enabled: true
+    # Listener health is independent of ZAP; readiness checks the dependency.
+    tcpSocket:
+      port: 7456
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /actuator/health
+      port: 7456
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  startupProbe:
+    enabled: false
+    httpGet:
+      path: /actuator/health
+      port: 7456
+    failureThreshold: 30
+    periodSeconds: 10
+
+  revisionHistoryLimit: 5
+
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  terminationGracePeriodSeconds: 60
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  
+  # Environment variables
+  env: []
+    # - name: CUSTOM_VAR
+    #   value: "custom-value"
+  
+  # Secrets (use Kubernetes secrets or external secret management)
+  envFrom: []
+    # - secretRef:
+    #     name: mcp-zap-secrets
+  
+  # Node selector, tolerations, and affinity
+  nodeSelector: {}
+  tolerations: []
+  
+  # Pod affinity to co-locate MCP pods with ZAP (optional, for reduced latency)
+  affinity:
+    podAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: zap-proxy
+            topologyKey: kubernetes.io/hostname
+
+# Shared Postgres schema migration job
+migrations:
+  enabled: false
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  image:
+    repository: flyway/flyway
+    pullPolicy: IfNotPresent
+    tag: "11.15.0-alpine"
+
+  connectRetries: 60
+  validateOnMigrate: true
+  baselineOnMigrate: false
+
+  postgres:
+    url: ""
+    existingSecret:
+      name: ""
+      usernameKey: username
+      passwordKey: password
+
+# Service Account
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  automountServiceAccountToken: false
+
+# Pod Security Context
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  runAsNonRoot: true
+  runAsGroup: 1000
+  runAsUser: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Security Context
+securityContext:
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsGroup: 1000
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  seccompProfile:
+    type: RuntimeDefault
+
+# Image pull secrets (if using private registry)
+imagePullSecrets: []
+  # - name: regcred
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod labels
+podLabels: {}
+
+# Network policy defaults. Requires a CNI that enforces Kubernetes NetworkPolicy.
+# Policies are additive: another policy selecting these pods can allow traffic.
+networkPolicy:
+  zap:
+    enabled: true
+    egress:
+      # URL validation protects the application layer, but Kubernetes egress is
+      # the hard network boundary. By default ZAP can resolve DNS only; add
+      # explicit target CIDRs/ports under extraEgress for real scan egress.
+      allowDns: true
+      dns:
+        namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector: {}
+      extraEgress: []
+        # - to:
+        #     - ipBlock:
+        #         cidr: 203.0.113.0/24
+        #   ports:
+        #     - protocol: TCP
+        #       port: 443
+    extraIngress: []
+      # - namespaceSelector:
+      #     matchLabels:
+      #       kubernetes.io/metadata.name: tools
+  mcp:
+    enabled: true
+    # Allow MCP service ingress from pods in the release namespace.
+    allowSameNamespace: true
+    egress:
+      # MCP should only reach ZAP, DNS, and operator-approved dependencies
+      # such as Postgres/JWKS endpoints. Add those under extraEgress.
+      allowZap: true
+      allowDns: true
+      dns:
+        namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector: {}
+      extraEgress: []
+        # - to:
+        #     - ipBlock:
+        #         cidr: 10.0.0.0/16
+        #   ports:
+        #     - protocol: TCP
+        #       port: 5432
+    # Additional allowed source peers. With allowSameNamespace=false and no
+    # extraIngress peers, this policy denies all MCP ingress.
+    extraIngress: []
+      # - namespaceSelector:
+      #     matchLabels:
+      #       kubernetes.io/metadata.name: ingress-nginx

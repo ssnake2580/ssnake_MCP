@@ -1,0 +1,20 @@
+{
+  "name": "mcp-zap-local-preview",
+  "interface": {
+    "displayName": "Local Scan Prototype"
+  },
+  "plugins": [
+    {
+      "name": "mcp-zap-connect",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mcp-zap-connect"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -1,0 +1,872 @@
+package mcp.server.zap.core.service;
+
+import tools.jackson.databind.ObjectMapper;
+import mcp.server.zap.core.configuration.ScanLimitProperties;
+import mcp.server.zap.core.model.ScanJob;
+import mcp.server.zap.core.gateway.NativeScanLaunch;
+import mcp.server.zap.core.model.ScanJobStatus;
+import mcp.server.zap.core.model.ScanJobType;
+import mcp.server.zap.core.service.jobstore.PostgresScanJobStore;
+import mcp.server.zap.core.service.queue.ScanJobClaimToken;
+import mcp.server.zap.core.service.queue.ScanJobStartTarget;
+import mcp.server.zap.core.service.queue.ScanJobLaunchSafety;
+import mcp.server.zap.core.service.queue.leadership.LeadershipDecision;
+import mcp.server.zap.core.service.queue.leadership.QueueLeadershipCoordinator;
+import org.flywaydb.core.Flyway;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.eq;
+import static mcp.server.zap.core.service.GuardedQueueTestSupport.startReplies;
+
+@Tag("docker")
+@Testcontainers
+class PostgresBackedScanJobQueueServiceTest {
+    @RegisterExtension
+    final GuardedQueueTestSupport launches = new GuardedQueueTestSupport();
+
+    @Container
+    static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:16-alpine")
+            .withReuse(false)
+            .withCommand("postgres", "-c", "shared_buffers=32MB", "-c", "max_connections=30")
+            .withCreateContainerCmdModifier(command -> command.getHostConfig()
+                    .withMemory(256L * 1024 * 1024)
+                    .withNanoCPUs(1_000_000_000L));
+
+    private ActiveScanService activeScanService;
+    private SpiderScanService spiderScanService;
+    private AjaxSpiderService ajaxSpiderService;
+    private ClientSpiderService clientSpiderService;
+    private UrlValidationService urlValidationService;
+    private ScanLimitProperties scanLimitProperties;
+
+    @BeforeAll
+    static void migrateSchema() {
+        Flyway.configure()
+                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
+                .locations("classpath:db/migration")
+                .load()
+                .migrate();
+    }
+
+    @BeforeEach
+    void setUp() throws Exception {
+        activeScanService = mock(ActiveScanService.class);
+        spiderScanService = mock(SpiderScanService.class);
+        ajaxSpiderService = mock(AjaxSpiderService.class);
+        clientSpiderService = mock(ClientSpiderService.class);
+        urlValidationService = mock(UrlValidationService.class);
+        scanLimitProperties = mock(ScanLimitProperties.class);
+
+        when(scanLimitProperties.getMaxConcurrentActiveScans()).thenReturn(1);
+        when(scanLimitProperties.getMaxConcurrentSpiderScans()).thenReturn(1);
+
+        try (Connection connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(),
+                POSTGRES.getUsername(),
+                POSTGRES.getPassword()
+        ); Statement statement = connection.createStatement()) {
+            statement.execute("DELETE FROM scan_jobs");
+        }
+    }
+
+    @Test
+    void admitQueuedJobAssignsQueuePositionAndReusesIdempotentRequest() {
+        PostgresScanJobStore store = newStore();
+
+        ScanJob first = new ScanJob(
+                "job-1",
+                ScanJobType.ACTIVE_SCAN,
+                Map.of("targetUrl", "http://example.com/1", "recurse", "true", "policy", ""),
+                Instant.parse("2026-03-14T00:00:01Z"),
+                3,
+                "client-a",
+                "idem-a"
+        );
+        ScanJob second = new ScanJob(
+                "job-2",
+                ScanJobType.ACTIVE_SCAN,
+                Map.of("targetUrl", "http://example.com/2", "recurse", "true", "policy", ""),
+                Instant.parse("2026-03-14T00:00:02Z"),
+                3,
+                "client-a",
+                "idem-b"
+        );
+        ScanJob duplicate = new ScanJob(
+                "job-3",
+                ScanJobType.ACTIVE_SCAN,
+                Map.of("targetUrl", "http://example.com/1", "recurse", "true", "policy", ""),
+                Instant.parse("2026-03-14T00:00:03Z"),
+                3,
+                "client-a",
+                "idem-a"
+        );
+
+        ScanJob admittedFirst = store.admitQueuedJob(first);
+        ScanJob admittedSecond = store.admitQueuedJob(second);
+        ScanJob admittedDuplicate = store.admitQueuedJob(duplicate);
+
+        assertEquals(1, admittedFirst.getQueuePosition());
+        assertEquals(2, admittedSecond.getQueuePosition());
+        assertEquals("job-1", admittedDuplicate.getId());
+        assertEquals(2, store.list().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void queueRepairPreservesPeerStartAndCancellationCommittedAfterItsSnapshot(boolean cancelling) throws Exception {
+        PostgresScanJobStore peerStore = newStore();
+        ScanJob first = queuedJob("repair-first", ScanJobType.ACTIVE_SCAN, "http://example.com/first", "repair-first");
+        ScanJob next = queuedJob("repair-next", ScanJobType.ACTIVE_SCAN, "http://example.com/next", "repair-next");
+        first.assignQueuePosition(8);
+        next.assignQueuePosition(9);
+        peerStore.upsertAll(List.of(first, next));
+
+        CountDownLatch snapshotRead = new CountDownLatch(1);
+        CountDownLatch peerCommitted = new CountDownLatch(1);
+        PostgresScanJobStore repairStore = spy(newStore());
+        doAnswer(invocation -> {
+            List<ScanJob> snapshot = (List<ScanJob>) invocation.callRealMethod();
+            snapshotRead.countDown();
+            assertTrue(peerCommitted.await(5, TimeUnit.SECONDS));
+            return snapshot;
+        }).when(repairStore).list();
+
+        var executor = Executors.newSingleThreadExecutor();
+        ScanJobQueueService restored = null;
+        Future<ScanJobQueueService> repair = executor.submit(() -> launches.guarded(new ScanJobQueueService(
+                activeScanService, spiderScanService, ajaxSpiderService, urlValidationService,
+                scanLimitProperties, 3, false, repairStore,
+                new TestQueueLeadershipCoordinator("repair-worker", new SharedLeadershipState("repair-worker")))));
+        try {
+            assertTrue(snapshotRead.await(5, TimeUnit.SECONDS));
+            Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+            Instant claimUntil = now.plusSeconds(60);
+            ScanJob claimed = peerStore.claimQueuedJobs("peer-worker", now, claimUntil, 1, 1).getFirst();
+            ScanJob accepted = peerStore.updateClaimedJob(first.getId(), ScanJobClaimToken.from(claimed), now, job -> {
+                job.beginLaunch(new ScanJob.LaunchAttempt("peer-attempt", "peer-controller", now, 0));
+            job.markRunning("accepted-scan");
+                if (cancelling) {
+                    job.requestCancellation(now, now.plusSeconds(30));
+                }
+                return job;
+            }).orElseThrow();
+            peerCommitted.countDown();
+            restored = repair.get(5, TimeUnit.SECONDS);
+
+            ScanJob durable = peerStore.load(first.getId()).orElseThrow();
+            assertEquals(ScanJobStatus.RUNNING, durable.getStatus());
+            assertEquals("accepted-scan", durable.getZapScanId());
+            assertEquals(accepted.getLaunchAttempt(), durable.getLaunchAttempt());
+            assertEquals(accepted.getClaimOwnerId(), durable.getClaimOwnerId());
+            assertEquals(accepted.getClaimFenceId(), durable.getClaimFenceId());
+            assertEquals(accepted.getClaimExpiresAt(), durable.getClaimExpiresAt());
+            assertEquals(accepted.getCancelRequestedAt(), durable.getCancelRequestedAt());
+            assertEquals(accepted.getCancelDeadlineAt(), durable.getCancelDeadlineAt());
+            assertEquals(cancelling, durable.isCancellationRequested());
+            assertEquals(1, peerStore.load(next.getId()).orElseThrow().getQueuePosition());
+            assertTrue(peerStore.claimQueuedJobs("third-worker", now, claimUntil, 1, 1).isEmpty());
+
+            restored.processQueueOnceForTesting();
+            assertEquals("accepted-scan", peerStore.load(first.getId()).orElseThrow().getZapScanId());
+            verify(activeScanService, never()).startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class));
+        } finally {
+            peerCommitted.countDown();
+            executor.shutdownNow();
+            if (restored != null) {
+                restored.shutdownExecutor();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void staleLocalSnapshotCannotDiscardInFlightRenewal(boolean polling) throws Exception {
+        CountDownLatch snapshotRead = new CountDownLatch(1);
+        CountDownLatch releaseSnapshot = new CountDownLatch(1);
+        CountDownLatch engineEntered = new CountDownLatch(1);
+        CountDownLatch releaseEngine = new CountDownLatch(1);
+        CountDownLatch claimRenewed = new CountDownLatch(1);
+        AtomicBoolean pauseNextSnapshot = new AtomicBoolean();
+        PostgresScanJobStore store = spy(newStore());
+        doAnswer(invocation -> {
+            List<ScanJob> snapshot = (List<ScanJob>) invocation.callRealMethod();
+            if (pauseNextSnapshot.compareAndSet(true, false)) {
+                snapshotRead.countDown();
+                assertTrue(releaseSnapshot.await(5, TimeUnit.SECONDS));
+            }
+            return snapshot;
+        }).when(store).list();
+        doAnswer(invocation -> {
+            int renewed = (int) invocation.callRealMethod();
+            if (renewed > 0) claimRenewed.countDown();
+            return renewed;
+        }).when(store).renewClaims(anyString(), any(), any(), any());
+        when(activeScanService.startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class))).thenAnswer(invocation -> {
+            NativeScanLaunch launch = GuardedQueueTestSupport.launch(invocation);
+            launch.beforeDispatch();
+            engineEntered.countDown();
+            assertTrue(releaseEngine.await(5, TimeUnit.SECONDS));
+            launch.accepted("in-flight-scan");
+            return "in-flight-scan";
+        });
+        when(activeScanService.getActiveScanProgressPercent(anyString())).thenAnswer(invocation -> {
+            engineEntered.countDown();
+            assertTrue(releaseEngine.await(5, TimeUnit.SECONDS));
+            return 25;
+        });
+        ScanJobQueueService queue = launches.guarded(new ScanJobQueueService(activeScanService, spiderScanService, ajaxSpiderService,
+                urlValidationService, scanLimitProperties, 3, false, store,
+                new TestQueueLeadershipCoordinator("local-worker", new SharedLeadershipState("local-worker"))));
+        ScanJob job = queuedJob("local-in-flight", ScanJobType.ACTIVE_SCAN, "http://example.com/in-flight", "local-in-flight");
+        if (polling) {
+            seedOwnedRunning(queue, store, job, "in-flight-scan");
+        } else {
+            job.assignQueuePosition(1);
+            store.upsertAll(List.of(job));
+        }
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            pauseNextSnapshot.set(true);
+            Future<?> staleRefresh = executor.submit(queue::processQueueOnceForTesting);
+            assertTrue(snapshotRead.await(3, TimeUnit.SECONDS));
+            Future<?> dispatch = executor.submit(queue::processQueueOnceForTesting);
+            assertTrue(engineEntered.await(3, TimeUnit.SECONDS));
+            releaseSnapshot.countDown();
+            assertTrue(claimRenewed.await(3, TimeUnit.SECONDS), "Live engine work must remain eligible for claim renewal");
+            staleRefresh.get(3, TimeUnit.SECONDS);
+            releaseEngine.countDown();
+            dispatch.get(3, TimeUnit.SECONDS);
+            assertEquals("in-flight-scan", newStore().load(job.getId()).orElseThrow().getZapScanId());
+            if (polling) verify(activeScanService, times(1)).getActiveScanProgressPercent("in-flight-scan");
+            else verify(activeScanService, times(1)).startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class));
+        } finally {
+            releaseSnapshot.countDown();
+            releaseEngine.countDown();
+            executor.shutdownNow();
+            queue.shutdownExecutor();
+        }
+    }
+
+    @Test
+    void submittingReplicaClaimsAndStartsSharedPostgresJobState() {
+        PostgresScanJobStore leaderStore = newStore();
+        PostgresScanJobStore followerStore = newStore();
+        SharedLeadershipState leadershipState = new SharedLeadershipState("node-a");
+        TestQueueLeadershipCoordinator leaderCoordinator = new TestQueueLeadershipCoordinator("node-a", leadershipState);
+        TestQueueLeadershipCoordinator followerCoordinator = new TestQueueLeadershipCoordinator("node-b", leadershipState);
+
+        when(activeScanService.startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class))).thenAnswer(startReplies("A-live"));
+
+        ScanJobQueueService leaderService = launches.guarded(new ScanJobQueueService(
+                activeScanService,
+                spiderScanService,
+                ajaxSpiderService,
+                urlValidationService,
+                scanLimitProperties,
+                3,
+                false,
+                leaderStore,
+                leaderCoordinator
+        ));
+        ScanJobQueueService followerService = launches.guarded(new ScanJobQueueService(
+                activeScanService,
+                spiderScanService,
+                ajaxSpiderService,
+                urlValidationService,
+                scanLimitProperties,
+                3,
+                false,
+                followerStore,
+                followerCoordinator
+        ));
+
+        String response = followerService.queueActiveScan("http://example.com/ha", "true", null, "ha-idem-1");
+        String jobId = extractJobId(response);
+        ScanJob queuedJob = followerStore.load(jobId).orElse(null);
+
+        assertNotNull(queuedJob);
+        assertEquals(ScanJobStatus.RUNNING, queuedJob.getStatus());
+        assertEquals("A-live", queuedJob.getZapScanId());
+        assertEquals("node-b", queuedJob.getClaimOwnerId());
+        verify(activeScanService, times(1)).startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class));
+
+        leaderService.processQueueOnceForTesting();
+
+        ScanJob runningJob = leaderStore.load(jobId).orElse(null);
+        assertNotNull(runningJob);
+        assertEquals(ScanJobStatus.RUNNING, runningJob.getStatus());
+        assertEquals("A-live", runningJob.getZapScanId());
+        assertEquals("node-b", runningJob.getClaimOwnerId());
+        verify(activeScanService, times(1)).startActiveScanJob(eq("http://example.com/ha"), eq("true"), eq(null), any(NativeScanLaunch.class));
+    }
+
+    @Test
+    void concurrentReplicaAdmissionDeduplicatesIdempotencyKeyOnPostgres() throws Exception {
+        SharedLeadershipState leadershipState = new SharedLeadershipState("node-c");
+        when(activeScanService.startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class)))
+                .thenAnswer(startReplies("deduplicated-start"));
+        ScanJobQueueService firstService = launches.guarded(new ScanJobQueueService(
+                activeScanService,
+                spiderScanService,
+                ajaxSpiderService,
+                urlValidationService,
+                scanLimitProperties,
+                3,
+                false,
+                newStore(),
+                new TestQueueLeadershipCoordinator("node-a", leadershipState)
+        ));
+        ScanJobQueueService secondService = launches.guarded(new ScanJobQueueService(
+                activeScanService,
+                spiderScanService,
+                ajaxSpiderService,
+                urlValidationService,
+                scanLimitProperties,
+                3,
+                false,
+                newStore(),
+                new TestQueueLeadershipCoordinator("node-b", leadershipState)
+        ));
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            Future<String> firstAdmission = executor.submit(() -> {
+                barrier.await();
+                return firstService.queueActiveScan("http://example.com/concurrent", "true", null, "pg-idem-1");
+            });
+            Future<String> secondAdmission = executor.submit(() -> {
+                barrier.await();
+                return secondService.queueActiveScan("http://example.com/concurrent", "true", null, "pg-idem-1");
+            });
+
+            String firstJobId = extractJobId(firstAdmission.get());
+            String secondJobId = extractJobId(secondAdmission.get());
+
+            assertEquals(firstJobId, secondJobId);
+            assertEquals(1, newStore().list().size());
+            assertTrue(newStore().load(firstJobId).orElseThrow().getIdempotencyKey().equals("pg-idem-1"));
+            assertEquals("deduplicated-start", newStore().load(firstJobId).orElseThrow().getZapScanId());
+            verify(activeScanService, times(1)).startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void expiredRunningClaimRequiresOwnershipReconciliationBeforeResumingWithoutDuplicateStart() {
+        SharedLeadershipState leadershipState = new SharedLeadershipState("node-a");
+        ScanJobQueueService leaderService = launches.guarded(new ScanJobQueueService(
+                activeScanService,
+                spiderScanService,
+                ajaxSpiderService,
+                urlValidationService,
+                scanLimitProperties,
+                3,
+                false,
+                newStore(),
+                new TestQueueLeadershipCoordinator("node-a", leadershipState)
+        ));
+        ScanJobQueueService followerService = launches.guarded(new ScanJobQueueService(
+                activeScanService,
+                spiderScanService,
+                ajaxSpiderService,
+                urlValidationService,
+                scanLimitProperties,
+                3,
+                false,
+                newStore(),
+                new TestQueueLeadershipCoordinator("node-b", leadershipState)
+        ));
+
+        when(activeScanService.startActiveScanJob(anyString(), anyString(), any(), any(NativeScanLaunch.class))).thenAnswer(startReplies("A-recover"));
+        when(activeScanService.getActiveScanProgressPercent("A-recover")).thenReturn(100);
+
+        String jobId = extractJobId(leaderService.queueActiveScan("http://example.com/recover-pg", "true", null, "pg-recover"));
+        ScanJob runningJob = newStore().load(jobId).orElseThrow();
+        runningJob.claim("node-a", Instant.now().minusSeconds(30), Instant.now().minusSeconds(1));
+        newStore().upsertAll(java.util.List.of(runningJob));
+
+        followerService.processQueueOnceForTesting();
+
+        ScanJob recoveredJob = newStore().load(jobId).orElseThrow();
+        assertEquals(ScanJobStatus.START_OUTCOME_UNKNOWN, recoveredJob.getStatus());
+        assertEquals("A-recover", recoveredJob.getZapScanId());
+        verify(activeScanService, never()).getActiveScanProgressPercent("A-recover");
+        verify(activeScanService, times(1)).startActiveScanJob(eq("http://example.com/recover-pg"), eq("true"), eq(null), any(NativeScanLaunch.class));
+
+        attestOwnership(followerService, recoveredJob);
+        followerService.processQueueOnceForTesting();
+
+        assertEquals(ScanJobStatus.SUCCEEDED, newStore().load(jobId).orElseThrow().getStatus());
+        verify(activeScanService, times(1)).getActiveScanProgressPercent("A-recover");
+        verify(activeScanService, times(1)).startActiveScanJob(eq("http://example.com/recover-pg"), eq("true"), eq(null), any(NativeScanLaunch.class));
+    }
+
+    @Test
+    void staleClaimTokenCannotUpdateReclaimedPostgresJob() {
+        PostgresScanJobStore store = newStore();
+        ScanJob job = queuedJob("job-pg-stale", ScanJobType.ACTIVE_SCAN, "http://example.com/stale", "pg-stale-token");
+        store.admitQueuedJob(job);
+
+        Instant firstClaimAt = Instant.parse("2026-05-06T00:00:10Z");
+        ScanJob firstClaim = store.claimQueuedJobs(
+                "node-a",
+                firstClaimAt,
+                firstClaimAt.plusSeconds(10),
+                1,
+                1
+        ).getFirst();
+        ScanJobClaimToken staleToken = ScanJobClaimToken.from(firstClaim);
+
+        Instant secondClaimAt = Instant.parse("2026-05-06T00:00:30Z");
+        ScanJob secondClaim = store.claimQueuedJobs(
+                "node-a",
+                secondClaimAt,
+                secondClaimAt.plusSeconds(30),
+                1,
+                1
+        ).getFirst();
+        ScanJobClaimToken currentToken = ScanJobClaimToken.from(secondClaim);
+
+        assertTrue(store.updateClaimedJob("job-pg-stale", staleToken, secondClaimAt.plusSeconds(1), claimedJob -> {
+            claimedJob.markRunning("A-stale");
+            return claimedJob;
+        }).isEmpty());
+        assertEquals(ScanJobStatus.QUEUED, store.load("job-pg-stale").orElseThrow().getStatus());
+
+        assertTrue(store.updateClaimedJob("job-pg-stale", currentToken, secondClaimAt.plusSeconds(1), claimedJob -> {
+            claimedJob.markRunning("A-current");
+            return claimedJob;
+        }).isPresent());
+        ScanJob runningJob = store.load("job-pg-stale").orElseThrow();
+        assertEquals(ScanJobStatus.RUNNING, runningJob.getStatus());
+        assertEquals("A-current", runningJob.getZapScanId());
+    }
+
+    @Test
+    void concurrentQueuedClaimsRespectActiveCapacityOnPostgres() throws Exception {
+        PostgresScanJobStore store = newStore();
+        store.admitQueuedJob(queuedJob(
+                "job-pg-active-race-1",
+                ScanJobType.ACTIVE_SCAN,
+                "http://example.com/race-1",
+                "pg-active-race-1"
+        ));
+        store.admitQueuedJob(queuedJob(
+                "job-pg-active-race-2",
+                ScanJobType.ACTIVE_SCAN,
+                "http://example.com/race-2",
+                "pg-active-race-2"
+        ));
+
+        Instant claimAt = Instant.parse("2026-05-06T00:02:00Z");
+        List<ScanJob> claimedJobs = runConcurrentClaims(
+                () -> newStore().claimQueuedJobs("node-a", claimAt, claimAt.plusSeconds(30), 1, 1),
+                () -> newStore().claimQueuedJobs("node-b", claimAt, claimAt.plusSeconds(30), 1, 1)
+        );
+
+        List<ScanJob> liveActiveClaims = newStore().list().stream()
+                .filter(job -> job.getType().isActiveFamily())
+                .filter(job -> job.getStatus() == ScanJobStatus.QUEUED)
+                .filter(job -> job.hasLiveClaim(claimAt.plusSeconds(1)))
+                .toList();
+
+        assertEquals(1, claimedJobs.size());
+        assertEquals(1, liveActiveClaims.size());
+        assertEquals(claimedJobs.getFirst().getId(), liveActiveClaims.getFirst().getId());
+        assertNotNull(liveActiveClaims.getFirst().getClaimFenceId());
+    }
+
+    @Test
+    void concurrentExpiredRunningRecoveryClaimsSingleOwnerOnPostgres() throws Exception {
+        PostgresScanJobStore store = newStore();
+        ScanJob runningJob = queuedJob(
+                "job-pg-running-race",
+                ScanJobType.ACTIVE_SCAN,
+                "http://example.com/running-race",
+                "pg-running-race"
+        );
+        runningJob.incrementAttempts();
+        runningJob.markRunning("A-running-race");
+        runningJob.claim(
+                "node-old",
+                Instant.parse("2026-05-06T00:01:00Z"),
+                Instant.parse("2026-05-06T00:01:10Z")
+        );
+        store.upsertAll(List.of(runningJob));
+
+        Instant reclaimAt = Instant.parse("2026-05-06T00:02:00Z");
+        List<ScanJob> claimedJobs = runConcurrentClaims(
+                () -> newStore().claimRunningJobs("node-a", reclaimAt, reclaimAt.plusSeconds(30)),
+                () -> newStore().claimRunningJobs("node-b", reclaimAt, reclaimAt.plusSeconds(30))
+        );
+
+        ScanJob persistedJob = newStore().load("job-pg-running-race").orElseThrow();
+        assertEquals(1, claimedJobs.size());
+        assertEquals(ScanJobStatus.RUNNING, persistedJob.getStatus());
+        assertEquals("A-running-race", persistedJob.getZapScanId());
+        assertEquals(claimedJobs.getFirst().getClaimOwnerId(), persistedJob.getClaimOwnerId());
+        assertEquals(ScanJobClaimToken.from(claimedJobs.getFirst()), ScanJobClaimToken.from(persistedJob));
+    }
+
+    @Test
+    void postgresRenewalPreservesFenceAndKeepsInFlightTokenUsable() {
+        PostgresScanJobStore store = newStore();
+        store.admitQueuedJob(queuedJob(
+                "job-pg-renew-fence",
+                ScanJobType.ACTIVE_SCAN,
+                "http://example.com/renew-fence",
+                "pg-renew-fence"
+        ));
+
+        Instant claimAt = Instant.parse("2026-05-06T00:03:00Z");
+        ScanJob claimedJob = store.claimQueuedJobs(
+                "node-a",
+                claimAt,
+                claimAt.plusSeconds(30),
+                1,
+                1
+        ).getFirst();
+        ScanJobClaimToken inFlightToken = ScanJobClaimToken.from(claimedJob);
+
+        Instant renewAt = claimAt.plusSeconds(5);
+        int renewedCount = store.renewClaims("node-a", List.of("job-pg-renew-fence"), renewAt, renewAt.plusSeconds(45));
+
+        ScanJob renewedJob = store.load("job-pg-renew-fence").orElseThrow();
+        assertEquals(1, renewedCount);
+        assertEquals(inFlightToken, ScanJobClaimToken.from(renewedJob));
+        assertEquals(renewAt, renewedJob.getClaimHeartbeatAt());
+        assertEquals(renewAt.plusSeconds(45), renewedJob.getClaimExpiresAt());
+
+        assertTrue(store.updateClaimedJob(
+                "job-pg-renew-fence",
+                inFlightToken,
+                renewAt.plusSeconds(1),
+                job -> {
+                    job.markRunning("A-renewed-token");
+                    return job;
+                }
+        ).isPresent());
+        assertEquals("A-renewed-token", store.load("job-pg-renew-fence").orElseThrow().getZapScanId());
+    }
+
+    @Test
+    void expiredPostgresClaimCannotRenewOrApplyResultWithoutReclaim() {
+        PostgresScanJobStore store = newStore();
+        store.admitQueuedJob(queuedJob(
+                "job-pg-expired-update",
+                ScanJobType.ACTIVE_SCAN,
+                "http://example.com/expired-update",
+                "pg-expired-update"
+        ));
+
+        Instant claimAt = Instant.parse("2026-05-06T00:04:00Z");
+        ScanJob claimedJob = store.claimQueuedJobs(
+                "node-a",
+                claimAt,
+                claimAt.plusSeconds(10),
+                1,
+                1
+        ).getFirst();
+        ScanJobClaimToken expiredToken = ScanJobClaimToken.from(claimedJob);
+
+        Instant afterExpiry = claimAt.plusSeconds(15);
+        int renewedCount = store.renewClaims(
+                "node-a",
+                List.of("job-pg-expired-update"),
+                afterExpiry,
+                afterExpiry.plusSeconds(30)
+        );
+        assertEquals(0, renewedCount);
+        assertTrue(store.updateClaimedJob(
+                "job-pg-expired-update",
+                expiredToken,
+                afterExpiry,
+                job -> {
+                    job.markRunning("A-expired-should-not-apply");
+                    return job;
+                }
+        ).isEmpty());
+
+        ScanJob unchangedJob = store.load("job-pg-expired-update").orElseThrow();
+        assertEquals(ScanJobStatus.QUEUED, unchangedJob.getStatus());
+        assertEquals(claimAt, unchangedJob.getClaimHeartbeatAt());
+        assertEquals(claimAt.plusSeconds(10), unchangedJob.getClaimExpiresAt());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ScanJobType.class, names = {
+            "ACTIVE_SCAN", "ACTIVE_SCAN_AS_USER", "SPIDER_SCAN", "SPIDER_SCAN_AS_USER", "CLIENT_SPIDER"
+    })
+    void nativeCleanupRequiresOwnershipAfterRestartAndNeverStopsTheSourcesNewerScan(ScanJobType type) {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        ScanJob source = queuedJob("source-job", type, "http://example.com/restarted-cleanup", "source-idem");
+        source.incrementAttempts();
+        source.markRunning("newer-scan");
+        source.claim("source-worker", now, now.plusSeconds(300));
+
+        Map<String, String> cleanupParameters = new HashMap<>(source.getParameters());
+        cleanupParameters.put(ScanJob.CLEANUP_OF_JOB_ID, source.getId());
+        ScanJob cleanup = new ScanJob("cleanup-job", type, cleanupParameters, now.minusSeconds(30),
+                1, source.getRequesterId(), null);
+        cleanup.markRunning("old-scan");
+        cleanup.requestCancellation(now.minusSeconds(20), now.plusSeconds(300));
+        newStore().upsertAll(List.of(source, cleanup));
+
+        if (type.isActiveFamily()) {
+            when(activeScanService.getActiveScanProgressPercent("old-scan")).thenReturn(100);
+            doThrow(new IllegalStateException("ZAP stop unavailable")).doNothing()
+                    .when(activeScanService).stopActiveScanJob("old-scan");
+        } else if (type == ScanJobType.CLIENT_SPIDER) {
+            when(clientSpiderService.getClientSpiderProgressPercent("old-scan")).thenReturn(100);
+            doThrow(new IllegalStateException("ZAP stop unavailable")).doNothing()
+                    .when(clientSpiderService).stopClientSpiderJob("old-scan");
+        } else {
+            when(spiderScanService.getSpiderScanProgressPercent("old-scan")).thenReturn(100);
+            doThrow(new IllegalStateException("ZAP stop unavailable")).doNothing()
+                    .when(spiderScanService).stopSpiderScanJob("old-scan");
+        }
+
+        ScanJobQueueService firstWorker = newNativeCleanupService("first-cleanup-worker");
+        ScanJob failedCleanup;
+        try {
+            ScanJob heldCleanup = newStore().load(cleanup.getId()).orElseThrow();
+            assertEquals(ScanJobStatus.START_OUTCOME_UNKNOWN, heldCleanup.getStatus());
+            attestOwnership(firstWorker, heldCleanup);
+            firstWorker.processQueueOnceForTesting();
+            failedCleanup = newStore().load(cleanup.getId()).orElseThrow();
+            assertTrue(failedCleanup.isCancellationPending());
+            assertEquals(1, failedCleanup.getCancelAttemptCount());
+            assertTrue(failedCleanup.getCancelNextAttemptAt().isAfter(Instant.now()));
+        } finally {
+            firstWorker.shutdownExecutor();
+        }
+
+        // Simulate the stopped worker's lease expiring without waiting for wall-clock time.
+        failedCleanup.claim("first-cleanup-worker", now.minusSeconds(30), now.minusSeconds(1));
+        newStore().upsertAll(List.of(failedCleanup));
+        ScanJobQueueService restoredWorker = newNativeCleanupService("restored-cleanup-worker");
+        try {
+            restoredWorker.processQueueOnceForTesting();
+            ScanJob restoredCleanup = newStore().load(cleanup.getId()).orElseThrow();
+            assertEquals(ScanJobStatus.START_OUTCOME_UNKNOWN, restoredCleanup.getStatus());
+            assertEquals(type, restoredCleanup.getType());
+            assertEquals("old-scan", restoredCleanup.getZapScanId());
+            assertEquals(source.getId(), restoredCleanup.getCleanupOfJobId());
+            assertEquals(source.getRequesterId(), restoredCleanup.getRequesterId());
+            assertNull(restoredCleanup.getIdempotencyKey());
+            assertEquals(failedCleanup.getCancelRequestedAt(), restoredCleanup.getCancelRequestedAt());
+            assertEquals(failedCleanup.getCancelDeadlineAt(), restoredCleanup.getCancelDeadlineAt());
+            assertEquals(failedCleanup.getCancelNextAttemptAt(), restoredCleanup.getCancelNextAttemptAt());
+            assertEquals(1, restoredCleanup.getCancelAttemptCount());
+            verifyNativeStops(type, 1);
+
+            restoredCleanup = attestOwnership(restoredWorker, restoredCleanup);
+            restoredCleanup.deferCancellationAttempt(Instant.now().minusSeconds(1));
+            newStore().upsertAll(List.of(restoredCleanup));
+            restoredWorker.processQueueOnceForTesting();
+
+            ScanJob completedCleanup = newStore().load(cleanup.getId()).orElseThrow();
+            assertEquals(ScanJobStatus.CANCELLED, completedCleanup.getStatus());
+            assertFalse(completedCleanup.isCancellationPending());
+            assertEquals(failedCleanup.getCancelDeadlineAt(), completedCleanup.getCancelDeadlineAt());
+            assertEquals(1, completedCleanup.getCancelAttemptCount());
+            ScanJob unaffectedSource = newStore().load(source.getId()).orElseThrow();
+            assertEquals(ScanJobStatus.RUNNING, unaffectedSource.getStatus());
+            assertEquals("newer-scan", unaffectedSource.getZapScanId());
+            assertEquals("source-idem", unaffectedSource.getIdempotencyKey());
+            verifyNativeStops(type, 2);
+        } finally {
+            restoredWorker.shutdownExecutor();
+        }
+    }
+
+    private ScanJobQueueService newNativeCleanupService(String workerId) {
+        ScanJobQueueService.RetryPolicy retryPolicy = new ScanJobQueueService.RetryPolicy(3, 60_000, 60_000, 1);
+        return launches.guarded(new ScanJobQueueService(activeScanService, spiderScanService, ajaxSpiderService, clientSpiderService,
+                urlValidationService, scanLimitProperties, retryPolicy, retryPolicy, false, newStore(),
+                new TestQueueLeadershipCoordinator(workerId, new SharedLeadershipState(workerId))));
+    }
+
+    private void verifyNativeStops(ScanJobType type, int expectedAttempts) {
+        if (type.isActiveFamily()) {
+            verify(activeScanService, times(expectedAttempts)).stopActiveScanJob("old-scan");
+            verify(activeScanService, never()).stopActiveScanJob("newer-scan");
+            verify(spiderScanService, never()).stopSpiderScanJob(anyString());
+        } else if (type == ScanJobType.CLIENT_SPIDER) {
+            verify(clientSpiderService, times(expectedAttempts)).stopClientSpiderJob("old-scan");
+            verify(clientSpiderService, never()).stopClientSpiderJob("newer-scan");
+            verify(activeScanService, never()).stopActiveScanJob(anyString());
+            verify(spiderScanService, never()).stopSpiderScanJob(anyString());
+        } else {
+            verify(spiderScanService, times(expectedAttempts)).stopSpiderScanJob("old-scan");
+            verify(spiderScanService, never()).stopSpiderScanJob("newer-scan");
+            verify(activeScanService, never()).stopActiveScanJob(anyString());
+        }
+        verify(ajaxSpiderService, never()).stopAjaxSpiderJob();
+    }
+
+    private ScanJobLaunchSafety safety(ScanJobQueueService queue) {
+        return (ScanJobLaunchSafety) ReflectionTestUtils.getField(queue, "launchSafety");
+    }
+
+    private ScanJob attestOwnership(ScanJobQueueService queue, ScanJob job) {
+        return safety(queue).reconcile(job.getId(), job.getLaunchAttempt().id(),
+                job.getLaunchAttempt().resolutionVersion(), "attach_scan", job.getZapScanId(), true);
+    }
+
+    private void seedOwnedRunning(ScanJobQueueService queue, PostgresScanJobStore store, ScanJob job, String scanId) {
+        store.admitQueuedJob(job);
+        Instant now = Instant.now();
+        String worker = (String) ReflectionTestUtils.getField(queue, "workerNodeId");
+        ScanJob claimed = store.claimQueuedJobs(worker, now, now.plusSeconds(60), 1, 1).getFirst();
+        ScanJobLaunchSafety.StartAttempt launch = safety(queue).newAttempt(new ScanJobStartTarget(job.getId(), job.getType(),
+                job.getParameters(), ScanJobClaimToken.from(claimed)));
+        try {
+            launch.beforeDispatch();
+            launch.accepted(scanId);
+        } finally {
+            launch.finished();
+        }
+    }
+
+    private PostgresScanJobStore newStore() {
+        mcp.server.zap.core.configuration.ScanJobStoreProperties.Postgres properties =
+                new mcp.server.zap.core.configuration.ScanJobStoreProperties.Postgres();
+        properties.setUrl(POSTGRES.getJdbcUrl());
+        properties.setUsername(POSTGRES.getUsername());
+        properties.setPassword(POSTGRES.getPassword());
+        properties.setFailFast(true);
+        return new PostgresScanJobStore(properties, new ObjectMapper());
+    }
+
+    private ScanJob queuedJob(String id, ScanJobType type, String targetUrl, String idempotencyKey) {
+        return new ScanJob(
+                id,
+                type,
+                Map.of("targetUrl", targetUrl, "recurse", "true", "policy", ""),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                3,
+                "client-a",
+                idempotencyKey
+        );
+    }
+
+    private List<ScanJob> runConcurrentClaims(ClaimCallable firstClaim, ClaimCallable secondClaim) throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            Future<List<ScanJob>> firstResult = executor.submit(() -> {
+                barrier.await();
+                return firstClaim.call();
+            });
+            Future<List<ScanJob>> secondResult = executor.submit(() -> {
+                barrier.await();
+                return secondClaim.call();
+            });
+
+            ArrayList<ScanJob> claimedJobs = new ArrayList<>();
+            claimedJobs.addAll(firstResult.get());
+            claimedJobs.addAll(secondResult.get());
+            return claimedJobs;
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private String extractJobId(String response) {
+        for (String line : response.split("\\R")) {
+            if (line.startsWith("Job ID: ")) {
+                return line.substring("Job ID: ".length()).trim();
+            }
+        }
+        throw new AssertionError("Unable to extract job ID from response: " + response);
+    }
+
+    @FunctionalInterface
+    private interface ClaimCallable {
+        List<ScanJob> call() throws Exception;
+    }
+
+    private static final class SharedLeadershipState {
+        private final AtomicReference<String> leaderId;
+
+        private SharedLeadershipState(String initialLeaderId) {
+            this.leaderId = new AtomicReference<>(initialLeaderId);
+        }
+
+        private String getLeaderId() {
+            return leaderId.get();
+        }
+    }
+
+    private static final class TestQueueLeadershipCoordinator implements QueueLeadershipCoordinator {
+        private final String nodeId;
+        private final SharedLeadershipState state;
+        private volatile boolean wasLeader;
+
+        private TestQueueLeadershipCoordinator(String nodeId, SharedLeadershipState state) {
+            this.nodeId = nodeId;
+            this.state = state;
+        }
+
+        @Override
+        public LeadershipDecision evaluateLeadership() {
+            boolean isLeaderNow = nodeId.equals(state.getLeaderId());
+            boolean acquired = !wasLeader && isLeaderNow;
+            boolean lost = wasLeader && !isLeaderNow;
+            wasLeader = isLeaderNow;
+            return new LeadershipDecision(isLeaderNow, acquired, lost);
+        }
+
+        @Override
+        public String nodeId() {
+            return nodeId;
+        }
+    }
+}

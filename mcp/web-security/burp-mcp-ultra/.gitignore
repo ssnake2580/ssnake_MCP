@@ -1,0 +1,29 @@
+# Build
+build/
+.gradle/
+out/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# NOTE: gradle/wrapper/gradle-wrapper.jar is intentionally committed (NOT ignored).
+# It is required for ./gradlew (Linux/macOS) and gradlew.bat (Windows) to run after
+# a fresh clone. Excluding it broke first-time builds on every OS (GitHub issue #2).
+
+# Test files
+test_*.py
+__pycache__/
+
+# Local config
+*.local
+
+# Local build / test artifacts (copyJar convenience copy at repo root, Kotlin daemon dirs, Burp project files)
+.kotlin/
+burpmcp-ultra.jar
+*.burp

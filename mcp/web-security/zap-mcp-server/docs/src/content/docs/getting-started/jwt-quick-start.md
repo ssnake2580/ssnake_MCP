@@ -1,0 +1,192 @@
+---
+title: "Quick Start: JWT Authentication"
+editUrl: false
+description: "Mint a JWT, initialize an MCP session, and verify authenticated access."
+---
+Get started with JWT authentication in a few minutes.
+
+## Prerequisites
+
+- A working [local Compose setup](../self-serve-first-run/) or a deployment you can configure
+- `curl`
+- `jq` if you want to use the copy-paste shell snippets as written
+
+JWT is not the fastest local setup path. Use it when you need token expiry, refresh rotation, revocation, or a shared production auth model.
+
+## Step 1: Configure JWT Mode
+
+For the supplied Docker Compose stack, set these values in `.env`. Keep the
+generated `MCP_API_KEY` from your existing setup:
+
+```bash
+MCP_SECURITY_MODE=jwt
+JWT_ENABLED=true
+MCP_API_KEY=your-mcp-api-key
+```
+
+## Step 2: Generate JWT Secret
+
+```bash
+openssl rand -base64 32
+```
+
+Then add it to `.env`:
+
+```bash
+JWT_SECRET=your-generated-secret-key-here
+```
+
+Replace any example secret from an older `.env`; it is not a usable signing key.
+Keep `JWT_ENABLED=false` for API-key-only setups. The supplied Compose file now
+passes JWT settings into the container, so enabling JWT takes effect on recreate.
+
+## Step 3: Apply The Configuration
+
+For the README's published-image stack started with
+`./bin/bootstrap-local.sh --start`, recreate the MCP service so the changed
+environment reaches the container:
+
+```bash
+docker compose up -d --no-build --force-recreate mcp-server
+```
+
+For a source-development stack started with `./dev.sh`, include its override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --force-recreate mcp-server
+```
+
+`docker compose restart` alone does not reload `.env`. The startup helpers'
+doctor checks the API-key connection, not JWT issuance or bearer tokens; use
+steps 4–6 below to verify JWT readiness.
+
+For a local JVM process, export the settings before starting it. `bootRun` does
+not automatically read `.env`; supply your ZAP connection and API keys as well:
+
+```bash
+export MCP_SECURITY_MODE=jwt
+export JWT_ENABLED=true
+export JWT_SECRET=your-generated-secret-key-here
+export MCP_API_KEY=your-mcp-api-key
+export ZAP_API_URL=localhost
+export ZAP_API_PORT=8090
+export ZAP_API_KEY=your-zap-api-key
+./gradlew bootRun
+```
+
+## Step 4: Get JWT Tokens
+
+```bash
+curl -s -X POST http://localhost:7456/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{
+    "apiKey": "your-mcp-api-key",
+    "clientId": "default-client"
+  }'
+```
+
+Response shape:
+
+```json
+{
+  "accessToken": "eyJ...",
+  "refreshToken": "eyJ...",
+  "tokenType": "Bearer",
+  "expiresIn": 3600,
+  "clientId": "default-client",
+  "scopes": ["mcp:tools:list", "zap:scan:read", "zap:report:read"]
+}
+```
+
+If your local config still uses the legacy wildcard client, the response may show `["*"]`. Replace that with explicit scopes before shared or production use.
+
+## Step 5: Initialize The MCP Session
+
+Do not skip this. `/mcp` is streamable HTTP, so manual testing requires `initialize` first.
+
+```bash
+TOKEN_RESPONSE=$(curl -s -X POST http://localhost:7456/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"apiKey":"your-mcp-api-key","clientId":"default-client"}')
+
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.accessToken')
+
+SESSION_ID=$(curl -si \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Accept: application/json,text/event-stream" \
+  -H "Content-Type: application/json" \
+  http://localhost:7456/mcp \
+  -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0.0"}}}' \
+  | awk -F': ' '/Mcp-Session-Id/ {print $2}' | tr -d '\r')
+```
+
+## Step 6: Verify MCP Access
+
+```bash
+curl -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Mcp-Session-Id: $SESSION_ID" \
+  -H "Accept: application/json,text/event-stream" \
+  -H "Content-Type: application/json" \
+  http://localhost:7456/mcp \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+```
+
+## Step 7: Refresh Token
+
+When the access token expires, use the refresh token to get a new token pair:
+
+```bash
+REFRESH_TOKEN="eyJ..."
+
+curl -X POST http://localhost:7456/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refreshToken\": \"$REFRESH_TOKEN\"}"
+```
+
+The returned refresh token replaces the old one. Refresh tokens are one-time use.
+
+## Step 8: Revoke Token
+
+```bash
+curl -X POST http://localhost:7456/auth/revoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "YOUR_ACCESS_OR_REFRESH_TOKEN"
+  }'
+```
+
+## Troubleshooting
+
+### "JWT secret is not configured"
+
+Set `JWT_SECRET` and restart the service.
+
+For Compose, recreate the service as shown above. For a local JVM process,
+confirm the variable is exported in the environment that starts the process.
+
+### "JWT secret must be at least 256 bits"
+
+Generate a stronger secret:
+
+```bash
+openssl rand -base64 32
+```
+
+### "Invalid API key"
+
+Check that `MCP_API_KEY` matches the configured client entry.
+
+### "I get 401 or 403 on /mcp even with a token"
+
+Common causes:
+
+- you forgot to initialize the MCP session first
+- you did not send back `Mcp-Session-Id`
+- your client scopes do not allow `tools/list` or the tool you are calling
+
+## Next Steps
+
+- read the [full JWT guide](../../security-modes/jwt-authentication/)
+- configure client scopes with [Tool Scope Authorization](../tool-scope-authorization/)
+- review the [guided tool catalog](../tool-surfaces/) and its permission requirements
+- configure your real client with [MCP Client Authentication](../mcp-client-authentication/)

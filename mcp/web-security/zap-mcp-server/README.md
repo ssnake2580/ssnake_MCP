@@ -1,0 +1,305 @@
+<p align="center">
+  <img src="images/brand.png" alt="MCP ZAP Server logo" width="180">
+</p>
+
+<h1 align="center">MCP ZAP Server</h1>
+
+<p align="center">
+  Give AI agents a safe, self-hosted ZAP operator for guided web security scans, findings, reports, and production guardrails.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/github/stars/dtkmn/mcp-zap-server?style=social" alt="GitHub stars">
+  <img src="https://img.shields.io/github/forks/dtkmn/mcp-zap-server?style=social" alt="GitHub forks">
+  <img src="https://img.shields.io/github/v/tag/dtkmn/mcp-zap-server" alt="GitHub tag">
+  <img src="https://img.shields.io/github/license/dtkmn/mcp-zap-server" alt="GitHub license">
+</p>
+
+> **Note** This project is not affiliated with or endorsed by the ZAP project. It is an independent implementation.
+
+`mcp-zap-server` exposes ZAP through MCP over streamable HTTP so agentic tools can run operator-controlled security workflows without brittle glue scripts or unsafe scanner access.
+
+Use it when you want:
+
+- **safe agentic scanning** with guided defaults for spider, active scan, passive scan, API imports, findings, and reports
+- **operator control** through API-key or JWT auth, tool scopes, runtime policy bundles, rate limits, and audit events
+- **self-hosted deployment** with Docker Compose for local adoption and Helm for Kubernetes
+- **one guided tool catalog** with queue-managed scan starts, findings baselines, reports and explicit operator recovery
+
+Full documentation: [danieltse.org/mcp-zap-server](https://danieltse.org/mcp-zap-server/)
+
+An experimental [headless Apple Silicon package](./docs/getting-started/MACOS_PACKAGE.md)
+bundles Java and ZAP for HTTP workflows. It is a maintainer-built local preview;
+public downloads are not available, and supplied previews are unsigned.
+The [private ChatGPT connection guide](./docs/getting-started/CHATGPT_LOCAL_TUNNEL.md)
+explains Secure MCP Tunnel prerequisites and access to a local scanner.
+
+Watch the demo: [browser demo](https://danieltse.org/mcp-zap-server/demo.html) or [YouTube](https://www.youtube.com/watch?v=9_9VqsL0lNw)
+
+<a href="https://www.youtube.com/watch?v=9_9VqsL0lNw" target="_blank" rel="noopener noreferrer">
+  <img src="https://img.youtube.com/vi/9_9VqsL0lNw/hqdefault.jpg" alt="MCP ZAP Server demo video thumbnail" width="480">
+</a>
+
+## Quick Start
+
+Prerequisites:
+
+- Docker 20.10+
+- Docker Compose v2 or newer (`docker compose`) with `--wait` and `--wait-timeout` support
+- your own MCP client with Streamable HTTP and custom-header support
+
+This source selects image `v0.17.1`. Verify that the matching
+[GitHub release](https://github.com/dtkmn/mcp-zap-server/releases) and Linux AMD64/ARM64
+images are published before starting it. Until then, use the published `v0.16.0`
+release or build local source through the contributor setup. Read the
+[0.17.1 upgrade guide](./docs/releases/RELEASE_NOTES_0.17.1.md) before changing
+an existing installation. Settings and selected versions are preserved; set
+`IMAGE_TAG` in `.env` deliberately when upgrading.
+
+Prefer to ask Codex to handle setup? Manually install the optional
+[MCP ZAP Connect plugin](./docs/getting-started/SELF_SERVE_FIRST_RUN.md#guided-setup-in-codex),
+then ask it to check prerequisites, start the Docker stack, configure your private
+MCP connection and verify status. The skill can help install missing prerequisites
+with your approval, then recheck and continue setup. Scanning is a separate
+request. The commands below remain available without the plugin.
+
+For Cursor Desktop Free, follow the [guided Cursor setup](./docs/getting-started/SELF_SERVE_FIRST_RUN.md#guided-setup-in-cursor).
+Use a local Agent chat with available Cursor allowance to set up the scanner,
+check status, then request a demo crawl and report separately.
+
+[Claude Code local preview](./plugins/mcp-zap-connect/README.md#claude-code-local-preview)
+uses the same scanner and setup skill in a local Claude Code session.
+
+For Claude Desktop Free, follow the [download, setup and first-scan guide](./packaging/claude-desktop/SETUP.md).
+The macOS MCPB preview adds agent-callable setup tools around the same Docker
+scripts and reuses existing installations. Choose a
+[scanner release](https://github.com/dtkmn/mcp-zap-server/releases) that includes
+the Desktop `.mcpb`, matching guide and checksum files. If those assets are not
+listed, use the [local build instructions](./packaging/claude-desktop/README.md#build-and-check-the-bundle).
+This extension is separate from the Claude Code plugin.
+
+```bash
+git clone https://github.com/dtkmn/mcp-zap-server.git
+cd mcp-zap-server
+
+./bin/bootstrap-local.sh --start
+```
+
+This creates missing settings, preserves existing keys and workspace data,
+and starts a versioned release image. It reports ready after container health
+and authenticated MCP checks pass. The packaged client uses `*` for the curated
+guided tools; run scans only when requested. Existing settings retain their
+permissions. See
+[quick-start permissions](./docs/src/content/docs/getting-started/tool-scope-authorization.md#quick-start-permissions)
+for the default and optional per-client restrictions.
+
+Use [Self-Serve First Run](./docs/getting-started/SELF_SERVE_FIRST_RUN.md) for
+version selection, configuration, stopping/restarting, startup timeouts,
+and recovery. For source builds, use the
+[contributor setup](./CONTRIBUTING.md#local-stack).
+
+Connect your MCP client:
+
+- MCP endpoint for host-side clients: `http://localhost:7456/mcp`
+- Authentication: send `MCP_API_KEY` from `.env` in the `X-API-Key` header
+- [MCP client setup and authentication](./docs/src/content/docs/getting-started/mcp-client-authentication.md)
+
+The stack runs the MCP server, ZAP, and demo targets. Install and configure
+your preferred MCP client separately.
+
+After connecting, try this first prompt:
+
+```text
+Use the guided ZAP tools to crawl http://juice-shop:3000. Wait for the crawl
+and passive analysis to finish, show a findings summary, generate an HTML
+report, and read it back through MCP. Do not run an active scan.
+```
+
+Expect a completed crawl, a findings summary, and a report the client can
+read. Use the container URL `http://juice-shop:3000` for this scan; the host
+preview `http://localhost:3001` is for your browser. Finding counts vary;
+a connection or scan error is not a clean result.
+
+The default stack binds published ports to loopback. Review
+[Quick Start Security](./QUICK_START_SECURITY.md) before changing access or
+scan-target settings. [Agent install notes](./llms-install.md) cover setup
+permissions and standalone OCI use.
+
+## Discovery Metadata
+
+This source includes `0.17.1` MCP Registry metadata in
+[`.mcp/server.json`](./.mcp/server.json). Metadata in source does not publish a
+registry version or image. Check the
+[MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers/io.github.dtkmn%2Fmcp-zap-server/versions/latest)
+and use metadata from the same published version as the image you deploy.
+The image includes the MCP server name expected by registry and catalog tooling.
+The published `0.16.0` version and its immutable digest remain documented in the
+[0.16.0 release guide](./docs/releases/RELEASE_NOTES_0.16.0.md).
+
+Docker Compose remains the easiest installation path because the MCP server is designed to operate with a ZAP sidecar and explicit auth keys. The OCI package metadata is for advanced standalone installs where ZAP is already running and reachable from the MCP container.
+
+## What You Get
+
+- **Guided scans**: intent-first tools for spider, active scan, passive scan, API imports, findings, reports, and scan history.
+- **Guided tool catalog**: policy inspection, authentication setup and queued scan operations with status and stop controls.
+- **Authentication**: API key mode by default, optional JWT mode with refresh and revocation support.
+- **Runtime policy bundles**: configured dry-run and enforcement modes for guided tool calls.
+- **Scan queue and history**: queued active, traditional spider, AJAX Spider, and Client Spider jobs with claim-based recovery, durable Postgres state, and evidence export.
+- **Extension contracts**: experimental policy, protection, evidence metadata, and extension metadata APIs with sample extension packaging.
+- **Operational guardrails**: request body limits, rate limits, workspace quotas, tool-scope authorization, structured logs, metrics, and audit events.
+- **Deployment paths**: local Docker Compose, published JVM container images, and Helm charts for Kubernetes.
+
+See the [Client Spider guide](./docs/src/content/docs/scanning/client-spider.md) for browser setup, authenticated guided crawling and reports.
+
+## Version 0.17.1
+
+The [0.17.1 release and upgrade guide](./docs/releases/RELEASE_NOTES_0.17.1.md)
+describes neutral recorded-findings responses, authoritative explicit target
+denies, permission-aware next actions, and the local client setup options.
+Publication of the tag, images, registry version and Desktop downloads must be
+verified separately in [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases).
+Use a version with verified published images until the matching distribution is available.
+The `v0.17.0` GitHub release is incomplete: its Desktop assets are absent and
+its image-release workflow did not complete. See the upgrade guide for availability checks.
+
+## Version 0.16.0
+
+See the [0.16.0 release and upgrade guide](./docs/releases/RELEASE_NOTES_0.16.0.md) for that release's behavior and requirements.
+
+## Version 0.15.0
+
+See the [0.15.0 release and upgrade guide](./docs/releases/RELEASE_NOTES_0.15.0.md) for that release's behavior and requirements.
+
+## Version 0.14.0
+
+See the [0.14.0 release and upgrade guide](./docs/releases/RELEASE_NOTES_0.14.0.md) for that release's behavior and requirements.
+
+The [release notes archive](./docs/releases/README.md) and [changelog](./CHANGELOG.md) cover earlier versions. For changes to older MCP integrations, use [Upgrading to Guided Tools](./docs/src/content/docs/getting-started/tool-migration.md). Verify the matching image and distribution in [GitHub Releases](https://github.com/dtkmn/mcp-zap-server/releases) before deployment.
+
+## Security Defaults
+
+The default posture is intentionally conservative:
+
+- `api-key` mode is the base runtime default.
+- `none` mode is for explicit local dev/test only.
+- Docker Compose binds published ports to loopback by default.
+- The Java 25 JVM image uses a digest-pinned distroless runtime with no shell or
+  package manager; debug it through logs, metrics, and external diagnostic
+  containers rather than installing tools into the application container.
+- URL validation blocks localhost, private networks, and link-local targets by default.
+- Target authentication is optional and profiles default to an empty list. When enabled, guided auth binds an exact server-side credential reference and login settings to one approved origin; callers provide only `profileId` and `targetUrl`.
+- Public auth exchange endpoints are rate-limited.
+- MCP request bodies have a hard early size cap.
+
+For a first private AWS deployment without Kubernetes, use [AWS EC2 with Docker Compose](./docs/operator/runbooks/AWS_EC2_COMPOSE_GUIDE.md) and its [standalone example](./examples/aws-ec2/).
+
+For Kubernetes, use the [EKS infrastructure starter](./examples/aws-eks/) to
+create a dedicated evaluation cluster in an existing VPC, then deploy with the
+existing Helm chart. Follow the walkthrough for network configuration, JWT
+authentication, persistent storage and deployment checks.
+
+Production and shared deployments should review:
+
+- [Security Modes](https://danieltse.org/mcp-zap-server/security-modes/)
+- [JWT Authentication](https://danieltse.org/mcp-zap-server/security-modes/jwt-authentication/)
+- [Optional Target Form-Login](https://danieltse.org/mcp-zap-server/getting-started/form-login-target-authentication/)
+- [Authenticated Scanning Reference](https://danieltse.org/mcp-zap-server/scanning/authenticated-scanning-best-practices/)
+- [Abuse Protection](https://danieltse.org/mcp-zap-server/operations/abuse-protection/)
+- [Production Readiness Checklist](https://danieltse.org/mcp-zap-server/operations/production-checklist/)
+- [Security Policy](./SECURITY.md)
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Client["Your MCP Client"] -->|"MCP over Streamable HTTP"| MCP["MCP ZAP Server"]
+  MCP -->|"ZAP API"| ZAP["ZAP"]
+  ZAP -->|"scan"| Target["Authorized target app"]
+  MCP -->|"reports / findings / history"| Evidence["Evidence + reports"]
+```
+
+For multi-replica queueing, durable Postgres state, claim recovery, and ingress affinity, use the operations docs instead of this README:
+
+- [Queue Coordinator and Worker Claims](https://danieltse.org/mcp-zap-server/operations/queue-coordinator-leader-election/)
+- [Multi-Replica Deployment Requirements](https://danieltse.org/mcp-zap-server/operations/local-ha-compose/)
+- [Scan History Ledger](https://danieltse.org/mcp-zap-server/operations/scan-history-ledger/)
+- [Helm Deployment](./helm/mcp-zap-server/README.md)
+
+### Extension Model
+
+The extension API exposes selected contracts for policy, protection, evidence
+and metadata integrations:
+
+- `mcp-zap-extension-api` packages selected policy, protection, evidence, and
+  metadata contracts without gateway runtime internals.
+- [How extensions work](./docs/extensions/README.md) explains the core versus
+  extension boundary.
+- [Build your own extension](./docs/extensions/BUILD_YOUR_OWN_EXTENSION.md)
+  shows the target standalone repository shape.
+- [Extension API release policy](./docs/extensions/EXTENSION_API_RELEASE_POLICY.md)
+  explains publication stages and compatibility gates.
+- [Standalone sample extension](./examples/extensions/standalone-policy-metadata-extension/README.md)
+  shows how a separate project depends on the API artifact.
+
+Extensions do not add runtime multi-engine support. Additional scanner engines
+require their own adapters and explicit capability boundaries.
+
+## Documentation Map
+
+Start here:
+
+- [Full documentation](https://danieltse.org/mcp-zap-server/)
+- [Self-Serve First Run](https://danieltse.org/mcp-zap-server/getting-started/self-serve-first-run/)
+- [OSS Extension Model](./docs/extensions/README.md)
+- [MCP Access Authentication](https://danieltse.org/mcp-zap-server/getting-started/authentication-quick-start/)
+- [MCP Client Authentication](https://danieltse.org/mcp-zap-server/getting-started/mcp-client-authentication/)
+- [Optional Target Form-Login](https://danieltse.org/mcp-zap-server/getting-started/form-login-target-authentication/)
+- [Guided Tools](https://danieltse.org/mcp-zap-server/getting-started/tool-surfaces/)
+- [Upgrading to Guided Tools](https://danieltse.org/mcp-zap-server/getting-started/tool-migration/)
+
+Scanning:
+
+- [MCP Client Scan To Evidence](https://danieltse.org/mcp-zap-server/scanning/mcp-client-scan-to-evidence/)
+- [Scan Execution](https://danieltse.org/mcp-zap-server/scanning/scan-execution-modes/)
+- [Seeded API Gate Playbook](https://danieltse.org/mcp-zap-server/scanning/seeded-api-gate-playbook/)
+- [API Schema Imports](https://danieltse.org/mcp-zap-server/scanning/api-schema-imports/)
+- [AJAX Spider](https://danieltse.org/mcp-zap-server/scanning/ajax-spider/)
+- [Client Spider](https://danieltse.org/mcp-zap-server/scanning/client-spider/)
+- [Findings and Reports](https://danieltse.org/mcp-zap-server/scanning/findings-and-reports/)
+
+Operations:
+
+- [Runtime Policy Bundles](https://danieltse.org/mcp-zap-server/operations/runtime-policy-bundles/)
+- [Observability](https://danieltse.org/mcp-zap-server/operations/observability/)
+- [Production Checklist](https://danieltse.org/mcp-zap-server/operations/production-checklist/)
+- [Release Evidence Handoff](https://danieltse.org/mcp-zap-server/operations/release-evidence-handoff-runbook/)
+
+## Open Source Core And Extension Model
+
+`mcp-zap-server` is the Apache-2.0-licensed open-source core. It is intended to be useful on its own for self-hosted MCP and ZAP workflows.
+
+Private or enterprise capabilities may be built as separate extensions around this core. Those extensions are not required to run the OSS project, and enterprise implementation code is not shipped in this repository.
+
+The boundary is intentional:
+
+- this repository remains the public OSS distribution
+- extension points should be documented and kept stable where practical
+- private extensions must not weaken the security, licensing, or usability of the OSS core
+- security scanning and open-source program entitlements for this repository apply only to this public project
+
+## Contributing And Support
+
+- [Contributing](./CONTRIBUTING.md)
+- [Security Policy](./SECURITY.md)
+- [Discussions](https://github.com/dtkmn/mcp-zap-server/discussions)
+- [Demo video](https://danieltse.org/mcp-zap-server/demo.html)
+
+If this project saves you time or becomes part of your security workflow, you can [sponsor the maintainer](https://github.com/sponsors/dtkmn) to support ongoing maintenance.
+
+Agentic Lab offers optional paid support for teams adopting the public core in production. Commercial support is separate from the Apache-2.0-licensed OSS distribution, and the public core should remain usable without private extensions or paid services.
+
+[Contact Agentic Lab](mailto:agentic.lab.au@gmail.com?subject=Inquiry:%20MCP%20ZAP%20Server%20Commercial%20Support)
+
+## License
+
+Apache License 2.0. Copyright 2025-2026 Daniel Tse. See [LICENSE](./LICENSE).

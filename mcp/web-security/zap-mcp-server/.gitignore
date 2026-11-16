@@ -1,0 +1,52 @@
+# Gradle build output
+/build/
+/bin/*
+!/bin/bootstrap-local.sh
+!/bin/self-serve-doctor.sh
+!/bin/scanner-readiness.sh
+.gradle/
+**/build/
+**/.gradle/
+
+# Java class files
+*.class
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# IDE directories
+.idea/
+.vscode/
+*.iml
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# Astro documentation app
+docs/.astro/
+docs/dist/
+docs/node_modules/
+docs/src/content/docs/generated/
+
+# Keep local review notes out of public commits.
+docs/reviews/
+
+# Runtime and verification artifacts
+.zap-work/
+.zap-artifacts/
+zap-artifacts/
+.verify/
+zap-workplace/
+
+# Claude Desktop extension dependencies and packaged artifacts
+packaging/claude-desktop/node_modules/
+packaging/claude-desktop/*.mcpb

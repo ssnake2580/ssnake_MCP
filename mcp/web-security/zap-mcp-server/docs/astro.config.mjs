@@ -1,0 +1,136 @@
+// @ts-check
+import { defineConfig } from 'astro/config';
+import sitemap from '@astrojs/sitemap';
+import starlight from '@astrojs/starlight';
+import sharedDocs from './scripts/sync-docs.mjs';
+
+export default defineConfig({
+	site: 'https://danieltse.org',
+	base: '/mcp-zap-server',
+	trailingSlash: 'always',
+	redirects: {
+		'/operations/native-image-performance': '/mcp-zap-server/operations/production-checklist/',
+		'/security-modes/implementation-summary': '/mcp-zap-server/security-modes/',
+	},
+	integrations: [
+		sharedDocs(),
+		starlight({
+			title: 'MCP ZAP Server',
+			description: 'Enterprise-grade security testing for AI agents and operators using ZAP over MCP.',
+			social: [
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/dtkmn/mcp-zap-server' },
+			],
+			customCss: [
+				'@fontsource/ibm-plex-mono/400.css',
+				'@fontsource/ibm-plex-mono/500.css',
+				'@fontsource/rajdhani/500.css',
+				'@fontsource/rajdhani/700.css',
+				'/src/styles/terminal-ops.css',
+			],
+			credits: false,
+			components: {
+				Header: './src/components/CinematicHeader.astro',
+				Footer: './src/components/CinematicFooter.astro',
+				PageTitle: './src/components/FsPageTitle.astro',
+				SiteTitle: './src/components/FsSiteTitle.astro',
+			},
+			sidebar: [
+				{
+					label: 'Mission Control',
+					items: [
+						{ label: 'root@localhost:~', link: '/' },
+						{ slug: 'releases/0.17.1' },
+						{ slug: 'releases/publishing' },
+						{ slug: 'releases/0.17.0' },
+						{ slug: 'releases/0.16.0' },
+						{ slug: 'getting-started/self-serve-first-run' },
+						{ slug: 'getting-started/macos-package' },
+						{ slug: 'getting-started/chatgpt-local-tunnel' },
+						{ slug: 'getting-started/authentication-quick-start' },
+						{ slug: 'getting-started/mcp-client-authentication' },
+						{ slug: 'getting-started/form-login-target-authentication' },
+						{ slug: 'getting-started/tool-surfaces' },
+						{ slug: 'getting-started/tool-migration' },
+						{ slug: 'getting-started/jwt-quick-start' },
+						{ slug: 'getting-started/tool-scope-authorization' },
+					],
+				},
+				{
+					label: 'Scanning',
+					items: [
+						{ slug: 'scanning/mcp-client-scan-to-evidence' },
+						{ slug: 'scanning/scan-execution-modes' },
+						{ slug: 'scanning/client-spider' },
+						{ slug: 'scanning/ajax-spider' },
+						{ slug: 'scanning/passive-scan' },
+						{ slug: 'scanning/seeded-api-gate-playbook' },
+						{ slug: 'scanning/api-schema-imports' },
+						{ slug: 'scanning/scan-policy-controls' },
+						{ slug: 'scanning/findings-and-reports' },
+						{ slug: 'scanning/authenticated-scanning-best-practices' },
+					],
+				},
+				{
+					label: 'Security Modes',
+					items: [
+						{ slug: 'security-modes' },
+						{ slug: 'security-modes/jwt-authentication' },
+						{ slug: 'security-modes/examples' },
+						{ slug: 'security-modes/jwt-key-rotation-runbook' },
+						{ slug: 'security-modes/jwt-implementation-summary' },
+					],
+				},
+				{
+					label: 'Operations',
+					items: [
+						{ slug: 'operations/abuse-protection' },
+						{ slug: 'operations/runtime-policy-bundles' },
+						{ slug: 'operations/engine-addons' },
+						{ slug: 'operations/observability' },
+						{ slug: 'operations/structured-logging' },
+						{ slug: 'operations/aws-ec2-compose' },
+						{ slug: 'operations/aws-eks-infrastructure' },
+						{ slug: 'operations/production-checklist' },
+						{ slug: 'operations/local-ha-compose' },
+						{ slug: 'operations/queue-coordinator-leader-election' },
+						{ slug: 'operations/scan-queue-retry-policy' },
+						{ slug: 'operations/scan-history-ledger' },
+						{ slug: 'operations/release-evidence-handoff-runbook' },
+						{ slug: 'operations/production-simulation-runbook' },
+					],
+				},
+				{
+					label: 'Extensions',
+					items: [
+						{ slug: 'extensions/extension-api-release-policy' },
+					],
+				},
+				{
+					label: 'Reference',
+					collapsed: true,
+					items: [
+						{ slug: 'reference/security-policy' },
+						{ slug: 'reference/dependency-security' },
+					],
+				},
+				{
+					label: 'Project Links',
+					collapsed: true,
+					items: [
+						{
+							label: 'GitHub Repository',
+							link: 'https://github.com/dtkmn/mcp-zap-server',
+						},
+						{
+							label: 'Releases',
+							link: 'https://github.com/dtkmn/mcp-zap-server/releases',
+						},
+					],
+				},
+			],
+		}),
+		sitemap({
+			filter: (page) => !/\/[A-Z_]+\.html\/?$/.test(new URL(page).pathname),
+		}),
+	],
+});

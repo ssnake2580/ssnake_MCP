@@ -1,0 +1,365 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../../../">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mcp_server_webcrawl.crawlers.interrobot.adapter &mdash; mcp-server-webcrawl  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            mcp-server-webcrawl
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../guides.html">Setup Guides</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../prompts.html">Prompt Routines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../interactive.html">Interactive Mode</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../modules.html">mcp_server_webcrawl</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">mcp-server-webcrawl</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">Module code</a></li>
+          <li class="breadcrumb-item"><a href="../../crawlers.html">mcp_server_webcrawl.crawlers</a></li>
+      <li class="breadcrumb-item active">mcp_server_webcrawl.crawlers.interrobot.adapter</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for mcp_server_webcrawl.crawlers.interrobot.adapter</h1><div class="highlight"><pre>
+<span></span><span class="kn">import</span> <span class="nn">re</span>
+<span class="kn">import</span> <span class="nn">sqlite3</span>
+<span class="kn">import</span> <span class="nn">traceback</span>
+
+<span class="kn">from</span> <span class="nn">contextlib</span> <span class="kn">import</span> <span class="n">closing</span>
+<span class="kn">from</span> <span class="nn">logging</span> <span class="kn">import</span> <span class="n">Logger</span>
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Final</span>
+<span class="kn">from</span> <span class="nn">urllib.parse</span> <span class="kn">import</span> <span class="n">urlparse</span>
+
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.crawlers.base.adapter</span> <span class="kn">import</span> <span class="n">IndexState</span><span class="p">,</span> <span class="n">IndexStatus</span><span class="p">,</span> <span class="n">BaseManager</span><span class="p">,</span> <span class="n">SitesGroup</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.resources</span> <span class="kn">import</span> <span class="n">ResourceResult</span><span class="p">,</span> <span class="n">RESOURCES_LIMIT_DEFAULT</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.sites</span> <span class="kn">import</span> <span class="n">SiteResult</span><span class="p">,</span> <span class="n">SiteType</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.utils</span> <span class="kn">import</span> <span class="n">from_isoformat_zulu</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.utils.logger</span> <span class="kn">import</span> <span class="n">get_logger</span>
+
+<span class="c1"># maybe dedupe with near match RESOURCES version</span>
+<span class="n">INTERROBOT_RESOURCE_FIELD_MAPPING</span><span class="p">:</span> <span class="n">Final</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;id&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Id&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;site&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Project&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;created&quot;</span><span class="p">:</span> <span class="s2">&quot;Resources.Created&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;modified&quot;</span><span class="p">:</span> <span class="s2">&quot;Resources.Modified&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Url&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Status&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;size&quot;</span><span class="p">:</span> <span class="s2">&quot;Resources.Size&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Type&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;headers&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Headers&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Content&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;time&quot;</span><span class="p">:</span> <span class="s2">&quot;ResourcesFullText.Time&quot;</span>
+<span class="p">}</span>
+
+<span class="n">INTERROBOT_SITE_FIELD_REQUIRED</span><span class="p">:</span> <span class="n">Final</span><span class="p">[</span><span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">([</span><span class="s2">&quot;id&quot;</span><span class="p">,</span> <span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;type&quot;</span><span class="p">,</span> <span class="s2">&quot;urls&quot;</span><span class="p">])</span>
+
+<span class="c1"># legit different from default version (extra robots)</span>
+<span class="n">INTERROBOT_SITE_FIELD_MAPPING</span><span class="p">:</span> <span class="n">Final</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;id&quot;</span><span class="p">:</span> <span class="s2">&quot;Project.Id&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;Project.Name&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Project.Type&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;urls&quot;</span><span class="p">:</span> <span class="s2">&quot;Project.Urls&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;created&quot;</span><span class="p">:</span> <span class="s2">&quot;Project.Created&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;modified&quot;</span><span class="p">:</span> <span class="s2">&quot;Project.Modified&quot;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="n">logger</span><span class="p">:</span> <span class="n">Logger</span> <span class="o">=</span> <span class="n">get_logger</span><span class="p">()</span>
+
+<div class="viewcode-block" id="InterroBotManager">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.adapter.InterroBotManager">[docs]</a>
+<span class="k">class</span> <span class="nc">InterroBotManager</span><span class="p">(</span><span class="n">BaseManager</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Manages HTTP text files in in-memory SQLite databases.</span>
+<span class="sd">    Provides connection pooling and caching for efficient access.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+<div class="viewcode-block" id="InterroBotManager.__init__">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.adapter.InterroBotManager.__init__">[docs]</a>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Initialize the HTTP text manager with empty cache and statistics.&quot;&quot;&quot;</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="InterroBotManager.get_connection">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.adapter.InterroBotManager.get_connection">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_connection</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">SitesGroup</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">sqlite3</span><span class="o">.</span><span class="n">Connection</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">IndexState</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Get database connection for sites in the group, creating if needed.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            group: Group of sites to connect to</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            Tuple of (SQLite connection to in-memory database with data loaded or None if building,</span>
+<span class="sd">                     IndexState associated with this database)</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+
+        <span class="n">index_state</span> <span class="o">=</span> <span class="n">IndexState</span><span class="p">()</span>
+        <span class="n">index_state</span><span class="o">.</span><span class="n">set_status</span><span class="p">(</span><span class="n">IndexStatus</span><span class="o">.</span><span class="n">REMOTE</span><span class="p">)</span>
+        <span class="n">connection</span><span class="p">:</span> <span class="n">sqlite3</span><span class="o">.</span><span class="n">Connection</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="c1"># note, responsible for implementing closing() on other side</span>
+            <span class="n">connection</span> <span class="o">=</span> <span class="n">sqlite3</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">datasrc</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">sqlite3</span><span class="o">.</span><span class="n">Error</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;SQLite error reading database: </span><span class="si">{</span><span class="n">ex</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">except</span> <span class="p">(</span><span class="ne">FileNotFoundError</span><span class="p">,</span> <span class="ne">PermissionError</span><span class="p">)</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Database access error: </span><span class="si">{</span><span class="n">group</span><span class="o">.</span><span class="n">datasrc</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">raise</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unexpected error reading database </span><span class="si">{</span><span class="n">group</span><span class="o">.</span><span class="n">datasrc</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">ex</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">raise</span>
+
+        <span class="k">return</span> <span class="n">connection</span><span class="p">,</span> <span class="n">index_state</span></div>
+</div>
+
+
+<span class="n">manager</span><span class="p">:</span> <span class="n">InterroBotManager</span> <span class="o">=</span> <span class="n">InterroBotManager</span><span class="p">()</span>
+
+<div class="viewcode-block" id="get_sites">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.adapter.get_sites">[docs]</a>
+<span class="k">def</span> <span class="nf">get_sites</span><span class="p">(</span><span class="n">datasrc</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">fields</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">SiteResult</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Get sites based on the provided parameters.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        datasrc: path to the database</span>
+<span class="sd">        ids: optional list of site IDs</span>
+<span class="sd">        fields: list of fields to include in response</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        List of SiteResult objects</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">site_fields_required</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;id&quot;</span><span class="p">,</span> <span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;type&quot;</span><span class="p">,</span> <span class="s2">&quot;urls&quot;</span><span class="p">]</span>
+    <span class="n">site_fields_default</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">site_fields_required</span> <span class="o">+</span> <span class="p">[</span><span class="s2">&quot;created&quot;</span><span class="p">,</span> <span class="s2">&quot;modified&quot;</span><span class="p">]</span>
+    <span class="n">site_fields_available</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">INTERROBOT_SITE_FIELD_MAPPING</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+
+    <span class="c1"># build query</span>
+    <span class="n">params</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+    <span class="c1"># these inputs are named parameters</span>
+    <span class="n">ids_clause</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">ids</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">placeholders</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="sa">f</span><span class="s2">&quot;:id</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">&quot;</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">))]</span>
+        <span class="n">ids_clause</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot; WHERE Project.Id IN (</span><span class="si">{</span><span class="s1">&#39;,&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">placeholders</span><span class="p">)</span><span class="si">}</span><span class="s2">)&quot;</span>
+        <span class="n">params</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="sa">f</span><span class="s2">&quot;id</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">:</span> <span class="n">id_val</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">id_val</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">ids</span><span class="p">)})</span>
+
+    <span class="c1"># these inputs are not parameterized</span>
+    <span class="c1"># fields will be returned from database, if found in INTERROBOT_SITE_FIELD_MAPPING</span>
+    <span class="n">selected_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">site_fields_required</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">fields</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">fields</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+        <span class="n">selected_fields</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span> <span class="k">if</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">site_fields_available</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">selected_fields</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">site_fields_default</span><span class="p">)</span>
+
+    <span class="n">safe_sql_fields</span> <span class="o">=</span> <span class="p">[</span><span class="n">INTERROBOT_SITE_FIELD_MAPPING</span><span class="p">[</span><span class="n">f</span><span class="p">]</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">selected_fields</span><span class="p">]</span>
+    <span class="k">assert</span> <span class="nb">all</span><span class="p">(</span><span class="n">re</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;^[A-Za-z\.]+$&quot;</span><span class="p">,</span> <span class="n">field</span><span class="p">)</span> <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">safe_sql_fields</span><span class="p">),</span> <span class="s2">&quot;Unknown or unsafe field requested&quot;</span>
+    <span class="n">safe_sql_fields_joined</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">safe_sql_fields</span><span class="p">)</span>
+
+    <span class="n">statement</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;SELECT </span><span class="si">{</span><span class="n">safe_sql_fields_joined</span><span class="si">}</span><span class="s2"> FROM Projects AS Project</span><span class="si">{</span><span class="n">ids_clause</span><span class="si">}</span><span class="s2"> ORDER BY Project.Name ASC&quot;</span>
+    <span class="n">sql_results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">statement</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;SELECT&quot;</span><span class="p">):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="s2">&quot;Unauthorized SQL statement&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Only SELECT queries are permitted&quot;</span><span class="p">)</span>
+
+        <span class="k">with</span> <span class="n">closing</span><span class="p">(</span><span class="n">sqlite3</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="n">datasrc</span><span class="p">))</span> <span class="k">as</span> <span class="n">conn</span><span class="p">:</span>
+            <span class="n">conn</span><span class="o">.</span><span class="n">row_factory</span> <span class="o">=</span> <span class="n">sqlite3</span><span class="o">.</span><span class="n">Row</span>
+            <span class="k">with</span> <span class="n">closing</span><span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">cursor</span><span class="p">())</span> <span class="k">as</span> <span class="n">cursor</span><span class="p">:</span>
+                <span class="n">cursor</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="n">statement</span><span class="p">,</span> <span class="n">params</span> <span class="ow">or</span> <span class="p">{})</span>
+                <span class="n">sql_results</span> <span class="o">=</span> <span class="p">[{</span><span class="n">k</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="nb">dict</span><span class="p">(</span><span class="n">row</span><span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span> <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">cursor</span><span class="o">.</span><span class="n">fetchall</span><span class="p">()]</span>
+    <span class="k">except</span> <span class="n">sqlite3</span><span class="o">.</span><span class="n">Error</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;SQLite error reading database: </span><span class="si">{</span><span class="n">ex</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">[]</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">ex</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Database error: </span><span class="si">{</span><span class="n">ex</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">[]</span>
+
+    <span class="n">results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SiteResult</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="c1">#for row in sql_results:</span>
+    <span class="c1">#    results.append(SiteResult(</span>
+    <span class="c1">#        path=datasrc,</span>
+    <span class="c1">#        id=row.get(&quot;id&quot;),</span>
+    <span class="c1">#        url=row.get(&quot;url&quot;, &quot;&quot;),</span>
+    <span class="c1">#        created=from_isoformat_zulu(row.get(&quot;created&quot;)),</span>
+    <span class="c1">#        modified=from_isoformat_zulu(row.get(&quot;modified&quot;)),</span>
+    <span class="c1">#        robots=row.get(&quot;robotstext&quot;),</span>
+    <span class="c1">#        metadata=None,</span>
+    <span class="c1">#    ))</span>
+
+    <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">sql_results</span><span class="p">:</span>
+        <span class="n">urls_list</span> <span class="o">=</span> <span class="n">__urls_from_text</span><span class="p">(</span><span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;urls&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">))</span>
+        <span class="n">site_type</span><span class="p">:</span> <span class="n">SiteType</span>
+        <span class="n">db_type</span> <span class="o">=</span> <span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;type&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">db_type</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">site_type</span> <span class="o">=</span> <span class="n">SiteType</span><span class="o">.</span><span class="n">CRAWLED_URL</span>
+        <span class="k">elif</span> <span class="n">db_type</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="n">site_type</span> <span class="o">=</span> <span class="n">SiteType</span><span class="o">.</span><span class="n">CRAWLED_LIST</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">site_type</span> <span class="o">=</span> <span class="n">SiteType</span><span class="o">.</span><span class="n">UNDEFINED</span>
+
+        <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">SiteResult</span><span class="p">(</span>
+            <span class="n">path</span><span class="o">=</span><span class="n">datasrc</span><span class="p">,</span>
+            <span class="nb">id</span><span class="o">=</span><span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;id&quot;</span><span class="p">),</span>
+            <span class="n">name</span><span class="o">=</span><span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;name&quot;</span><span class="p">),</span>  <span class="c1"># NEW: directly from DB</span>
+            <span class="nb">type</span><span class="o">=</span><span class="n">site_type</span><span class="p">,</span>  <span class="c1"># NEW: from DB (needs mapping)</span>
+            <span class="n">urls</span><span class="o">=</span><span class="n">urls_list</span><span class="p">,</span>  <span class="c1"># CHANGED: split into list</span>
+            <span class="n">created</span><span class="o">=</span><span class="n">from_isoformat_zulu</span><span class="p">(</span><span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;created&quot;</span><span class="p">)),</span>
+            <span class="n">modified</span><span class="o">=</span><span class="n">from_isoformat_zulu</span><span class="p">(</span><span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;modified&quot;</span><span class="p">)),</span>
+            <span class="n">robots</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>  <span class="c1"># Removed - not in new model</span>
+            <span class="n">metadata</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="p">))</span>
+
+    <span class="k">return</span> <span class="n">results</span></div>
+
+
+<span class="k">def</span> <span class="nf">__urls_from_text</span><span class="p">(</span><span class="n">urls</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="n">urls_list</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">if</span> <span class="n">urls</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">url</span> <span class="ow">in</span> <span class="n">urls</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s1">&#39;</span><span class="se">\n</span><span class="s1">&#39;</span><span class="p">):</span>
+            <span class="n">url</span> <span class="o">=</span> <span class="n">url</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">url</span><span class="p">:</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">parsed</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span><span class="p">:</span>
+                        <span class="n">urls_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+                <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                    <span class="k">continue</span>
+    <span class="k">return</span> <span class="n">urls_list</span>
+
+<div class="viewcode-block" id="get_resources">
+<a class="viewcode-back" href="../../../../mcp_server_webcrawl.crawlers.interrobot.html#mcp_server_webcrawl.crawlers.interrobot.adapter.get_resources">[docs]</a>
+<span class="k">def</span> <span class="nf">get_resources</span><span class="p">(</span>
+    <span class="n">datasrc</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span>
+    <span class="n">sites</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">query</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+    <span class="n">fields</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">sort</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">limit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">RESOURCES_LIMIT_DEFAULT</span><span class="p">,</span>
+    <span class="n">offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="n">ResourceResult</span><span class="p">],</span> <span class="nb">int</span><span class="p">,</span> <span class="n">IndexState</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Get resources from wget directories using in-memory SQLite.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        datasrc: path to the directory containing wget captures</span>
+<span class="sd">        sites: optional list of site IDs to filter by</span>
+<span class="sd">        query: search query string</span>
+<span class="sd">        fields: optional list of fields to include in response</span>
+<span class="sd">        sort: sort order for results</span>
+<span class="sd">        limit: maximum number of results to return</span>
+<span class="sd">        offset: number of results to skip for pagination</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        Tuple of (list of ResourceResult objects, total count)</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">sites_results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SiteResult</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_sites</span><span class="p">(</span><span class="n">datasrc</span><span class="o">=</span><span class="n">datasrc</span><span class="p">,</span> <span class="n">ids</span><span class="o">=</span><span class="n">sites</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">sites_results</span><span class="p">,</span> <span class="s2">&quot;At least one site is required to search&quot;</span>
+    <span class="n">site_paths</span> <span class="o">=</span> <span class="p">[</span><span class="n">site</span><span class="o">.</span><span class="n">path</span> <span class="k">for</span> <span class="n">site</span> <span class="ow">in</span> <span class="n">sites_results</span><span class="p">]</span>
+    <span class="n">sites_group</span> <span class="o">=</span> <span class="n">SitesGroup</span><span class="p">(</span><span class="n">datasrc</span><span class="p">,</span> <span class="n">sites</span><span class="p">,</span> <span class="n">site_paths</span><span class="p">)</span>
+
+    <span class="c1"># InterroBot uses ints in place of strings</span>
+    <span class="n">swap_values</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;type&quot;</span> <span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>             <span class="c1"># UNDEFINED</span>
+            <span class="s2">&quot;html&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>         <span class="c1"># PAGE</span>
+            <span class="s2">&quot;other&quot;</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span>        <span class="c1"># OTHER (could also be 5 or 12 depending on context)</span>
+            <span class="s2">&quot;rss&quot;</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span>          <span class="c1"># FEED</span>
+            <span class="s2">&quot;iframe&quot;</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span>       <span class="c1"># FRAME</span>
+            <span class="s2">&quot;img&quot;</span><span class="p">:</span> <span class="mi">6</span><span class="p">,</span>          <span class="c1"># IMAGE</span>
+            <span class="s2">&quot;audio&quot;</span><span class="p">:</span> <span class="mi">7</span><span class="p">,</span>        <span class="c1"># AUDIO</span>
+            <span class="s2">&quot;video&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>        <span class="c1"># VIDEO</span>
+            <span class="s2">&quot;font&quot;</span><span class="p">:</span> <span class="mi">9</span><span class="p">,</span>         <span class="c1"># FONT</span>
+            <span class="s2">&quot;style&quot;</span><span class="p">:</span> <span class="mi">10</span><span class="p">,</span>       <span class="c1"># CSS</span>
+            <span class="s2">&quot;script&quot;</span><span class="p">:</span> <span class="mi">11</span><span class="p">,</span>      <span class="c1"># SCRIPT</span>
+            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="mi">13</span><span class="p">,</span>        <span class="c1"># TEXT</span>
+            <span class="s2">&quot;pdf&quot;</span><span class="p">:</span> <span class="mi">14</span><span class="p">,</span>         <span class="c1"># PDF</span>
+            <span class="s2">&quot;doc&quot;</span><span class="p">:</span> <span class="mi">15</span>          <span class="c1"># DOC</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">manager</span><span class="o">.</span><span class="n">get_resources_for_sites_group</span><span class="p">(</span><span class="n">sites_group</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">fields</span><span class="p">,</span> <span class="n">sort</span><span class="p">,</span> <span class="n">limit</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">swap_values</span><span class="p">)</span></div>
+
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, pragmar.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

@@ -1,0 +1,74 @@
+package mcp.server.zap.core.service;
+
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import mcp.server.zap.core.gateway.ZapEnginePassiveScanAccess;
+import org.junit.jupiter.api.Tag;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.Network;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.zaproxy.clientapi.core.ClientApi;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+@Tag("docker")
+@Testcontainers
+public class PassiveScanServiceDockerTest {
+    private static final Network NETWORK = Network.newNetwork();
+
+    @Container
+    static final GenericContainer<?> TARGET =
+            new GenericContainer<>(DockerImageName.parse("nginx:1.27-alpine"))
+                    .withNetwork(NETWORK)
+                    .withNetworkAliases("passive-target")
+                    .withExposedPorts(80)
+                    .waitingFor(Wait.forHttp("/"));
+
+    @Container
+    static final GenericContainer<?> ZAP =
+            new GenericContainer<>(ZapDockerTestSupport.zapImage())
+                    .withNetwork(NETWORK)
+                    .dependsOn(TARGET)
+                    .withExposedPorts(8090)
+                    .withCommand(
+                            "zap.sh",
+                            "-daemon",
+                            "-host",
+                            "0.0.0.0",
+                            "-port",
+                            "8090",
+                            "-config",
+                            "api.disablekey=true",
+                            "-config",
+                            "api.addrs.addr.name=.*",
+                            "-config",
+                            "api.addrs.addr.regex=true"
+                    )
+                    .waitingFor(ZapDockerTestSupport.waitForZapPort());
+
+    private static ClientApi clientApi;
+    private static PassiveScanService service;
+
+    @BeforeAll
+    static void setupClient() throws Exception {
+        clientApi = ZapDockerTestSupport.clientApi(ZAP.getHost(), ZAP.getMappedPort(8090));
+        ZapDockerTestSupport.awaitZapApiReady(clientApi);
+        service = new PassiveScanService(new ZapEnginePassiveScanAccess(clientApi));
+    }
+
+    @Test
+    void passiveScanStatusAndWaitWorkAgainstRealZap() throws Exception {
+        clientApi.core.accessUrl("http://passive-target/", "true");
+
+        String status = service.getPassiveScanStatus();
+        String waitResult = service.waitForPassiveScanCompletion(30, 250);
+        String finalStatus = service.getPassiveScanStatus();
+
+        assertTrue(status.contains("Records remaining:"));
+        assertTrue(waitResult.contains("Passive scan backlog drained."));
+        assertTrue(finalStatus.contains("Completed: yes"));
+    }
+}

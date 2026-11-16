@@ -1,0 +1,1544 @@
+import importlib.util
+import io
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+MODULE_PATH = Path(__file__).resolve().parents[2] / ".github" / "actions" / "zap-security-gate" / "mcp_zap_gate.py"
+SPEC = importlib.util.spec_from_file_location("mcp_zap_gate", MODULE_PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+class McpZapGateHelpersTest(unittest.TestCase):
+    def test_extract_tool_text_from_mcp_content(self):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [
+                    {"type": "text", "text": "Direct spider scan started.\nScan ID: spider-1"},
+                    {"type": "text", "text": "Use zap_spider_status next."},
+                ]
+            },
+        }
+
+        text = MODULE.extract_tool_text(payload)
+
+        self.assertIn("Scan ID: spider-1", text)
+        self.assertIn("Use zap_spider_status next.", text)
+
+    def test_extract_tool_text_decodes_json_encoded_text_payloads(self):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "\"Guided crawl started.\\nOperation ID: zop_123\\nExecution Mode: direct\"",
+                    }
+                ]
+            },
+        }
+
+        text = MODULE.extract_tool_text(payload)
+
+        self.assertIn("Guided crawl started.", text)
+        self.assertIn("Operation ID: zop_123", text)
+        self.assertIn("Execution Mode: direct", text)
+
+    def test_parse_completed_prefers_completed_label(self):
+        text = "Direct active scan status:\nScan ID: active-1\nProgress: 45%\nCompleted: yes\n"
+
+        self.assertTrue(MODULE.parse_completed(text))
+
+    def test_unwrap_mcp_body_extracts_sse_data_payload(self):
+        body = 'event:message\ndata:{"jsonrpc":"2.0","result":{"ok":true}}\n'
+
+        self.assertEqual(body := MODULE.unwrap_mcp_body(body), '{"jsonrpc":"2.0","result":{"ok":true}}')
+
+    def test_mcp_client_timeout_outlives_passive_wait_timeout(self):
+        self.assertEqual(MODULE.mcp_client_timeout_seconds(20), 60)
+        self.assertEqual(MODULE.mcp_client_timeout_seconds(180), 210)
+
+    def test_mcp_client_reports_socket_timeout_with_configured_timeout(self):
+        client = MODULE.McpHttpClient("http://example.com/mcp", "test-key", timeout_seconds=7)
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=TimeoutError):
+            with self.assertRaisesRegex(RuntimeError, "after 7 seconds"):
+                client._post_json({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+
+    def test_mcp_client_reports_wrapped_socket_timeout_with_configured_timeout(self):
+        client = MODULE.McpHttpClient("http://example.com/mcp", "test-key", timeout_seconds=11)
+        wrapped_timeout = MODULE.urllib.error.URLError(TimeoutError("timed out"))
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=wrapped_timeout):
+            with self.assertRaisesRegex(RuntimeError, "after 11 seconds"):
+                client._post_json({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+
+    def test_parse_operation_id_reads_guided_operation_id(self):
+        text = "Guided crawl started.\nOperation ID: zop_123\nExecution Mode: direct\n"
+
+        self.assertEqual(MODULE.parse_operation_id(text), "zop_123")
+
+    def test_parse_report_path_reads_guided_report_output(self):
+        text = "Guided report generated.\nFormat: html\nPath: /tmp/report.html\n"
+
+        self.assertEqual(MODULE.parse_report_path(text), "/tmp/report.html")
+
+    def test_map_report_path_translates_container_root(self):
+        mapped = MODULE.map_report_path(
+            "/zap/wrk/reports/zap-report-123.html",
+            "/zap/wrk/reports",
+            "/tmp/zap-work/reports",
+        )
+
+        self.assertEqual(mapped, Path("/tmp/zap-work/reports/zap-report-123.html").resolve())
+
+    def test_map_report_path_translates_workspace_scoped_report(self):
+        mapped = MODULE.map_report_path(
+            "/zap/wrk/workspaces/default-client/zap-report-123.html",
+            "/zap/wrk",
+            "/tmp/zap-work",
+        )
+
+        self.assertEqual(mapped, Path("/tmp/zap-work/workspaces/default-client/zap-report-123.html").resolve())
+
+    def test_map_report_path_rejects_parent_traversal(self):
+        mapped = MODULE.map_report_path(
+            "/zap/wrk/../../tmp/secret.txt",
+            "/zap/wrk",
+            "/tmp/zap-work",
+        )
+
+        self.assertIsNone(mapped)
+
+    def test_map_report_path_rejects_existing_host_path_when_roots_are_configured(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outside = Path(tmpdir) / "secret.txt"
+            outside.write_text("secret\n", encoding="utf-8")
+
+            mapped = MODULE.map_report_path(
+                str(outside),
+                "/zap/wrk",
+                str(Path(tmpdir) / "zap-work"),
+            )
+
+            self.assertIsNone(mapped)
+
+    def test_map_report_path_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            local_root = tmp_path / "zap-work"
+            outside = tmp_path / "outside"
+            local_root.mkdir()
+            outside.mkdir()
+            (outside / "secret.txt").write_text("secret\n", encoding="utf-8")
+            (local_root / "escape").symlink_to(outside)
+
+            mapped = MODULE.map_report_path(
+                "/zap/wrk/escape/secret.txt",
+                "/zap/wrk",
+                str(local_root),
+            )
+
+            self.assertIsNone(mapped)
+
+    def test_canonicalize_snapshot_normalizes_legacy_payload_and_dedupes(self):
+        payload = {
+            "version": 1,
+            "baseUrl": "https://Example.com",
+            "exportedAt": "2026-03-22T00:00:00Z",
+            "fingerprints": [
+                {
+                    "pluginId": "40018",
+                    "alertName": "SQL Injection",
+                    "risk": "high",
+                    "confidence": "Medium",
+                    "url": "HTTPS://EXAMPLE.com",
+                    "param": "id",
+                    "fingerprint": "legacy-a",
+                },
+                {
+                    "pluginId": "40018",
+                    "alertName": "SQL Injection",
+                    "risk": "High",
+                    "confidence": "Medium",
+                    "url": "https://example.com/",
+                    "param": "id",
+                    "fingerprint": "legacy-b",
+                },
+            ],
+        }
+
+        snapshot, source_contract = MODULE.canonicalize_snapshot(payload)
+
+        self.assertEqual(source_contract, MODULE.LEGACY_FINDINGS_SNAPSHOT_CONTRACT_VERSION)
+        self.assertEqual(snapshot["contract_version"], MODULE.CI_GATE_FINDINGS_SNAPSHOT_CONTRACT_VERSION)
+        self.assertEqual(snapshot["identity_version"], 1)
+        self.assertFalse(snapshot["scanner"]["inventoryComplete"])
+        self.assertEqual(snapshot["target_url"], "https://example.com/")
+        self.assertEqual(snapshot["finding_count"], 1)
+        self.assertEqual(snapshot["findings"][0]["risk"], "High")
+        self.assertTrue(snapshot["findings"][0]["fingerprint"].startswith("sha256:"))
+
+    def test_canonicalize_snapshot_normalizes_confidence_and_query_order(self):
+        payload = {
+            "version": 1,
+            "baseUrl": "https://Example.com/search?b=2&a=1",
+            "fingerprints": [
+                {
+                    "pluginId": "40012",
+                    "alertName": "Cross Site Scripting",
+                    "risk": "medium",
+                    "confidence": "high",
+                    "url": "https://example.com/search?b=2&a=1",
+                    "param": "q",
+                },
+                {
+                    "pluginId": "40012",
+                    "alertName": "Cross Site Scripting",
+                    "risk": "Medium",
+                    "confidence": "High",
+                    "url": "HTTPS://EXAMPLE.com/search?a=1&b=2",
+                    "param": "q",
+                },
+            ],
+        }
+
+        snapshot, _source_contract = MODULE.canonicalize_snapshot(payload)
+
+        self.assertEqual(snapshot["target_url"], "https://example.com/search?a=1&b=2")
+        self.assertEqual(snapshot["finding_count"], 1)
+        self.assertEqual(snapshot["findings"][0]["confidence"], "High")
+        self.assertEqual(snapshot["findings"][0]["url"], "https://example.com/search?a=1&b=2")
+
+    @staticmethod
+    def node_finding(url="https://example.com/search?q=one", **overrides):
+        return {
+            "pluginId": "40012", "alertName": "Cross Site Scripting", "risk": "High",
+            "confidence": "Medium", "url": url, "param": "q", "method": "GET",
+            "nodeName": "https://example.com/search(q)", "tags": {}, **overrides,
+        }
+
+    @staticmethod
+    def scanner_inventory(**overrides):
+        return {
+            "version": 1, "zapVersion": "2.17.0", "inventoryComplete": True,
+            "addOns": [{"id": "pscanrules", "version": "65.0.0", "status": "release"}],
+            **overrides,
+        }
+
+    @classmethod
+    def node_snapshot(cls, findings, version=3, **overrides):
+        return MODULE.canonicalize_snapshot({
+            "version": version, "baseUrl": "https://example.com/", "fingerprints": findings,
+            **({"scanner": cls.scanner_inventory()} if version == 3 else {}),
+            **overrides,
+        })[0]
+
+    @staticmethod
+    def compare_snapshots(baseline, current):
+        return MODULE.build_diff_contract("https://example.com/", baseline, current, {
+            "requested": False, "used": False, "reason": None, "matched_rule_ids": [],
+            "suppressed_baseline_findings": 0, "suppressed_current_findings": 0,
+        })
+
+    def test_scanner_update_does_not_label_removed_csp_alert_as_resolved(self):
+        csp = self.node_finding(pluginId="10038", alertName="Content Security Policy Header Not Set")
+        baseline = self.node_snapshot([csp])
+        current = self.node_snapshot([], scanner=self.scanner_inventory(addOns=[
+            {"id": "pscanrules", "version": "66.0.0", "status": "release"},
+        ]))
+
+        diff = self.compare_snapshots(baseline, current)
+
+        self.assertEqual(diff["scanner_comparison"], {"status": "different", "reason": "scanner_inventory_changed"})
+        self.assertEqual(diff["counts"], {"new": None, "resolved": None, "unchanged": None})
+        self.assertEqual(diff["observed_changes"], {"added": 0, "removed": 1, "retained": 0})
+        self.assertEqual(diff["resolved_finding_groups"], [])
+        self.assertEqual(diff["observed_removed_finding_groups"][0]["plugin_id"], "10038")
+        rendered = MODULE.render_diff_text(diff)
+        self.assertIn("Do not interpret these changes as remediation or regressions", rendered)
+        self.assertIn("Observed Removed: 1", rendered)
+        self.assertNotIn("Resolved Findings:", rendered)
+
+    def test_matching_scanner_preserves_removed_finding_counts(self):
+        diff = self.compare_snapshots(self.node_snapshot([self.node_finding()]), self.node_snapshot([]))
+
+        self.assertEqual(diff["scanner_comparison"], {"status": "matching", "reason": None})
+        self.assertEqual(diff["counts"], {"new": 0, "resolved": 1, "unchanged": 0})
+        self.assertEqual(diff["observed_changes"], {"added": 0, "removed": 1, "retained": 0})
+        self.assertEqual(diff["resolved_finding_groups"][0]["count"], 1)
+        self.assertIn("not proof of remediation", MODULE.render_diff_text(diff))
+
+    def test_scanner_comparison_uses_engine_and_inventory_but_not_build_context(self):
+        baseline = self.node_snapshot([])
+        for changes in (
+            {"zapVersion": "2.18.0"},
+            {"addOns": []},
+            {"addOns": [{"id": "pscanrules", "version": "65.0.0", "status": "beta"}]},
+        ):
+            with self.subTest(changes=changes):
+                current = self.node_snapshot([], scanner=self.scanner_inventory(**changes))
+                self.assertEqual(self.compare_snapshots(baseline, current)["scanner_comparison"]["status"], "different")
+        current = self.node_snapshot([], scanner=self.scanner_inventory(
+            serverVersion="0.16.0", serverRevision="abcdef0123",
+            serverImageDigest="sha256:" + "a" * 64, zapImageDigest="sha256:" + "b" * 64,
+        ))
+        self.assertEqual(self.compare_snapshots(baseline, current)["scanner_comparison"]["status"], "matching")
+        self.assertEqual(current["scanner"]["serverRevision"], "abcdef0123")
+
+    def test_scanner_inventory_order_is_deterministic(self):
+        add_ons = [
+            {"id": "pscanrules", "version": "65.0.0", "status": "release"},
+            {"id": "ascanrules", "version": "71.0.0", "status": "weekly"},
+        ]
+        baseline = self.node_snapshot([], scanner=self.scanner_inventory(addOns=add_ons))
+        current = self.node_snapshot([], scanner=self.scanner_inventory(addOns=list(reversed(add_ons))))
+
+        self.assertEqual(baseline, current)
+        self.assertEqual(self.compare_snapshots(baseline, current)["scanner_comparison"]["status"], "matching")
+
+    def test_missing_legacy_and_malformed_scanner_inventories_are_unknown(self):
+        cases = [
+            None, "private raw error", {},
+            self.scanner_inventory(version=2),
+            self.scanner_inventory(version=True),
+            self.scanner_inventory(inventoryComplete=False),
+            self.scanner_inventory(inventoryComplete="true"),
+            self.scanner_inventory(zapVersion=""),
+            self.scanner_inventory(zapVersion="2.17.0\ninternal"),
+            self.scanner_inventory(addOns=None),
+            self.scanner_inventory(addOns=["raw error"]),
+            self.scanner_inventory(addOns=[{"id": "pscanrules", "version": "65.0.0", "status": "untrusted"}]),
+            self.scanner_inventory(addOns=[{"id": "../../private", "version": "65.0.0", "status": "release"}]),
+            self.scanner_inventory(addOns=[{"id": "pscanrules", "version": "", "status": "release"}]),
+            self.scanner_inventory(addOns=[{"id": "pscanrules", "version": "65.0.0", "status": "release"}] * 2),
+            self.scanner_inventory(addOns=[{"id": "pscanrules", "version": "65.0.0", "status": "release"}] * 1025),
+        ]
+        baseline = self.node_snapshot([self.node_finding()])
+        for scanner in cases:
+            with self.subTest(scanner=scanner):
+                current = self.node_snapshot([], scanner=scanner)
+                restored = MODULE.canonicalize_snapshot(json.loads(json.dumps(current)))[0]
+                diff = self.compare_snapshots(baseline, restored)
+                self.assertFalse(restored["scanner"]["inventoryComplete"])
+                self.assertEqual(diff["scanner_comparison"], {"status": "unknown", "reason": "scanner_provenance_unknown"})
+                self.assertIsNone(diff["counts"]["resolved"])
+                self.assertEqual(diff["observed_changes"]["removed"], 1)
+        for version in (1, 2):
+            current = self.node_snapshot([], version=version)
+            self.assertEqual(self.compare_snapshots(baseline, current)["scanner_comparison"]["status"], "unknown")
+
+    def test_scanner_normalization_drops_unrecognized_metadata_and_sensitive_values(self):
+        scanner = self.scanner_inventory(
+            debug={"apiKey": "private-secret", "home": "/Users/maintainer"},
+            serverVersion="0.16.0\nprivate-secret", serverRevision="private-secret",
+            serverImageDigest="registry.example/private:image", zapImageDigest="sha256:" + "f" * 64,
+            addOns=[{"id": "pscanrules", "version": "65.0.0", "status": "release", "path": "/Users/maintainer"}],
+        )
+        normalized = MODULE.normalize_scanner(scanner)
+
+        self.assertEqual(set(normalized), {
+            "version", "serverVersion", "serverRevision", "serverImageDigest", "zapImageDigest",
+            "zapVersion", "addOns", "inventoryComplete",
+        })
+        self.assertNotIn("private", json.dumps(normalized))
+        self.assertNotIn("/Users/", json.dumps(normalized))
+        self.assertTrue(normalized["inventoryComplete"])
+        self.assertIsNone(normalized["serverVersion"])
+        self.assertEqual(normalized["zapImageDigest"], "sha256:" + "f" * 64)
+
+    def test_legacy_contract_cannot_gain_measured_provenance_from_extra_fields(self):
+        baseline = self.node_snapshot([])
+        for version in (1, 2):
+            payloads = [
+                {"version": version, "fingerprints": [], "scanner": self.scanner_inventory()},
+                {"contract_version": f"ci_gate_findings_snapshot/v{version}", "findings": [],
+                 "scanner": self.scanner_inventory()},
+                {"contract_version": f"ci_gate_findings_snapshot/v{version}", "version": 3,
+                 "findings": [], "scanner": self.scanner_inventory()},
+            ]
+            for payload in payloads:
+                with self.subTest(version=version, payload=payload):
+                    current, _source = MODULE.canonicalize_snapshot(payload)
+                    self.assertFalse(current["scanner"]["inventoryComplete"])
+                    self.assertEqual(self.compare_snapshots(baseline, current)["scanner_comparison"]["status"], "unknown")
+
+    def test_v2_saved_snapshot_keeps_node_identity_after_contract_upgrade(self):
+        raw = self.node_snapshot([self.node_finding()])
+        raw["contract_version"] = MODULE.PREVIOUS_CI_GATE_FINDINGS_SNAPSHOT_CONTRACT_VERSION
+        raw.pop("identity_version")
+        raw.pop("scanner")
+        restored, source = MODULE.canonicalize_snapshot(raw)
+        current = self.node_snapshot([self.node_finding("https://example.com/search?q=two")])
+        diff = self.compare_snapshots(restored, current)
+
+        self.assertEqual(source, "ci_gate_findings_snapshot/v2")
+        self.assertEqual(restored["identity_version"], 2)
+        self.assertEqual(diff["identity_version"], 2)
+        self.assertEqual(diff["observed_changes"], {"added": 0, "removed": 0, "retained": 1})
+        self.assertEqual(diff["scanner_comparison"]["status"], "unknown")
+
+    def test_v2_same_node_survives_representative_url_and_tag_changes(self):
+        baseline = self.node_snapshot([self.node_finding()])
+        current = self.node_snapshot([self.node_finding(
+            "https://example.com/search?q=two", tags={"SYSTEMIC": "https://example.com/tag"},
+        )])
+
+        diff = self.compare_snapshots(baseline, current)
+
+        self.assertEqual(diff["counts"], {"new": 0, "resolved": 0, "unchanged": 1})
+        self.assertEqual(diff["identity_version"], 2)
+        self.assertIn("ZAP node identity", MODULE.render_diff_text(diff))
+
+    def test_v2_preserves_different_nodes_sites_methods_and_node_case(self):
+        findings = [
+            self.node_finding(),
+            self.node_finding(nodeName="https://example.com/other(q)"),
+            self.node_finding(nodeName="https://example.com/Search(q)"),
+            self.node_finding(method="POST"),
+            self.node_finding("https://other.example/search?q=one", nodeName="https://other.example/search(q)"),
+        ]
+        snapshot = self.node_snapshot(findings)
+
+        self.assertEqual(snapshot["finding_count"], 5)
+        self.assertEqual(self.compare_snapshots(self.node_snapshot([]), snapshot)["counts"]["new"], 5)
+
+    def test_v2_missing_node_uses_normalized_url_and_method(self):
+        baseline = self.node_snapshot([self.node_finding(nodeName=None)])
+        same_url = self.node_snapshot([self.node_finding(nodeName="  ")])
+        changed_url = self.node_snapshot([self.node_finding("https://example.com/search?q=two", nodeName=None)])
+        changed_method = self.node_snapshot([self.node_finding(nodeName=None, method="POST")])
+
+        self.assertEqual(self.compare_snapshots(baseline, same_url)["counts"]["unchanged"], 1)
+        for current in (changed_url, changed_method):
+            self.assertEqual(self.compare_snapshots(baseline, current)["counts"], {"new": 1, "resolved": 1, "unchanged": 0})
+
+    def test_v1_raw_and_saved_canonical_baselines_keep_url_identity_for_both_sides(self):
+        rows = [self.node_finding(), self.node_finding("https://example.com/search?q=two")]
+        legacy = self.node_snapshot(rows, version=1)
+        saved_legacy = MODULE.canonicalize_snapshot(json.loads(json.dumps(legacy)))[0]
+        current = self.node_snapshot([{**row, "method": "POST"} for row in rows])
+
+        self.assertEqual(current["finding_count"], 1)
+        self.assertEqual(current["recorded_example_count"], 2)
+        for baseline in (legacy, saved_legacy):
+            diff = self.compare_snapshots(baseline, current)
+            self.assertEqual(diff["identity_version"], 1)
+            self.assertEqual(diff["counts"], {"new": None, "resolved": None, "unchanged": None})
+            self.assertEqual(diff["observed_changes"], {"added": 0, "removed": 0, "retained": 2})
+            self.assertEqual(diff["scanner_comparison"]["status"], "unknown")
+            self.assertEqual(diff["current"]["finding_count"], 2)
+            self.assertIn("legacy URL identity", MODULE.render_diff_text(diff))
+
+    def test_v1_comparison_does_not_use_new_node_identity(self):
+        baseline = self.node_snapshot([self.node_finding()], version=1)
+        current = self.node_snapshot([self.node_finding("https://example.com/search?q=two")])
+
+        self.assertEqual(self.compare_snapshots(baseline, current)["observed_changes"], {"added": 1, "removed": 1, "retained": 0})
+        self.assertEqual(self.compare_snapshots(current, baseline)["observed_changes"], {"added": 1, "removed": 1, "retained": 0})
+
+    def test_v2_keeps_old_suppression_hashes_and_exact_url_matching(self):
+        rows = [self.node_finding(), self.node_finding("https://example.com/search?q=two")]
+        # Fingerprint exported by the gate before node-aware comparisons existed.
+        legacy_hash = "sha256:878375727eb6267528810b63b99da6e415416971f08f691236fdbf3316ed1477"
+        self.assertEqual(self.node_snapshot(rows[:1], version=1)["findings"][0]["fingerprint"], legacy_hash)
+        current = self.node_snapshot(rows)
+
+        for match in ({"fingerprint": legacy_hash}, {"url": rows[0]["url"]}):
+            filtered, count, rule_ids = MODULE.apply_suppressions(current["findings"], {"rules": [
+                {"id": "known-example", "active": True, "match": match},
+            ]})
+            self.assertEqual(count, 1)
+            self.assertEqual(rule_ids, ["known-example"])
+            self.assertEqual([row["url"] for row in filtered], [rows[1]["url"]])
+            diff = self.compare_snapshots(self.node_snapshot([]), {**current, "findings": filtered})
+            diff["suppressions"]["suppressed_current_findings"] = count
+            self.assertEqual(diff["counts"]["new"], 1)
+            self.assertEqual(diff["current"]["finding_count"], 1)
+            self.assertEqual(diff["current"]["recorded_example_count"], 1)
+            self.assertIn("Suppressed Current Recorded Examples: 1", MODULE.render_diff_text(diff))
+
+    def test_v2_roundtrip_preserves_systemic_metadata_and_recorded_counts(self):
+        tags = {"SYSTEMIC": "https://www.zaproxy.org/alerttags/systemic/", "POLICY_DEV_STD": "https://example.com/policy"}
+        snapshot = self.node_snapshot([
+            self.node_finding(tags=tags), self.node_finding("https://example.com/search?q=two", tags=tags),
+        ])
+        restored, source = MODULE.canonicalize_snapshot(json.loads(json.dumps(snapshot)))
+
+        self.assertEqual(restored, snapshot)
+        self.assertEqual(source, MODULE.CI_GATE_FINDINGS_SNAPSHOT_CONTRACT_VERSION)
+        self.assertEqual(snapshot["finding_count"], 1)
+        self.assertEqual(snapshot["recorded_example_count"], 2)
+        self.assertTrue(all(row["tags"] == tags for row in restored["findings"]))
+        summary = MODULE.render_findings_summary(snapshot)
+        self.assertIn("Unique Recorded Findings: 1", summary)
+        self.assertIn("Recorded Examples: 2", summary)
+        self.assertIn("SYSTEMIC: may affect the whole site", summary)
+        self.assertIn("not the total number of affected endpoints", summary)
+        diff = self.compare_snapshots(self.node_snapshot([]), snapshot)
+        self.assertTrue(diff["new_finding_groups"][0]["systemic"])
+        self.assertIn("SYSTEMIC: may affect the whole site", MODULE.render_diff_text(diff))
+        # Do not lose the systemic marker when a second recorded example lacks tags.
+        mixed_tags = self.node_snapshot([
+            self.node_finding(tags=tags), self.node_finding("https://example.com/search?q=two"),
+        ])
+        self.assertTrue(self.compare_snapshots(self.node_snapshot([]), mixed_tags)["new_finding_groups"][0]["systemic"])
+        lowercase_tag = self.node_snapshot([self.node_finding(tags={"systemic": tags["SYSTEMIC"]})])
+        self.assertNotIn("| SYSTEMIC:", MODULE.render_findings_summary(lowercase_tag))
+
+    def test_main_compares_v2_examples_with_saved_v1_baseline_and_suppressions(self):
+        rows = [self.node_finding(), self.node_finding("https://example.com/search?q=two")]
+        responses = {
+            "zap_crawl_start": "Operation ID: spider-1",
+            "zap_crawl_status": "Completed: yes",
+            "zap_attack_start": "Operation ID: active-1",
+            "zap_attack_status": "Completed: yes",
+            "zap_passive_scan_wait": "Completed: yes",
+            "zap_findings_summary": "Unused snapshot-derived summary",
+            "zap_findings_snapshot": json.dumps({"version": 3, "baseUrl": "https://example.com/", "fingerprints": rows,
+                                                  "scanner": self.scanner_inventory()}),
+            "zap_report_generate": "Path: /zap/wrk/report.html",
+        }
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def list_tools(self):
+                return list(responses)
+
+            def call_tool(self, name, _arguments):
+                return responses[name]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            baseline = root / "baseline.json"
+            baseline.write_text(json.dumps(self.node_snapshot(rows, version=1)), encoding="utf-8")
+            suppressions = root / "suppressions.json"
+            suppressions.write_text(json.dumps({
+                "contract_version": MODULE.CI_GATE_SUPPRESSIONS_CONTRACT_VERSION,
+                "suppressions": [{
+                    "id": "known-example",
+                    "fingerprint": "sha256:878375727eb6267528810b63b99da6e415416971f08f691236fdbf3316ed1477",
+                }],
+            }), encoding="utf-8")
+            output = root / "output"
+            with mock.patch.object(MODULE, "McpHttpClient", FakeClient), mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                result = MODULE.main([
+                    "--server-url", "http://example.com/mcp", "--api-key", "test-key",
+                    "--target-url", "https://example.com/", "--baseline-file", str(baseline),
+                    "--suppressions-file", str(suppressions), "--output-dir", str(output),
+                    "--run-active-scan", "false",
+                ])
+
+            self.assertEqual(result, 1)
+            snapshot = json.loads((output / "current-findings.json").read_text())
+            self.assertEqual(snapshot["recorded_example_count"], 2)
+            diff = json.loads((output / "findings-diff.json").read_text())
+            self.assertEqual(diff["identity_version"], 1)
+            self.assertEqual(diff["counts"], {"new": None, "resolved": None, "unchanged": None})
+            self.assertEqual(diff["observed_changes"], {"added": 0, "removed": 0, "retained": 1})
+            self.assertEqual(diff["scanner_comparison"]["status"], "unknown")
+            self.assertEqual(diff["suppressions"]["suppressed_baseline_findings"], 1)
+            self.assertEqual(diff["suppressions"]["suppressed_current_findings"], 1)
+
+    def test_load_suppressions_contract_tracks_active_and_expired_rules(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "suppressions.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "contract_version": MODULE.CI_GATE_SUPPRESSIONS_CONTRACT_VERSION,
+                        "suppressions": [
+                            {
+                                "id": "active-sqli",
+                                "match": {
+                                    "plugin_id": "40018",
+                                    "alert_name": "SQL Injection",
+                                    "url": "https://example.com/",
+                                    "param": "id",
+                                },
+                                "reason": "Known issue",
+                            },
+                            {
+                                "id": "expired-xss",
+                                "fingerprint": "sha256:deadbeef",
+                                "expires_at": "2020-01-01T00:00:00Z",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            contract = MODULE.load_suppressions_contract(path)
+
+            self.assertEqual(contract["rule_count"], 2)
+            self.assertEqual(contract["active_rule_count"], 1)
+            self.assertEqual(contract["expired_rule_count"], 1)
+
+            findings = [
+                {
+                    "plugin_id": "40018",
+                    "alert_name": "SQL Injection",
+                    "risk": "High",
+                    "confidence": "Medium",
+                    "url": "https://example.com/",
+                    "param": "id",
+                    "fingerprint": "sha256:match-me",
+                },
+                {
+                    "plugin_id": "40012",
+                    "alert_name": "Cross Site Scripting",
+                    "risk": "Medium",
+                    "confidence": "High",
+                    "url": "https://example.com/search",
+                    "param": "q",
+                    "fingerprint": "sha256:keep-me",
+                },
+            ]
+
+            filtered, suppressed_count, matched_rule_ids = MODULE.apply_suppressions(findings, contract)
+
+            self.assertEqual(suppressed_count, 1)
+            self.assertEqual(matched_rule_ids, ["active-sqli"])
+            self.assertEqual([finding["fingerprint"] for finding in filtered], ["sha256:keep-me"])
+
+    def test_build_diff_contract_prefers_normalized_snapshot_target_url(self):
+        baseline_snapshot = {
+            "contract_version": MODULE.CI_GATE_FINDINGS_SNAPSHOT_CONTRACT_VERSION,
+            "target_url": "https://example.com/search?a=1&b=2",
+            "finding_count": 0,
+            "findings": [],
+        }
+        current_snapshot = {
+            "contract_version": MODULE.CI_GATE_FINDINGS_SNAPSHOT_CONTRACT_VERSION,
+            "target_url": "https://example.com/search?a=1&b=2",
+            "finding_count": 0,
+            "findings": [],
+        }
+
+        diff_contract = MODULE.build_diff_contract(
+            "HTTPS://EXAMPLE.com/search?b=2&a=1",
+            baseline_snapshot,
+            current_snapshot,
+            {
+                "requested": False,
+                "used": False,
+                "reason": None,
+                "matched_rule_ids": [],
+                "suppressed_baseline_findings": 0,
+                "suppressed_current_findings": 0,
+            },
+        )
+
+        self.assertEqual(diff_contract["target_url"], "https://example.com/search?a=1&b=2")
+
+    def test_load_seed_requests_defaults_url_and_json_content_type(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "seed.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "requests": [
+                            {
+                                "name": "bid-request",
+                                "method": "post",
+                                "body": {"id": "ci-bid"},
+                                "expectedStatus": [200, 204],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            requests = MODULE.load_seed_requests(path, "http://app:8080/bid-request")
+
+            self.assertEqual(requests[0]["name"], "bid-request")
+            self.assertEqual(requests[0]["method"], "POST")
+            self.assertEqual(requests[0]["url"], "http://app:8080/bid-request")
+            self.assertEqual(requests[0]["expected_statuses"], {200, 204})
+
+    def test_execute_seed_requests_replays_through_proxy_without_echoing_body_or_headers(self):
+        class FakeResponse:
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b'{"ok":true}'
+
+            def close(self):
+                pass
+
+        class FakeOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                return FakeResponse()
+
+        opener = FakeOpener()
+        seed_requests = [
+            {
+                "name": "bid-request",
+                "method": "POST",
+                "url": "http://app:8080/bid-request?token=secret&debug=true",
+                "headers": {"X-Test": "secret-ish"},
+                "body": {"id": "ci-bid"},
+                "expected_statuses": {200},
+            }
+        ]
+
+        result = MODULE.execute_seed_requests(
+            seed_requests,
+            "http://proxy-user:proxy-pass@127.0.0.1:8090?token=proxy-secret",
+            7,
+            opener=opener,
+        )
+
+        self.assertEqual(result["contract_version"], "ci_gate_seed_requests/v1")
+        self.assertEqual(result["proxy_url"], "http://127.0.0.1:8090?redacted")
+        self.assertEqual(result["request_count"], 1)
+        self.assertEqual(result["failure_count"], 0)
+        self.assertEqual(result["requests"][0]["method"], "POST")
+        self.assertEqual(result["requests"][0]["url"], "http://app:8080/bid-request?redacted")
+        self.assertEqual(result["requests"][0]["status"], 200)
+        self.assertEqual(result["requests"][0]["expected_status"], "200")
+        self.assertTrue(result["requests"][0]["ok"])
+        self.assertNotIn("headers", result["requests"][0])
+        self.assertNotIn("body", result["requests"][0])
+        self.assertNotIn("secret", json.dumps(result))
+        request, timeout = opener.requests[0]
+        self.assertEqual(timeout, 7)
+        self.assertEqual(request.full_url, "http://app:8080/bid-request?token=secret&debug=true")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.data, b'{"id":"ci-bid"}')
+        self.assertEqual(request.headers["Content-type"], "application/json")
+
+    def test_execute_seed_requests_records_unexpected_status(self):
+        response_body = b'{"error":"private response detail"}'
+        response_stream = io.BytesIO(response_body)
+
+        class FakeHttpErrorOpener:
+            def open(self, _request, timeout):
+                raise MODULE.urllib.error.HTTPError(
+                    "http://app:8080/bid-request",
+                    400,
+                    "Bad Request",
+                    {},
+                    response_stream,
+                )
+
+        result = MODULE.execute_seed_requests(
+            [
+                {
+                    "name": "bid-request",
+                    "method": "POST",
+                    "url": "http://app:8080/bid-request",
+                    "headers": {},
+                    "body": "{}",
+                    "expected_statuses": {200},
+                }
+            ],
+            "http://127.0.0.1:8090",
+            30,
+            opener=FakeHttpErrorOpener(),
+        )
+
+        self.assertEqual(result["failure_count"], 1)
+        self.assertFalse(result["requests"][0]["ok"])
+        self.assertEqual(result["requests"][0]["status"], 400)
+        self.assertEqual(result["requests"][0]["response_bytes"], len(response_body))
+        self.assertTrue(response_stream.closed)
+        self.assertNotIn("private response detail", json.dumps(result))
+
+    def test_main_writes_deterministic_gate_contract_artifacts(self):
+        class FakeMcpHttpClient:
+            snapshot_text = ""
+            report_path = ""
+
+            def __init__(self, _server_url: str, _api_key: str, timeout_seconds: int = 60) -> None:
+                self.timeout_seconds = timeout_seconds
+
+            def list_tools(self):
+                return [
+                    "zap_crawl_start",
+                    "zap_crawl_status",
+                    "zap_attack_start",
+                    "zap_attack_status",
+                    "zap_passive_scan_wait",
+                    "zap_findings_summary",
+                    "zap_findings_snapshot",
+                    "zap_report_generate",
+                ]
+
+            def call_tool(self, name, _arguments):
+                if name == "zap_crawl_start":
+                    return "Guided crawl scan started.\nOperation ID: spider-1"
+                if name == "zap_crawl_status":
+                    return "Guided crawl scan status:\nOperation ID: spider-1\nCompleted: yes\n"
+                if name == "zap_attack_start":
+                    return "Guided attack scan started.\nOperation ID: active-1"
+                if name == "zap_attack_status":
+                    return "Guided attack scan status:\nOperation ID: active-1\nCompleted: yes\n"
+                if name == "zap_passive_scan_wait":
+                    return "Passive scan queue drained."
+                if name == "zap_findings_summary":
+                    return "this output should be ignored when a snapshot is available"
+                if name == "zap_findings_snapshot":
+                    return self.snapshot_text
+                if name == "zap_report_generate":
+                    return "Path: " + self.report_path
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        baseline_payload = {
+            "version": 3,
+            "scanner": self.scanner_inventory(),
+            "baseUrl": "https://example.com",
+            "exportedAt": "2026-03-21T00:00:00Z",
+            "fingerprints": [
+                {
+                    "pluginId": "40018",
+                    "alertName": "SQL Injection",
+                    "risk": "High",
+                    "confidence": "Medium",
+                    "url": "https://example.com/",
+                    "param": "id",
+                    "fingerprint": "legacy-baseline",
+                }
+            ],
+        }
+        snapshot_variant_a = {
+            "version": 3,
+            "scanner": self.scanner_inventory(),
+            "baseUrl": "https://example.com",
+            "exportedAt": "2026-03-22T01:00:00Z",
+            "fingerprints": [
+                {
+                    "pluginId": "40012",
+                    "alertName": "Cross Site Scripting",
+                    "risk": "Medium",
+                    "confidence": "high",
+                    "url": "https://example.com/search?b=2&a=1",
+                    "param": "q",
+                    "fingerprint": "legacy-xss-a",
+                },
+                {
+                    "pluginId": "40018",
+                    "alertName": "SQL Injection",
+                    "risk": "High",
+                    "confidence": "Medium",
+                    "url": "https://example.com",
+                    "param": "id",
+                    "fingerprint": "legacy-sqli-a",
+                },
+            ],
+        }
+        snapshot_variant_b = {
+            "version": 3,
+            "scanner": self.scanner_inventory(),
+            "baseUrl": "https://example.com",
+            "exportedAt": "2026-03-22T02:00:00Z",
+            "fingerprints": [
+                {
+                    "pluginId": "40018",
+                    "alertName": "SQL Injection",
+                    "risk": "High",
+                    "confidence": "Medium",
+                    "url": "https://EXAMPLE.com/",
+                    "param": "id",
+                    "fingerprint": "legacy-sqli-b",
+                },
+                {
+                    "pluginId": "40012",
+                    "alertName": "Cross Site Scripting",
+                    "risk": "Medium",
+                    "confidence": "High",
+                    "url": "https://EXAMPLE.com/search?a=1&b=2",
+                    "param": "q",
+                    "fingerprint": "legacy-xss-b",
+                },
+            ],
+        }
+
+        artifact_names = [
+            "artifact-manifest.json",
+            "current-findings.json",
+            "findings-diff.json",
+            "findings-diff.txt",
+            "findings-summary.md",
+            "gate-metadata.json",
+            "gate-summary.md",
+            "reports/zap-report.html",
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            baseline_path = tmp_path / "baseline.json"
+            baseline_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+
+            report_root_a = tmp_path / "report-root-a"
+            report_root_b = tmp_path / "report-root-b"
+            report_root_a.mkdir()
+            report_root_b.mkdir()
+            (report_root_a / "generated-a.html").write_text("<html>stable report</html>\n", encoding="utf-8")
+            (report_root_b / "generated-b.html").write_text("<html>stable report</html>\n", encoding="utf-8")
+
+            output_a = tmp_path / "out-a"
+            output_b = tmp_path / "out-b"
+
+            def run_gate(snapshot_payload, report_path, report_root, output_dir):
+                FakeMcpHttpClient.snapshot_text = json.dumps(snapshot_payload)
+                FakeMcpHttpClient.report_path = report_path
+                with mock.patch.object(MODULE, "McpHttpClient", FakeMcpHttpClient):
+                    result = MODULE.main(
+                        [
+                            "--server-url",
+                            "http://example.com/mcp",
+                            "--api-key",
+                            "test-key",
+                            "--target-url",
+                            "https://example.com",
+                            "--baseline-file",
+                            str(baseline_path),
+                            "--output-dir",
+                            str(output_dir),
+                            "--report-root-container",
+                            "/zap/wrk/reports",
+                            "--report-root-local",
+                            str(report_root),
+                        ]
+                    )
+                self.assertEqual(result, 1)
+
+            run_gate(snapshot_variant_a, "/zap/wrk/reports/generated-a.html", report_root_a, output_a)
+            run_gate(snapshot_variant_b, "/zap/wrk/reports/generated-b.html", report_root_b, output_b)
+
+            for artifact_name in artifact_names:
+                self.assertEqual(
+                    (output_a / artifact_name).read_text(encoding="utf-8"),
+                    (output_b / artifact_name).read_text(encoding="utf-8"),
+                    artifact_name,
+                )
+
+            metadata = json.loads((output_a / "gate-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["contract_version"], MODULE.CI_GATE_RESULT_CONTRACT_VERSION)
+            self.assertEqual(metadata["findings"]["new_findings"], 1)
+            self.assertFalse(metadata["gate_passed"])
+            self.assertEqual(metadata["report"]["artifact_path"], "reports/zap-report.html")
+
+    def test_main_enforces_comparable_evidence_and_seed_mode_retains_unknown_counts(self):
+        responses = {
+            "zap_crawl_start": "Operation ID: spider-1",
+            "zap_crawl_status": "Completed: yes",
+            "zap_attack_start": "Operation ID: active-1",
+            "zap_attack_status": "Completed: yes",
+            "zap_passive_scan_wait": "Completed: yes",
+            "zap_findings_summary": "unused summary",
+            "zap_findings_snapshot": "",
+            "zap_report_generate": "Path: /zap/wrk/report.html",
+        }
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def list_tools(self):
+                return list(responses)
+
+            def call_tool(self, name, _arguments):
+                return responses[name]
+
+        csp = self.node_finding(pluginId="10038", alertName="Content Security Policy Header Not Set")
+        changed_inventory = self.scanner_inventory(addOns=[
+            {"id": "pscanrules", "version": "66.0.0", "status": "release"},
+        ])
+        cases = [
+            ("matching", self.scanner_inventory(), 3, "enforce", True, 0, 0),
+            ("different", changed_inventory, 3, "enforce", True, 1, None),
+            ("different", changed_inventory, 3, "seed", True, 0, None),
+            ("different", changed_inventory, 3, "enforce", False, 0, None),
+            ("unknown", self.scanner_inventory(inventoryComplete=False), 3, "enforce", True, 1, None),
+            ("unknown", self.scanner_inventory(inventoryComplete=False), 3, "seed", True, 0, None),
+            ("unknown", None, 3, "enforce", True, 1, None),
+            ("unknown", self.scanner_inventory(), 2, "enforce", True, 1, None),
+            ("unknown", self.scanner_inventory(), 2, "seed", True, 0, None),
+        ]
+        for status, scanner, baseline_version, mode, fail_on_new, expected_result, expected_new in cases:
+            with self.subTest(status=status, baseline_version=baseline_version, mode=mode, fail_on_new=fail_on_new):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    baseline = root / "baseline.json"
+                    baseline.write_text(json.dumps(self.node_snapshot([csp], version=baseline_version)), encoding="utf-8")
+                    current_payload = {"version": 3, "baseUrl": "https://example.com/", "fingerprints": [], "scanner": scanner}
+                    responses["zap_findings_snapshot"] = json.dumps(current_payload)
+                    output = root / "artifacts"
+                    with mock.patch.object(MODULE, "McpHttpClient", FakeClient), mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                        result = MODULE.main([
+                            "--server-url", "http://example.com/mcp", "--api-key", "test-key",
+                            "--target-url", "https://example.com/", "--baseline-file", str(baseline),
+                            "--output-dir", str(output), "--baseline-mode", mode,
+                            "--fail-on-new-findings", str(fail_on_new).lower(), "--run-active-scan", "false",
+                        ])
+
+                    self.assertEqual(result, expected_result)
+                    snapshot = json.loads((output / "current-findings.json").read_text())
+                    metadata = json.loads((output / "gate-metadata.json").read_text())
+                    diff = json.loads((output / "findings-diff.json").read_text())
+                    summary = (output / "gate-summary.md").read_text()
+                    self.assertEqual(metadata["contract_version"], "ci_gate_result/v2")
+                    self.assertEqual(snapshot["contract_version"], "ci_gate_findings_snapshot/v3")
+                    self.assertEqual(diff["contract_version"], "ci_gate_findings_diff/v3")
+                    self.assertEqual(metadata["scanner"], snapshot["scanner"])
+                    self.assertEqual(diff["current"]["scanner"], snapshot["scanner"])
+                    self.assertEqual(metadata["baseline"]["scanner"], diff["baseline"]["scanner"])
+                    self.assertEqual(metadata["scanner_comparison"], diff["scanner_comparison"])
+                    self.assertEqual(metadata["scanner_comparison"]["status"], status)
+                    self.assertEqual(metadata["enforcement"]["diff_available"], status == "matching")
+                    self.assertEqual(metadata["new_findings"], expected_new)
+                    self.assertEqual(metadata["findings"]["new_findings"], expected_new)
+                    self.assertEqual(diff["observed_changes"], {"added": 0, "removed": 1, "retained": 0})
+                    self.assertIn(f"Scanner comparison: `{status}`", summary)
+                    self.assertIn(f"Scanner ZAP Version: {snapshot['scanner']['zapVersion'] or 'unknown'}", summary)
+                    if status != "matching":
+                        self.assertNotIn("Resolved findings:", summary)
+                        self.assertIn("Observed added / removed / retained: `0 / 1 / 0`", summary)
+                    if expected_result:
+                        self.assertEqual(metadata["enforcement"]["failure_reason"], diff["scanner_comparison"]["reason"])
+                    if mode == "seed" and status != "matching":
+                        self.assertIn("Seed mode allows baseline review", summary)
+
+    def test_main_uses_guided_tools_when_legacy_expert_tools_are_also_available(self):
+        calls = []
+
+        class FakeMcpHttpClient:
+            def __init__(self, _server_url: str, _api_key: str, timeout_seconds: int = 60) -> None:
+                self.timeout_seconds = timeout_seconds
+
+            def list_tools(self):
+                return [
+                    "zap_crawl_start",
+                    "zap_crawl_status",
+                    "zap_attack_start",
+                    "zap_attack_status",
+                    "zap_findings_summary",
+                    "zap_report_generate",
+                    "zap_spider_start",
+                    "zap_spider_status",
+                    "zap_active_scan_start",
+                    "zap_active_scan_status",
+                    "zap_passive_scan_wait",
+                    "zap_get_findings_summary",
+                    "zap_findings_snapshot",
+                    "zap_generate_report",
+                ]
+
+            def call_tool(self, name, _arguments):
+                calls.append((name, _arguments))
+                if name == "zap_crawl_start":
+                    return "Guided crawl scan started.\nOperation ID: spider-1"
+                if name == "zap_crawl_status":
+                    return "Guided crawl scan status:\nOperation ID: spider-1\nCompleted: yes\n"
+                if name == "zap_attack_start":
+                    return "Guided attack accepted.\nOperation ID: attack-1"
+                if name == "zap_attack_status":
+                    return "Status: SUCCEEDED\nProgress: 100%\n"
+                if name == "zap_passive_scan_wait":
+                    return "Passive scan queue drained."
+                if name == "zap_findings_snapshot":
+                    return json.dumps(
+                        {
+                            "version": 1,
+                            "baseUrl": "https://example.com",
+                            "exportedAt": "2026-03-22T00:00:00Z",
+                            "fingerprints": [
+                                {
+                                    "pluginId": "40018",
+                                    "alertName": "SQL Injection",
+                                    "risk": "High",
+                                    "confidence": "Medium",
+                                    "url": "https://example.com/",
+                                    "param": "id",
+                                    "fingerprint": "legacy",
+                                }
+                            ],
+                        }
+                    )
+                if name == "zap_report_generate":
+                    return "Path: /zap/wrk/reports/generated.html"
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            report_root = tmp_path / "reports"
+            report_root.mkdir()
+            (report_root / "generated.html").write_text("<html>report</html>\n", encoding="utf-8")
+            output_dir = tmp_path / "artifacts"
+
+            with mock.patch.object(MODULE, "McpHttpClient", FakeMcpHttpClient):
+                result = MODULE.main(
+                    [
+                        "--server-url",
+                        "http://example.com/mcp",
+                        "--api-key",
+                        "test-key",
+                        "--target-url",
+                        "https://example.com",
+                        "--output-dir",
+                        str(output_dir),
+                        "--report-root-container",
+                        "/zap/wrk/reports",
+                        "--report-root-local",
+                        str(report_root),
+                        "--fail-on-new-findings",
+                        "false",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            metadata = json.loads((output_dir / "gate-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["tool_surface"], "guided")
+            self.assertTrue((output_dir / "current-findings.json").exists())
+            self.assertEqual(metadata["report"]["artifact_path"], "reports/zap-report.html")
+            self.assertEqual([name for name, _ in calls], [
+                "zap_crawl_start", "zap_crawl_status", "zap_attack_start", "zap_attack_status",
+                "zap_passive_scan_wait", "zap_findings_snapshot", "zap_report_generate",
+            ])
+            self.assertIn(("zap_crawl_status", {"operationId": "spider-1"}), calls)
+            self.assertIn(("zap_attack_status", {"operationId": "attack-1"}), calls)
+
+    def test_queue_status_takes_precedence_over_completion_and_progress_labels(self):
+        for state in ("QUEUED", "STARTING", "RUNNING", "FAILED", "CANCELLED", "START_OUTCOME_UNKNOWN"):
+            with self.subTest(state=state):
+                self.assertFalse(MODULE.parse_completed(f"Status: {state}\nProgress: 100%\nCompleted: yes\n"))
+        self.assertTrue(MODULE.parse_completed("Status: SUCCEEDED\nCompleted: 2026-10-29T00:00:00Z\n"))
+
+    def test_polling_waits_for_queue_success_even_when_running_progress_is_full(self):
+        client = mock.Mock()
+        client.call_tool.side_effect = ["Status: RUNNING\nProgress: 100%", "Status: SUCCEEDED\nProgress: 100%"]
+        with mock.patch.object(MODULE.time, "sleep") as sleep:
+            result = MODULE.wait_for_completion(client, "zap_crawl_status", "operation-1", 10, 1, "operationId")
+        self.assertIn("SUCCEEDED", result)
+        self.assertEqual(client.call_tool.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_main_never_resubmits_or_falls_back_after_uncertain_or_failed_guided_start(self):
+        for phase in ("crawl", "attack"):
+            for outcome in ("lost_reply", "START_OUTCOME_UNKNOWN", "FAILED", "CANCELLED"):
+                with self.subTest(phase=phase, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                    calls = []
+
+                    class FakeClient:
+                        def __init__(self, *_args, **_kwargs):
+                            pass
+
+                        def list_tools(self):
+                            return ["zap_crawl_start", "zap_crawl_status", "zap_attack_start", "zap_attack_status",
+                                    "zap_passive_scan_wait", "zap_findings_summary", "zap_report_generate",
+                                    "zap_spider_start", "zap_ajax_spider", "zap_active_scan_start"]
+
+                        def call_tool(self, name, _arguments):
+                            calls.append(name)
+                            if name == f"zap_{phase}_start":
+                                if outcome == "lost_reply":
+                                    raise RuntimeError("START response timed out")
+                                return f"Guided {phase} accepted.\nOperation ID: operation-1\nStatus: {outcome}"
+                            if name == f"zap_{phase}_status":
+                                return f"Status: {outcome}\nProgress: 100%\nCompleted: yes"
+                            if name == "zap_crawl_start":
+                                return "Operation ID: crawl-1"
+                            if name == "zap_crawl_status":
+                                return "Status: SUCCEEDED"
+                            raise AssertionError(f"Unexpected call after uncertain/failed start: {name}")
+
+                    with mock.patch.object(MODULE, "McpHttpClient", FakeClient):
+                        with self.assertRaises(RuntimeError):
+                            MODULE.main(["--server-url", "http://example.invalid/mcp", "--api-key", "test-key",
+                                         "--target-url", "https://example.invalid", "--output-dir", directory])
+                    expected = ["zap_crawl_start", "zap_crawl_status"] if phase == "attack" else []
+                    expected.append(f"zap_{phase}_start")
+                    if outcome != "lost_reply":
+                        expected.append(f"zap_{phase}_status")
+                    self.assertEqual(calls, expected)
+
+    def test_main_rejects_expert_only_server_without_starting_a_scan(self):
+        client = mock.Mock()
+        client.list_tools.return_value = ["zap_spider_start", "zap_spider_status", "zap_active_scan_start",
+                                         "zap_active_scan_status", "zap_passive_scan_wait", "zap_findings_snapshot",
+                                         "zap_get_findings_summary", "zap_generate_report"]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(MODULE, "McpHttpClient", return_value=client):
+            with self.assertRaisesRegex(RuntimeError, "requires guided MCP"):
+                MODULE.main(["--server-url", "http://example.invalid/mcp", "--api-key", "test-key",
+                             "--target-url", "https://example.invalid", "--output-dir", directory])
+        client.call_tool.assert_not_called()
+
+    def test_main_rejects_unsupported_report_template_before_connecting(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(MODULE, "McpHttpClient") as client_factory, \
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as error:
+                MODULE.main(["--server-url", "http://example.invalid/mcp", "--api-key", "test-key",
+                             "--target-url", "https://example.invalid", "--output-dir", directory,
+                             "--report-template", "custom-json"])
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("invalid choice", stderr.getvalue())
+            self.assertIn("traditional-json-plus", stderr.getvalue())
+            client_factory.assert_not_called()
+
+    def test_main_preserves_supported_guided_report_format_and_artifact_extension(self):
+        for format in ("html", "json"):
+            with self.subTest(format=format), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                report_root = root / "reports"
+                report_root.mkdir()
+                report = report_root / f"generated.{format}"
+                report.write_text("{}" if format == "json" else "<html></html>", encoding="utf-8")
+                output = root / "output"
+                responses = {
+                    "zap_crawl_start": "Operation ID: crawl-1",
+                    "zap_crawl_status": "Status: SUCCEEDED",
+                    "zap_attack_start": "unused",
+                    "zap_attack_status": "unused",
+                    "zap_passive_scan_wait": "Completed: yes",
+                    "zap_findings_summary": "No findings.",
+                    "zap_report_generate": f"Path: /zap/wrk/reports/generated.{format}",
+                }
+                client = mock.Mock()
+                client.list_tools.return_value = list(responses)
+                client.call_tool.side_effect = lambda name, arguments: responses[name]
+                with mock.patch.object(MODULE, "McpHttpClient", return_value=client):
+                    result = MODULE.main([
+                        "--server-url", "http://example.invalid/mcp", "--api-key", "test-key",
+                        "--target-url", "https://example.invalid", "--output-dir", str(output),
+                        "--run-active-scan", "false", "--fail-on-new-findings", "false",
+                        "--report-template", f"traditional-{format}-plus",
+                        "--report-root-container", "/zap/wrk/reports", "--report-root-local", str(report_root),
+                    ])
+                self.assertEqual(result, 0)
+                client.call_tool.assert_any_call("zap_report_generate", {
+                    "baseUrl": "https://example.invalid", "format": format, "theme": "light",
+                })
+                metadata = json.loads((output / "gate-metadata.json").read_text(encoding="utf-8"))
+                self.assertEqual(metadata["report"]["artifact_path"], f"reports/zap-report.{format}")
+                self.assertEqual((output / f"reports/zap-report.{format}").read_text(), report.read_text())
+
+    def test_main_records_successful_seed_request_artifact(self):
+        class FakeMcpHttpClient:
+            def __init__(self, _server_url: str, _api_key: str, timeout_seconds: int = 60) -> None:
+                self.timeout_seconds = timeout_seconds
+
+            def list_tools(self):
+                return [
+                    "zap_crawl_start",
+                    "zap_crawl_status",
+                    "zap_attack_start",
+                    "zap_attack_status",
+                    "zap_passive_scan_wait",
+                    "zap_findings_summary",
+                    "zap_findings_snapshot",
+                    "zap_report_generate",
+                ]
+
+            def call_tool(self, name, _arguments):
+                if name == "zap_crawl_start":
+                    return "Guided crawl scan started.\nOperation ID: spider-1"
+                if name == "zap_crawl_status":
+                    return "Guided crawl scan status:\nOperation ID: spider-1\nCompleted: yes\n"
+                if name == "zap_passive_scan_wait":
+                    return "Passive scan queue drained."
+                if name == "zap_findings_snapshot":
+                    return json.dumps({"version": 1, "baseUrl": "https://example.com/api", "fingerprints": []})
+                if name == "zap_report_generate":
+                    return "Path: /zap/wrk/reports/generated.html"
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        seed_results = {
+            "contract_version": "ci_gate_seed_requests/v1",
+            "proxy_url": "http://127.0.0.1:8090",
+            "request_count": 1,
+            "failure_count": 0,
+            "requests": [
+                {
+                    "name": "api-post",
+                    "method": "POST",
+                    "url": "https://example.com/api",
+                    "status": 200,
+                    "expected_status": "200",
+                    "ok": True,
+                    "response_bytes": 2,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            seed_path = tmp_path / "seed.json"
+            seed_path.write_text(
+                json.dumps({"requests": [{"name": "api-post", "method": "POST", "body": {"ok": True}}]}),
+                encoding="utf-8",
+            )
+            report_root = tmp_path / "reports"
+            report_root.mkdir()
+            (report_root / "generated.html").write_text("<html>report</html>\n", encoding="utf-8")
+            output_dir = tmp_path / "artifacts"
+
+            with mock.patch.object(MODULE, "McpHttpClient", FakeMcpHttpClient), mock.patch.object(
+                    MODULE, "execute_seed_requests", return_value=seed_results) as execute_seed_requests:
+                result = MODULE.main(
+                    [
+                        "--server-url",
+                        "http://example.com/mcp",
+                        "--api-key",
+                        "test-key",
+                        "--target-url",
+                        "https://example.com/api",
+                        "--seed-requests-file",
+                        str(seed_path),
+                        "--output-dir",
+                        str(output_dir),
+                        "--report-root-container",
+                        "/zap/wrk/reports",
+                        "--report-root-local",
+                        str(report_root),
+                        "--run-active-scan",
+                        "false",
+                        "--fail-on-new-findings",
+                        "false",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            execute_seed_requests.assert_called_once()
+            metadata = json.loads((output_dir / "gate-metadata.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output_dir / "artifact-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["seed_requests"]["request_count"], 1)
+            self.assertEqual(metadata["seed_requests"]["failure_count"], 0)
+            self.assertEqual(metadata["seed_requests"]["result_path"], "seed-requests-results.json")
+            self.assertEqual(
+                json.loads((output_dir / "seed-requests-results.json").read_text(encoding="utf-8")),
+                seed_results,
+            )
+            self.assertIn("seed_requests", [artifact["name"] for artifact in manifest["artifacts"]])
+
+    def test_main_fails_when_enforced_baseline_file_is_missing(self):
+        class FakeMcpHttpClient:
+            def __init__(self, _server_url: str, _api_key: str, timeout_seconds: int = 60) -> None:
+                self.timeout_seconds = timeout_seconds
+
+            def list_tools(self):
+                return [
+                    "zap_crawl_start",
+                    "zap_crawl_status",
+                    "zap_attack_start",
+                    "zap_attack_status",
+                    "zap_passive_scan_wait",
+                    "zap_findings_summary",
+                    "zap_findings_snapshot",
+                    "zap_report_generate",
+                ]
+
+            def call_tool(self, name, _arguments):
+                if name == "zap_crawl_start":
+                    return "Guided crawl scan started.\nOperation ID: spider-1"
+                if name == "zap_crawl_status":
+                    return "Guided crawl scan status:\nOperation ID: spider-1\nCompleted: yes\n"
+                if name == "zap_passive_scan_wait":
+                    return "Passive scan queue drained."
+                if name == "zap_findings_snapshot":
+                    return json.dumps({"version": 1, "baseUrl": "https://example.com", "fingerprints": []})
+                if name == "zap_report_generate":
+                    return "Path: /zap/wrk/reports/generated.html"
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            report_root = tmp_path / "reports"
+            report_root.mkdir()
+            (report_root / "generated.html").write_text("<html>report</html>\n", encoding="utf-8")
+            output_dir = tmp_path / "artifacts"
+
+            with mock.patch.object(MODULE, "McpHttpClient", FakeMcpHttpClient):
+                result = MODULE.main(
+                    [
+                        "--server-url",
+                        "http://example.com/mcp",
+                        "--api-key",
+                        "test-key",
+                        "--target-url",
+                        "https://example.com",
+                        "--baseline-file",
+                        str(tmp_path / "missing-baseline.json"),
+                        "--output-dir",
+                        str(output_dir),
+                        "--report-root-container",
+                        "/zap/wrk/reports",
+                        "--report-root-local",
+                        str(report_root),
+                        "--run-active-scan",
+                        "false",
+                    ]
+                )
+
+            metadata = json.loads((output_dir / "gate-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(result, 1)
+            self.assertFalse(metadata["gate_passed"])
+            self.assertEqual(metadata["baseline_mode"], "enforce")
+            self.assertEqual(metadata["baseline"]["diff_unavailable_reason"], "baseline_file_missing")
+            self.assertEqual(metadata["enforcement"]["failure_reason"], "baseline_file_missing")
+            self.assertTrue((output_dir / "baseline-note.txt").exists())
+
+    def test_main_allows_missing_baseline_in_seed_mode(self):
+        class FakeMcpHttpClient:
+            def __init__(self, _server_url: str, _api_key: str, timeout_seconds: int = 60) -> None:
+                self.timeout_seconds = timeout_seconds
+
+            def list_tools(self):
+                return [
+                    "zap_crawl_start",
+                    "zap_crawl_status",
+                    "zap_attack_start",
+                    "zap_attack_status",
+                    "zap_passive_scan_wait",
+                    "zap_findings_summary",
+                    "zap_findings_snapshot",
+                    "zap_report_generate",
+                ]
+
+            def call_tool(self, name, _arguments):
+                if name == "zap_crawl_start":
+                    return "Guided crawl scan started.\nOperation ID: spider-1"
+                if name == "zap_crawl_status":
+                    return "Guided crawl scan status:\nOperation ID: spider-1\nCompleted: yes\n"
+                if name == "zap_passive_scan_wait":
+                    return "Passive scan queue drained."
+                if name == "zap_findings_snapshot":
+                    return json.dumps({"version": 1, "baseUrl": "https://example.com", "fingerprints": []})
+                if name == "zap_report_generate":
+                    return "Path: /zap/wrk/reports/generated.html"
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            report_root = tmp_path / "reports"
+            report_root.mkdir()
+            (report_root / "generated.html").write_text("<html>report</html>\n", encoding="utf-8")
+            output_dir = tmp_path / "artifacts"
+
+            with mock.patch.object(MODULE, "McpHttpClient", FakeMcpHttpClient):
+                result = MODULE.main(
+                    [
+                        "--server-url",
+                        "http://example.com/mcp",
+                        "--api-key",
+                        "test-key",
+                        "--target-url",
+                        "https://example.com",
+                        "--baseline-file",
+                        str(tmp_path / "missing-baseline.json"),
+                        "--baseline-mode",
+                        "seed",
+                        "--output-dir",
+                        str(output_dir),
+                        "--report-root-container",
+                        "/zap/wrk/reports",
+                        "--report-root-local",
+                        str(report_root),
+                        "--run-active-scan",
+                        "false",
+                    ]
+                )
+
+            metadata = json.loads((output_dir / "gate-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(result, 0)
+            self.assertTrue(metadata["gate_passed"])
+            self.assertEqual(metadata["baseline_mode"], "seed")
+            self.assertEqual(metadata["baseline"]["diff_unavailable_reason"], "baseline_file_missing")
+            self.assertIsNone(metadata["enforcement"]["failure_reason"])
+
+    def test_main_fails_when_guided_surface_cannot_diff_in_enforce_mode(self):
+        class FakeMcpHttpClient:
+            def __init__(self, _server_url: str, _api_key: str, timeout_seconds: int = 60) -> None:
+                self.timeout_seconds = timeout_seconds
+
+            def list_tools(self):
+                return [
+                    "zap_crawl_start",
+                    "zap_crawl_status",
+                    "zap_attack_start",
+                    "zap_attack_status",
+                    "zap_passive_scan_wait",
+                    "zap_findings_summary",
+                    "zap_report_generate",
+                ]
+
+            def call_tool(self, name, _arguments):
+                if name == "zap_crawl_start":
+                    return "Guided crawl started.\nOperation ID: crawl-1\n"
+                if name == "zap_crawl_status":
+                    return "Guided crawl status.\nCompleted: yes\n"
+                if name == "zap_passive_scan_wait":
+                    return "Passive scan queue drained."
+                if name == "zap_findings_summary":
+                    return "No findings."
+                if name == "zap_report_generate":
+                    return "Guided report generated.\nPath: /zap/wrk/reports/generated.html\n"
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            baseline_path = tmp_path / "baseline.json"
+            baseline_path.write_text(
+                json.dumps({"version": 1, "baseUrl": "https://example.com", "fingerprints": []}),
+                encoding="utf-8",
+            )
+            report_root = tmp_path / "reports"
+            report_root.mkdir()
+            (report_root / "generated.html").write_text("<html>report</html>\n", encoding="utf-8")
+            output_dir = tmp_path / "artifacts"
+
+            with mock.patch.object(MODULE, "McpHttpClient", FakeMcpHttpClient):
+                result = MODULE.main(
+                    [
+                        "--server-url",
+                        "http://example.com/mcp",
+                        "--api-key",
+                        "test-key",
+                        "--target-url",
+                        "https://example.com",
+                        "--baseline-file",
+                        str(baseline_path),
+                        "--output-dir",
+                        str(output_dir),
+                        "--report-root-container",
+                        "/zap/wrk/reports",
+                        "--report-root-local",
+                        str(report_root),
+                        "--run-active-scan",
+                        "false",
+                    ]
+                )
+
+            metadata = json.loads((output_dir / "gate-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(result, 1)
+            self.assertFalse(metadata["gate_passed"])
+            self.assertEqual(metadata["tool_surface"], "guided")
+            self.assertEqual(
+                metadata["enforcement"]["failure_reason"],
+                "guided_surface_without_snapshot_support",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

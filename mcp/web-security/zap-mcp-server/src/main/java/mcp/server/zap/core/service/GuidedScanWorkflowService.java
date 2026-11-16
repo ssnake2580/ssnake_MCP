@@ -1,0 +1,815 @@
+package mcp.server.zap.core.service;
+
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.util.Base64;
+import java.util.Locale;
+import java.util.UUID;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import mcp.server.zap.core.gateway.EngineAdapter;
+import mcp.server.zap.core.gateway.EngineCapability;
+import mcp.server.zap.core.gateway.GatewayRecordFactory;
+import mcp.server.zap.core.service.auth.bootstrap.AuthBootstrapKind;
+import mcp.server.zap.core.service.auth.bootstrap.GuidedAuthSessionService;
+import mcp.server.zap.core.service.auth.bootstrap.PreparedAuthSession;
+import mcp.server.zap.core.service.authz.GuidedToolActions;
+import mcp.server.zap.core.service.protection.ClientWorkspaceResolver;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+/**
+ * Guided scan orchestration for crawl and attack flows without exposing MCP transport details.
+ */
+@Service
+public class GuidedScanWorkflowService {
+    private static final String PREFIX_OPERATION_ID = "zop_";
+    private static final byte[] PROCESS_OPERATION_SIGNING_SECRET =
+            UUID.randomUUID().toString().getBytes(StandardCharsets.UTF_8);
+    private static final String STRATEGY_ACTIVE = "active";
+    private static final String STRATEGY_AUTO = "auto";
+    private static final String STRATEGY_BROWSER = "browser";
+    private static final String STRATEGY_CLIENT = "client";
+    private static final String STRATEGY_HTTP = "http";
+    private static final String JOB_ID_PREFIX = "Job ID: ";
+    private static final String AUTO_QUEUE_HTTP_NOTE =
+            "Auto strategy selects the queued HTTP spider without automatic fallback.";
+    private static final String NEXT_ACTIONS_HEADER = "Next Actions:";
+
+    private final SpiderScanService spiderScanService;
+    private final AjaxSpiderService ajaxSpiderService;
+    private final ClientSpiderService clientSpiderService;
+    private final ActiveScanService activeScanService;
+    private final ScanJobQueueService scanJobQueueService;
+    private final GuidedAuthSessionService guidedAuthSessionService;
+    private final EngineAdapter engineAdapter;
+    private final GatewayRecordFactory gatewayRecordFactory;
+    private final GuidedToolActions guidedToolActions;
+    private ClientWorkspaceResolver clientWorkspaceResolver;
+
+    @Value("${mcp.server.guided.operation-signing-secret:${JWT_SECRET:}}")
+    private String operationSigningSecret;
+
+    public GuidedScanWorkflowService(SpiderScanService spiderScanService,
+                                     AjaxSpiderService ajaxSpiderService,
+                                     ClientSpiderService clientSpiderService,
+                                     ActiveScanService activeScanService,
+                                     ScanJobQueueService scanJobQueueService,
+                                     GuidedAuthSessionService guidedAuthSessionService,
+                                     EngineAdapter engineAdapter,
+                                     GatewayRecordFactory gatewayRecordFactory,
+                                     GuidedToolActions guidedToolActions) {
+        this.spiderScanService = spiderScanService;
+        this.ajaxSpiderService = ajaxSpiderService;
+        this.clientSpiderService = clientSpiderService;
+        this.activeScanService = activeScanService;
+        this.scanJobQueueService = scanJobQueueService;
+        this.guidedAuthSessionService = guidedAuthSessionService;
+        this.engineAdapter = engineAdapter;
+        this.gatewayRecordFactory = gatewayRecordFactory;
+        this.guidedToolActions = guidedToolActions;
+    }
+
+    @Autowired(required = false)
+    void setClientWorkspaceResolver(ClientWorkspaceResolver clientWorkspaceResolver) {
+        this.clientWorkspaceResolver = clientWorkspaceResolver;
+    }
+
+    public String startCrawl(String targetUrl, String strategy, String idempotencyKey, String authSessionId) {
+        String normalizedTargetUrl = requireText(targetUrl, "targetUrl");
+        gatewayRecordFactory.requireCapability(engineAdapter, EngineCapability.GUIDED_CRAWL, "guided crawl");
+        String normalizedStrategy = normalizeCrawlStrategy(strategy);
+        PreparedAuthSession preparedAuthSession = resolvePreparedSession(authSessionId, normalizedTargetUrl,
+                STRATEGY_CLIENT.equals(normalizedStrategy) ? AuthBootstrapKind.BROWSER : AuthBootstrapKind.FORM);
+        return formatStartedOperation(
+                normalizedTargetUrl,
+                startCrawlOperation(
+                        normalizedTargetUrl,
+                        normalizedStrategy,
+                        trimToNull(idempotencyKey),
+                        preparedAuthSession
+                )
+        );
+    }
+
+    public String getCrawlStatus(String operationId) {
+        return formatStatusMessage(operationId, OperationKind.CRAWL);
+    }
+
+    public String stopCrawl(String operationId) {
+        return formatStopMessage(operationId, OperationKind.CRAWL);
+    }
+
+    public String startAttack(String targetUrl, String recurse, String policy, String idempotencyKey, String authSessionId) {
+        String normalizedTargetUrl = requireText(targetUrl, "targetUrl");
+        gatewayRecordFactory.requireCapability(engineAdapter, EngineCapability.GUIDED_ATTACK, "guided attack");
+        PreparedAuthSession preparedAuthSession = resolvePreparedSession(
+                authSessionId, normalizedTargetUrl, AuthBootstrapKind.FORM);
+        return formatStartedOperation(
+                normalizedTargetUrl,
+                startAttackOperation(normalizedTargetUrl, recurse, policy, trimToNull(idempotencyKey), preparedAuthSession)
+        );
+    }
+
+    public String getAttackStatus(String operationId) {
+        return formatStatusMessage(operationId, OperationKind.ATTACK);
+    }
+
+    public String stopAttack(String operationId) {
+        return formatStopMessage(operationId, OperationKind.ATTACK);
+    }
+
+    private StartedOperation startCrawlOperation(String targetUrl,
+                                                 String requestedStrategy,
+                                                 String idempotencyKey,
+                                                 PreparedAuthSession preparedAuthSession) {
+        if (preparedAuthSession != null && STRATEGY_BROWSER.equals(requestedStrategy)) {
+            throw new IllegalArgumentException(
+                    "strategy=browser (AJAX Spider) does not support authSessionId."
+            );
+        }
+
+        String effectiveStrategy = STRATEGY_AUTO.equals(requestedStrategy) ? STRATEGY_HTTP : requestedStrategy;
+        String delegateResponse;
+        if (preparedAuthSession != null && STRATEGY_CLIENT.equals(effectiveStrategy)) {
+            delegateResponse = scanJobQueueService.queueClientSpiderScan(
+                    targetUrl, null, preparedAuthSession.contextName(), preparedAuthSession.zapUserName(), idempotencyKey
+            );
+        } else if (preparedAuthSession != null) {
+            delegateResponse = scanJobQueueService.queueSpiderScanAsUser(
+                    preparedAuthSession.contextId(),
+                    preparedAuthSession.userId(),
+                    targetUrl,
+                    null,
+                    "true",
+                    "false",
+                    idempotencyKey
+            );
+            effectiveStrategy = STRATEGY_HTTP;
+        } else {
+            delegateResponse = switch (effectiveStrategy) {
+                case STRATEGY_CLIENT -> scanJobQueueService.queueClientSpiderScan(targetUrl, null, idempotencyKey);
+                case STRATEGY_BROWSER -> scanJobQueueService.queueAjaxSpiderScan(targetUrl, idempotencyKey);
+                default -> scanJobQueueService.queueSpiderScan(targetUrl, idempotencyKey);
+            };
+        }
+        String note = queuedCrawlNote(requestedStrategy, effectiveStrategy, preparedAuthSession);
+        return startedOperation(
+                OperationKind.CRAWL,
+                GuidedExecutionModeResolver.ExecutionMode.QUEUE,
+                effectiveStrategy,
+                extractValueByPrefix(delegateResponse, JOB_ID_PREFIX),
+                delegateResponse,
+                note,
+                preparedAuthSession
+        );
+    }
+
+    private String queuedCrawlNote(String requestedStrategy,
+                                   String effectiveStrategy,
+                                   PreparedAuthSession preparedAuthSession) {
+        if (preparedAuthSession == null) {
+            return STRATEGY_AUTO.equals(requestedStrategy) ? AUTO_QUEUE_HTTP_NOTE : null;
+        }
+        if (STRATEGY_CLIENT.equals(effectiveStrategy)) {
+            return "Authenticated guided crawl applied the prepared browser session via ZAP context/user routing.";
+        }
+        return "Authenticated guided crawl applied the prepared form-login session via ZAP context/user routing.";
+    }
+
+    private StartedOperation startAttackOperation(String targetUrl,
+                                                  String recurse,
+                                                  String policy,
+                                                  String idempotencyKey,
+                                                  PreparedAuthSession preparedAuthSession) {
+        String delegateResponse = preparedAuthSession != null
+                ? scanJobQueueService.queueActiveScanAsUser(
+                        preparedAuthSession.contextId(),
+                        preparedAuthSession.userId(),
+                        targetUrl,
+                        recurse,
+                        policy,
+                        idempotencyKey
+                )
+                : scanJobQueueService.queueActiveScan(targetUrl, recurse, policy, idempotencyKey);
+        return startedOperation(
+                OperationKind.ATTACK,
+                GuidedExecutionModeResolver.ExecutionMode.QUEUE,
+                STRATEGY_ACTIVE,
+                extractValueByPrefix(delegateResponse, JOB_ID_PREFIX),
+                delegateResponse,
+                preparedAuthSession != null
+                        ? "Authenticated guided attack applied the prepared form-login session via ZAP context/user routing."
+                        : null,
+                preparedAuthSession
+        );
+    }
+
+    private StartedOperation startedOperation(OperationKind kind,
+                                              GuidedExecutionModeResolver.ExecutionMode executionMode,
+                                              String strategy,
+                                              String backendId,
+                                              String delegateResponse,
+                                              String note,
+                                              PreparedAuthSession preparedAuthSession) {
+        return new StartedOperation(
+                new GuidedOperation(kind, executionMode, strategy, backendId),
+                delegateResponse,
+                note,
+                preparedAuthSession
+        );
+    }
+
+    private String getOperationStatus(GuidedOperation operation) {
+        return switch (operation.kind()) {
+            case CRAWL -> switch (operation.executionMode()) {
+                case QUEUE -> scanJobQueueService.getScanJobStatus(operation.backendId());
+                case DIRECT -> switch (operation.strategy()) {
+                    case STRATEGY_CLIENT -> clientSpiderService.getClientSpiderStatus(operation.backendId());
+                    case STRATEGY_BROWSER -> ajaxSpiderService.getAjaxSpiderStatus();
+                    default -> spiderScanService.getSpiderScanStatus(operation.backendId());
+                };
+            };
+            case ATTACK -> operation.executionMode() == GuidedExecutionModeResolver.ExecutionMode.QUEUE
+                    ? scanJobQueueService.getScanJobStatus(operation.backendId())
+                    : activeScanService.getActiveScanStatus(operation.backendId());
+        };
+    }
+
+    private String stopOperation(GuidedOperation operation) {
+        return switch (operation.kind()) {
+            case CRAWL -> switch (operation.executionMode()) {
+                case QUEUE -> scanJobQueueService.cancelScanJob(operation.backendId());
+                case DIRECT -> switch (operation.strategy()) {
+                    case STRATEGY_CLIENT -> clientSpiderService.stopClientSpider(operation.backendId());
+                    case STRATEGY_BROWSER -> ajaxSpiderService.stopAjaxSpider();
+                    default -> spiderScanService.stopSpiderScan(operation.backendId());
+                };
+            };
+            case ATTACK -> operation.executionMode() == GuidedExecutionModeResolver.ExecutionMode.QUEUE
+                    ? scanJobQueueService.cancelScanJob(operation.backendId())
+                    : activeScanService.stopActiveScan(operation.backendId());
+        };
+    }
+
+    private String formatStartedOperation(String targetUrl, StartedOperation started) {
+        String operationId = encodeOperation(started.operation());
+        StringBuilder output = new StringBuilder();
+        boolean nativeStartConfirmed = inferOperationState(started.delegateResponse()) == OperationState.RUNNING;
+        output.append("Guided ").append(started.operation().kind().wireValue())
+                .append(nativeStartConfirmed ? " started.\n" : " accepted.\n")
+                .append("Operation ID: ").append(operationId).append('\n')
+                .append("Execution Mode: ").append(formatExecutionMode(started.operation().executionMode())).append('\n')
+                .append("Strategy: ").append(started.operation().strategy()).append('\n')
+                .append("Target URL: ").append(targetUrl).append('\n');
+        if (started.preparedAuthSession() != null) {
+            output.append("Authenticated Session: ").append(started.preparedAuthSession().sessionId()).append('\n')
+                    .append("Context ID: ").append(started.preparedAuthSession().contextId()).append('\n')
+                    .append("User ID: ").append(started.preparedAuthSession().userId()).append('\n');
+        }
+        if (hasText(started.note())) {
+            output.append("Note: ").append(started.note().trim()).append('\n');
+        }
+        output.append(nextActionsForStartedOperation(started, operationId))
+                .append('\n')
+                .append(sanitizeDelegateResponse(started.delegateResponse()));
+        return output.toString();
+    }
+
+    private String formatStatusMessage(String operationId, OperationKind expectedKind) {
+        GuidedOperation operation = decodeOperation(operationId, expectedKind);
+        return formatLifecycleMessage("status", operationId, operation, getOperationStatus(operation));
+    }
+
+    private String formatStopMessage(String operationId, OperationKind expectedKind) {
+        GuidedOperation operation = decodeOperation(operationId, expectedKind);
+        return formatLifecycleMessage("stop requested", operationId, operation, stopOperation(operation));
+    }
+
+    private String formatLifecycleMessage(String action,
+                                          String operationId,
+                                          GuidedOperation operation,
+                                          String delegateResponse) {
+        return new StringBuilder()
+                .append("Guided ").append(operation.kind().wireValue()).append(' ').append(action).append(".\n")
+                .append("Operation ID: ").append(operationId).append('\n')
+                .append("Execution Mode: ").append(formatExecutionMode(operation.executionMode())).append('\n')
+                .append("Strategy: ").append(operation.strategy()).append('\n')
+                .append('\n')
+                .append(nextActionsForLifecycle(action, operation, operationId, delegateResponse))
+                .append('\n')
+                .append(sanitizeDelegateResponse(delegateResponse))
+                .toString();
+    }
+
+    private String nextActionsForStartedOperation(StartedOperation started, String operationId) {
+        GuidedOperation operation = started.operation();
+        String heldGuidance = nextActionsForUnsettledQueueOperation(operation, operationId, started.delegateResponse());
+        if (heldGuidance != null) return heldGuidance;
+        String statusTool = statusToolFor(operation.kind());
+        String stopTool = stopToolFor(operation.kind());
+        StringBuilder output = new StringBuilder(NEXT_ACTIONS_HEADER).append('\n');
+        appendAction(output, statusTool, "- Poll: call " + statusTool + " with this operation ID: " + operationId);
+        appendAction(output, stopTool, "- Stop if needed: call " + stopTool + " with the same operation ID.");
+        if (started.preparedAuthSession() != null
+                && started.preparedAuthSession().authKind() == AuthBootstrapKind.BROWSER) {
+            appendAction(output, "zap_passive_scan_wait", "- When crawl stops: call zap_passive_scan_wait, then review crawl coverage.");
+            output.append("- This browser session supports Client Spider only. Authenticated active testing currently requires a prepared form-login session.\n");
+        } else if (operation.kind() == OperationKind.CRAWL
+                && (STRATEGY_CLIENT.equals(operation.strategy()) || STRATEGY_BROWSER.equals(operation.strategy()))) {
+            appendAction(output, "zap_passive_scan_wait", "- When crawl stops: call zap_passive_scan_wait, then review crawl coverage.");
+            appendAction(output, "zap_attack_start", "- After the crawl stops and coverage is reviewed: call zap_attack_start only if active testing is approved.");
+        } else if (operation.kind() == OperationKind.CRAWL) {
+            appendAction(output, "zap_attack_start", "- When crawl is complete: call zap_attack_start if active testing is approved.");
+            appendAction(output, "zap_passive_scan_wait", "- Crawl-only path: when the crawl is complete, call zap_passive_scan_wait before reviewing available evidence.");
+        } else {
+            appendAction(output, "zap_passive_scan_wait", "- When attack is complete: call zap_passive_scan_wait before reviewing available evidence.");
+        }
+        String completionPrerequisite = operation.kind() == OperationKind.CRAWL
+                ? (STRATEGY_CLIENT.equals(operation.strategy()) || STRATEGY_BROWSER.equals(operation.strategy())
+                        ? "the crawl has stopped" : "the crawl is complete")
+                : "the attack is complete";
+        appendEvidenceActions(output, completionPrerequisite + " and passive analysis has drained");
+        return finishNextActions(output);
+    }
+
+    private String nextActionsForLifecycle(String action,
+                                           GuidedOperation operation,
+                                           String operationId,
+                                           String delegateResponse) {
+        String heldGuidance = nextActionsForUnsettledQueueOperation(operation, operationId, delegateResponse);
+        if (heldGuidance != null) return heldGuidance;
+        if ("stop requested".equals(action)) {
+            if (operation.executionMode() == GuidedExecutionModeResolver.ExecutionMode.QUEUE
+                    && inferOperationState(delegateResponse) == OperationState.UNKNOWN) {
+                return nextActionsForUnconfirmedQueueStop(operation, operationId);
+            }
+            return nextActionsForStoppedOperation(operation, operationId);
+        }
+        if (!"status".equals(action)) {
+            return "";
+        }
+        return nextActionsForStatus(operation, operationId, delegateResponse);
+    }
+
+    private boolean requiresQueueOutcomeGuidance(OperationState state) {
+        return state == OperationState.STARTING || state == OperationState.START_OUTCOME_UNKNOWN
+                || state == OperationState.CANCELLATION_PENDING;
+    }
+
+    private String nextActionsForUnsettledQueueOperation(GuidedOperation operation, String operationId,
+                                                        String delegateResponse) {
+        if (operation.executionMode() != GuidedExecutionModeResolver.ExecutionMode.QUEUE) return null;
+        OperationState state = inferOperationState(delegateResponse);
+        if (!requiresQueueOutcomeGuidance(state)) return null;
+        StringBuilder output = new StringBuilder(NEXT_ACTIONS_HEADER).append('\n');
+        if (state == OperationState.START_OUTCOME_UNKNOWN) {
+            output.append("- Native launch outcome is unknown; capacity remains held. An authorized operator must reconcile this operation.\n")
+                    .append("- Do not submit a replacement or retry this operation while ownership is unresolved.\n");
+        } else if (state == OperationState.STARTING) {
+            output.append("- Native dispatch is in progress. Keep this operation ID; do not submit a replacement.\n");
+        } else {
+            output.append("- Cancellation is not confirmed. Do not submit a replacement until termination is confirmed or an authorized operator reconciles ownership.\n");
+        }
+        String statusTool = statusToolFor(operation.kind());
+        appendAction(output, statusTool, "- Check this same operation: call " + statusTool + " with operation ID: " + operationId);
+        return finishNextActions(output);
+    }
+
+    private String nextActionsForUnconfirmedQueueStop(GuidedOperation operation, String operationId) {
+        StringBuilder output = new StringBuilder(NEXT_ACTIONS_HEADER).append('\n');
+        output.append("- Confirm termination before submitting a replacement; a stop request alone does not confirm native work has ended.\n");
+        String statusTool = statusToolFor(operation.kind());
+        appendAction(output, statusTool, "- Check this same operation: call " + statusTool + " with operation ID: " + operationId);
+        return finishNextActions(output);
+    }
+
+    private String nextActionsForStatus(GuidedOperation operation, String operationId, String delegateResponse) {
+        OperationState state = inferOperationState(delegateResponse);
+        if (state == OperationState.SUCCEEDED && operation.kind() == OperationKind.CRAWL
+                && (STRATEGY_BROWSER.equals(operation.strategy()) || STRATEGY_CLIENT.equals(operation.strategy()))) {
+            // Browser crawler APIs confirm termination, not successful coverage.
+            state = OperationState.STOPPED;
+        }
+        String statusTool = statusToolFor(operation.kind());
+        String stopTool = stopToolFor(operation.kind());
+        StringBuilder output = new StringBuilder(NEXT_ACTIONS_HEADER).append('\n');
+        return switch (state) {
+            case SUCCEEDED -> {
+                if (operation.kind() == OperationKind.CRAWL) {
+                    appendAction(output, "zap_attack_start", "- Continue security testing: call zap_attack_start for the same target if active testing is approved.");
+                    appendAction(output, "zap_passive_scan_wait", "- Crawl-only path: call zap_passive_scan_wait before reviewing available evidence.");
+                } else {
+                    appendAction(output, "zap_passive_scan_wait", "- Settle passive analysis: call zap_passive_scan_wait.");
+                }
+                appendEvidenceActions(output);
+                yield finishNextActions(output);
+            }
+            case STOPPED -> {
+                output.append("- The browser crawl is no longer running; successful completion is unconfirmed.\n");
+                appendAction(output, "zap_passive_scan_wait", "- Call zap_passive_scan_wait before reviewing available findings; check crawl coverage before continuing security testing.");
+                appendEvidenceActions(output);
+                yield finishNextActions(output);
+            }
+            case FAILED, CANCELLED -> {
+                output.append("- Review the status/error above before trusting this scan as evidence.\n")
+                        .append("- Retry only after fixing target reachability, auth, policy, or scan configuration.");
+                yield output.toString();
+            }
+            case RUNNING, QUEUED, UNKNOWN, STARTING, START_OUTCOME_UNKNOWN, CANCELLATION_PENDING -> {
+                appendAction(output, statusTool, "- Continue: call " + statusTool + " with this operation ID until the scan is complete: " + operationId);
+                appendAction(output, stopTool, "- Stop if needed: call " + stopTool + " with the same operation ID.");
+                yield finishNextActions(output);
+            }
+        };
+    }
+
+    private String nextActionsForStoppedOperation(GuidedOperation operation, String operationId) {
+        StringBuilder output = new StringBuilder(NEXT_ACTIONS_HEADER).append('\n');
+        String statusTool = statusToolFor(operation.kind());
+        appendAction(output, statusTool, "- Confirm if needed: call " + statusTool + " with this operation ID: " + operationId);
+        appendAction(output, "zap_" + operation.kind().wireValue() + "_start",
+                "- Start a new guided " + operation.kind().wireValue() + " only after the target and policy are ready.");
+        return finishNextActions(output);
+    }
+
+    private void appendEvidenceActions(StringBuilder output) {
+        appendEvidenceActions(output, "passive analysis has drained");
+    }
+
+    private void appendEvidenceActions(StringBuilder output, String prerequisite) {
+        appendAction(output, "zap_findings_summary", "- Then review: call zap_findings_summary for the same target after " + prerequisite + ".");
+        appendAction(output, "zap_report_generate", "- Report: call zap_report_generate after " + prerequisite + " when you need an artifact.");
+    }
+
+    private void appendAction(StringBuilder output, String toolName, String action) {
+        if (guidedToolActions.canCall(toolName)) {
+            output.append(action).append('\n');
+        }
+    }
+
+    private String finishNextActions(StringBuilder output) {
+        if (output.toString().equals(NEXT_ACTIONS_HEADER + "\n")) {
+            output.append("- No further guided actions are available for this client.");
+        }
+        return output.toString().trim();
+    }
+
+    private OperationState inferOperationState(String delegateResponse) {
+        if (!hasText(delegateResponse)) {
+            return OperationState.UNKNOWN;
+        }
+        String normalized = delegateResponse.toLowerCase(Locale.ROOT);
+        if (normalized.contains("status: start_outcome_unknown") || normalized.contains("status=start_outcome_unknown")) {
+            return OperationState.START_OUTCOME_UNKNOWN;
+        }
+        if (normalized.contains("cancellation pending") || normalized.contains("cancellation unconfirmed")) {
+            return OperationState.CANCELLATION_PENDING;
+        }
+        if (normalized.contains("status: starting") || normalized.contains("status=starting")) {
+            return OperationState.STARTING;
+        }
+        if (normalized.contains("status: cancelled")
+                || normalized.contains("status: canceled")
+                || normalized.contains("status=cancelled")
+                || normalized.contains("status=canceled")) {
+            return OperationState.CANCELLED;
+        }
+        if (normalized.contains("status: failed")
+                || normalized.contains("status=failed")
+                || normalized.contains("dead letter: true")
+                || normalized.contains("dead-letter=true")) {
+            return OperationState.FAILED;
+        }
+        if (normalized.contains("ajax spider status: stopped")) {
+            return OperationState.STOPPED;
+        }
+        if (normalized.contains("status: succeeded")
+                || normalized.contains("status=succeeded")
+                || normalized.contains("completed: yes")
+                || normalized.contains("progress: 100%")
+                || normalized.contains("scan completed.")) {
+            return OperationState.SUCCEEDED;
+        }
+        if (normalized.contains("status: queued") || normalized.contains("status=queued")) {
+            return OperationState.QUEUED;
+        }
+        if (normalized.contains("status: running")
+                || normalized.contains("status=running")
+                || normalized.contains("scan is in progress")
+                || normalized.contains("completed: no")) {
+            return OperationState.RUNNING;
+        }
+        return OperationState.UNKNOWN;
+    }
+
+    private String sanitizeDelegateResponse(String delegateResponse) {
+        if (!hasText(delegateResponse)) {
+            return "";
+        }
+        StringBuilder sanitized = new StringBuilder();
+        for (String line : delegateResponse.split("\\R")) {
+            if (isDelegateGuidanceLine(line)) {
+                continue;
+            }
+            if (!sanitized.isEmpty()) {
+                sanitized.append('\n');
+            }
+            sanitized.append(line);
+        }
+        return sanitized.toString().trim();
+    }
+
+    private boolean isDelegateGuidanceLine(String line) {
+        if (!hasText(line)) {
+            return false;
+        }
+        String normalized = line.trim().toLowerCase(Locale.ROOT);
+        return normalized.startsWith("use 'zap_")
+                || normalized.startsWith("run 'zap_")
+                || normalized.startsWith("for durable")
+                || normalized.startsWith("for retryable")
+                || normalized.contains(" prefer 'zap_queue_");
+    }
+
+    private String statusToolFor(OperationKind kind) {
+        return "zap_" + kind.wireValue() + "_status";
+    }
+
+    private String stopToolFor(OperationKind kind) {
+        return "zap_" + kind.wireValue() + "_stop";
+    }
+
+    private String normalizeCrawlStrategy(String strategy) {
+        if (!hasText(strategy)) {
+            return STRATEGY_AUTO;
+        }
+        String normalized = strategy.trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case STRATEGY_AUTO, STRATEGY_HTTP, STRATEGY_BROWSER, STRATEGY_CLIENT -> normalized;
+            default -> throw new IllegalArgumentException("strategy must be one of: auto, http, browser, client");
+        };
+    }
+
+    private String trimToNull(String value) {
+        return hasText(value) ? value.trim() : null;
+    }
+
+    private String formatExecutionMode(GuidedExecutionModeResolver.ExecutionMode executionMode) {
+        return executionMode.name().toLowerCase(Locale.ROOT);
+    }
+
+    private String requireText(String value, String fieldName) {
+        if (!hasText(value)) {
+            throw new IllegalArgumentException(fieldName + " cannot be null or blank");
+        }
+        return value.trim();
+    }
+
+    private boolean hasText(String value) {
+        return value != null && !value.trim().isEmpty();
+    }
+
+    private String extractValueByPrefix(String response, String prefix) {
+        if (!hasText(response)) {
+            throw new IllegalStateException("Tool response was blank while trying to extract " + prefix);
+        }
+        for (String line : response.split("\\R")) {
+            if (line.startsWith(prefix)) {
+                String value = line.substring(prefix.length()).trim();
+                if (!value.isEmpty()) {
+                    return value;
+                }
+                break;
+            }
+        }
+        throw new IllegalStateException("Unable to extract value with prefix '" + prefix + "' from response: " + response);
+    }
+
+    private String encodeOperation(GuidedOperation operation) {
+        String payload = String.join("|",
+                "v2",
+                encodePart(operation.kind().wireValue()),
+                encodePart(formatExecutionMode(operation.executionMode())),
+                encodePart(operation.strategy()),
+                encodePart(operation.backendId()),
+                encodePart(currentClientId()),
+                encodePart(currentWorkspaceId()),
+                encodePart(UUID.randomUUID().toString()));
+        String signedPayload = payload + "|" + signPayload(payload);
+        return PREFIX_OPERATION_ID + Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString(signedPayload.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private GuidedOperation decodeOperation(String operationId, OperationKind expectedKind) {
+        String normalizedOperationId = requireText(operationId, "operationId");
+        if (!normalizedOperationId.startsWith(PREFIX_OPERATION_ID)) {
+            throw new IllegalArgumentException("operationId is not a guided operation ID");
+        }
+        String payload;
+        try {
+            payload = new String(
+                    Base64.getUrlDecoder().decode(normalizedOperationId.substring(PREFIX_OPERATION_ID.length())),
+                    StandardCharsets.UTF_8
+            );
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("operationId is malformed", e);
+        }
+
+        String[] parts = payload.split("\\|", -1);
+        if (parts.length != 9 || !"v2".equals(parts[0])) {
+            throw new IllegalArgumentException("operationId has an unsupported format");
+        }
+        String signedPayload = String.join("|",
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+                parts[4],
+                parts[5],
+                parts[6],
+                parts[7]
+        );
+        if (!MessageDigest.isEqual(
+                signPayload(signedPayload).getBytes(StandardCharsets.UTF_8),
+                parts[8].getBytes(StandardCharsets.UTF_8))) {
+            throw new IllegalArgumentException("operationId signature is invalid");
+        }
+
+        String operationClientId = decodePart(parts[5], "clientId");
+        String operationWorkspaceId = decodePart(parts[6], "workspaceId");
+        if (!operationClientId.equals(currentClientId()) || !operationWorkspaceId.equals(currentWorkspaceId())) {
+            throw new IllegalArgumentException("operationId is not visible to the current requester");
+        }
+
+        GuidedOperation operation = new GuidedOperation(
+                OperationKind.fromWireValue(decodePart(parts[1], "operationKind")),
+                parseExecutionMode(decodePart(parts[2], "executionMode")),
+                decodePart(parts[3], "strategy"),
+                decodePart(parts[4], "backendId")
+        );
+        if (operation.kind() != expectedKind) {
+            throw new IllegalArgumentException("operationId belongs to a different guided flow");
+        }
+        return operation;
+    }
+
+    private String encodePart(String value) {
+        return Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString((value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String decodePart(String value, String fieldName) {
+        try {
+            return new String(Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("operationId has malformed " + fieldName, e);
+        }
+    }
+
+    private String signPayload(String payload) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(operationSigningSecretBytes(), "HmacSHA256"));
+            return Base64.getUrlEncoder()
+                    .withoutPadding()
+                    .encodeToString(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("Unable to sign guided operation ID", e);
+        }
+    }
+
+    private byte[] operationSigningSecretBytes() {
+        if (hasText(operationSigningSecret)) {
+            return operationSigningSecret.trim().getBytes(StandardCharsets.UTF_8);
+        }
+        return PROCESS_OPERATION_SIGNING_SECRET;
+    }
+
+    private String currentClientId() {
+        if (clientWorkspaceResolver == null) {
+            return "anonymous";
+        }
+        String clientId = clientWorkspaceResolver.resolveCurrentClientId();
+        return hasText(clientId) ? clientId.trim() : "anonymous";
+    }
+
+    private String currentWorkspaceId() {
+        if (clientWorkspaceResolver == null) {
+            return "default-workspace";
+        }
+        String workspaceId = clientWorkspaceResolver.resolveCurrentWorkspaceId();
+        return hasText(workspaceId) ? workspaceId.trim() : "default-workspace";
+    }
+
+    private GuidedExecutionModeResolver.ExecutionMode parseExecutionMode(String executionMode) {
+        try {
+            return GuidedExecutionModeResolver.ExecutionMode.valueOf(
+                    requireText(executionMode, "executionMode").toUpperCase(Locale.ROOT)
+            );
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("operationId has an unsupported execution mode", e);
+        }
+    }
+
+    private PreparedAuthSession resolvePreparedSession(String authSessionId, String targetUrl,
+                                                      AuthBootstrapKind requiredKind) {
+        if (!hasText(authSessionId)) {
+            return null;
+        }
+        PreparedAuthSession session = guidedAuthSessionService.getPreparedSession(authSessionId);
+        if (session.authKind() != requiredKind) {
+            if (requiredKind == AuthBootstrapKind.BROWSER) {
+                throw new IllegalArgumentException(
+                        "strategy=client requires a prepared browser authentication session. Use a profile with kind=browser."
+                );
+            }
+            if (session.authKind() == AuthBootstrapKind.BROWSER) {
+                throw new IllegalArgumentException("Prepared browser authentication sessions currently require strategy=client.");
+            }
+            throw new IllegalArgumentException(
+                    "This operation currently supports form-login sessions only. Re-prepare a form session or omit authSessionId."
+            );
+        }
+        if (!session.engineBound() || !hasText(session.contextId()) || !hasText(session.userId())) {
+            throw new IllegalArgumentException(
+                    "Prepared auth session is not bound to a reusable ZAP context/user. Re-run zap_auth_session_prepare."
+            );
+        }
+        if (session.authorizedOrigin() == null) {
+            throw new IllegalArgumentException(
+                    "Prepared auth session has no authorized profile origin. Re-run zap_auth_session_prepare."
+            );
+        }
+        if (!session.authorizedOrigin().matches(session.target().baseUrl())
+                || !session.authorizedOrigin().matches(targetUrl)) {
+            throw new IllegalArgumentException(
+                    "authSessionId is not authorized for the requested targetUrl origin. Reuse the session only on its auth profile origin."
+            );
+        }
+        if (requiredKind == AuthBootstrapKind.BROWSER
+                && (!hasText(session.contextName()) || !hasText(session.zapUserName()))) {
+            throw new IllegalArgumentException(
+                    "Prepared browser session is missing ZAP context/user names. Re-run zap_auth_session_prepare."
+            );
+        }
+        return session;
+    }
+
+    private record GuidedOperation(
+            OperationKind kind,
+            GuidedExecutionModeResolver.ExecutionMode executionMode,
+            String strategy,
+            String backendId
+    ) {
+    }
+
+    private record StartedOperation(
+            GuidedOperation operation,
+            String delegateResponse,
+            String note,
+            PreparedAuthSession preparedAuthSession
+    ) {
+    }
+
+    private enum OperationKind {
+        CRAWL("crawl"),
+        ATTACK("attack");
+
+        private final String wireValue;
+
+        OperationKind(String wireValue) {
+            this.wireValue = wireValue;
+        }
+
+        private String wireValue() {
+            return wireValue;
+        }
+
+        private static OperationKind fromWireValue(String wireValue) {
+            String normalized = wireValue == null ? "" : wireValue.trim().toLowerCase(Locale.ROOT);
+            return switch (normalized) {
+                case "crawl" -> CRAWL;
+                case "attack" -> ATTACK;
+                default -> throw new IllegalArgumentException("operationId belongs to an unsupported guided flow");
+            };
+        }
+    }
+
+    private enum OperationState {
+        QUEUED,
+        STARTING,
+        START_OUTCOME_UNKNOWN,
+        CANCELLATION_PENDING,
+        RUNNING,
+        SUCCEEDED,
+        FAILED,
+        CANCELLED,
+        STOPPED,
+        UNKNOWN
+    }
+}

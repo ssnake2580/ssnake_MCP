@@ -1,0 +1,136 @@
+---
+title: root@localhost:~
+description: Initialising MCP ZAP Server Protocol...
+template: splash
+editUrl: false
+---
+
+<div class="mission-terminal">
+  <pre>{`  __  __  _____ _____    _____  __  _____
+ |  \\/  |/ ____|  __ \\  |___  |/  \\|  __ \\
+ | \\  / | |    | |__) |    / // /\\ \\ |__) |
+ | |\\/| | |    |  ___/    / // /__\\ \\  ___/
+ | |  | | |____| |       / // /____\\ \\ |
+ |_|  |_|\\_____|_|      /_//_/      \\_\\_|
+
+ > SYSTEM READY.
+ > CONNECTING TO MCP PROTOCOL... [OK]
+ > INITIALIZING ZAP CORE... [OK]`}</pre>
+
+  # Welcome, Friend.
+
+  <p class="mission-lead">
+    You have accessed the <strong>MCP ZAP Server</strong> documentation. This system lets AI agents and
+    operators drive ZAP through MCP for security testing and reporting.
+  </p>
+
+  <section class="mission-entry" aria-label="Start here">
+    <p>Start a local scanner, connect your AI client and get an HTML report from a bundled demo target.</p>
+    <div class="mission-actions">
+      <a class="mission-cta" href="./getting-started/self-serve-first-run/">
+        <span class="mission-cta-prompt" aria-hidden="true">&gt;</span>
+        <span>Get your first report</span>
+      </a>
+      <a href="./demo.html">Watch the demo</a>
+    </div>
+  </section>
+
+  <div class="telemetry-strip">
+    <div class="telemetry-chip">
+      <span>Protocol</span>
+      <strong>MCP + ZAP</strong>
+    </div>
+    <div class="telemetry-chip">
+      <span>Coverage</span>
+      <strong>Guided Scans and Evidence</strong>
+    </div>
+    <div class="telemetry-chip">
+      <span>Search Index</span>
+      <strong>Pagefind Online</strong>
+    </div>
+  </div>
+
+  <p>The v0.17.1 upgrade guide covers neutral findings responses, authoritative explicit target denies, permission-aware guidance and local client setup options. Verify the matching release, images and downloads before installing this source version; v0.17.0 was published without its Desktop downloads and its image-release workflow did not complete. Use a version with verified available images until the matching distribution is ready. Read the <a href="./releases/0.17.1/">release and upgrade guide</a> before changing an existing installation.</p>
+
+  <p>Ask Codex to handle your local scanner setup. <a href="./getting-started/agent-guided-setup/#codex-local-installation">Install MCP ZAP Connect locally</a>, then ask it to check prerequisites, start the Docker stack, configure your private MCP connection and verify status. The skill can help install missing prerequisites with your approval, then recheck and continue setup. Scans are a separate request.</p>
+
+  <span class="section-label">./execute_mission.sh</span>
+
+  <div class="mission-grid">
+    <a class="mission-card" href="./getting-started/self-serve-first-run/">
+      <h3>&gt; [01] SELF_SERVE_FIRST_RUN</h3>
+      <p>Choose agent-guided setup or Docker commands, connect your MCP client, and generate your first scan report.</p>
+    </a>
+    <a class="mission-card" href="./getting-started/tool-surfaces/">
+      <h3>&gt; [02] GUIDED_TOOLS</h3>
+      <p>Use the guided tool catalog and migrate older raw-tool workflows.</p>
+    </a>
+    <a class="mission-card" href="./scanning/scan-execution-modes/">
+      <h3>&gt; [03] SCAN_EXECUTION</h3>
+      <p>Understand guided queue admission, storage and scan lifecycle controls.</p>
+    </a>
+    <a class="mission-card" href="./getting-started/tool-scope-authorization/">
+      <h3>&gt; [04] TOOL_SCOPE_AUTHZ</h3>
+      <p>Control who can discover and invoke each MCP action.</p>
+    </a>
+    <a class="mission-card" href="./operations/observability/">
+      <h3>&gt; [05] OBSERVABILITY</h3>
+      <p>Trace requests with correlation IDs, audit events, and bounded metrics.</p>
+    </a>
+    <a class="mission-card" href="./scanning/seeded-api-gate-playbook/">
+      <h3>&gt; [06] SEEDED_API_GATE</h3>
+      <p>Adopt seeded API traffic, reviewed baselines, and enforcement without turning CI into noise.</p>
+    </a>
+    <a class="mission-card" href="./extensions/extension-api-release-policy/">
+      <h3>&gt; [07] EXTENSION_POLICY</h3>
+      <p>See what must be true before the extension API becomes a public compatibility promise.</p>
+    </a>
+    <a class="mission-card" href="./releases/0.17.1/">
+      <h3>&gt; [v0.17.1] RELEASE_AND_UPGRADE</h3>
+      <p>Review explicit target denies, findings semantics, client defaults and publication requirements before upgrading.</p>
+    </a>
+    <a class="mission-card" href="./security-modes/#registered-api-keys-in-v0140">
+      <h3>&gt; [v0.14.0] SECURITY_UPGRADE</h3>
+      <p>Review registered API keys, JWT recovery, stricter scan inputs, and the release notes before upgrading.</p>
+    </a>
+    <a class="mission-card" href="./scanning/client-spider/">
+      <h3>&gt; [v0.13.0] CLIENT_SPIDER</h3>
+      <p>In v0.13.0, explore JavaScript apps, verify browser login, and collect findings in direct or queued workflows.</p>
+    </a>
+    <a class="mission-card" href="./getting-started/form-login-target-authentication/">
+      <h3>&gt; [OPTIONAL] TARGET_FORM_LOGIN</h3>
+      <p>Only when the authorized target requires it: let ZAP log in without exposing the password to your AI client.</p>
+    </a>
+  </div>
+
+  <span class="section-label">tail -f /var/log/capabilities.txt</span>
+
+  <ul class="capability-list">
+    <li><strong>Guided_Flows</strong>: Queue crawl and attack operations with in-memory or PostgreSQL storage, then track them through guided status and stop tools.</li>
+    <li><strong>Findings_Evidence</strong>: Read target-scoped findings, export snapshots, compare baselines and retrieve reports.</li>
+    <li><strong>Operational_Guardrails</strong>: Enforce scopes, rate limits, correlation IDs, queue observability, and scan-history evidence.</li>
+  </ul>
+
+  <span class="section-label">./contact_support.sh</span>
+
+  <div class="support-box">
+    <p><strong>Target:</strong> Teams deploying the OSS project</p>
+    <p>
+      <code>mcp-zap-server</code> is the Apache-2.0-licensed open-source core. Private or
+      enterprise features can be built as separate extensions without shipping
+      enterprise implementation code in this repository.
+    </p>
+    <p>
+      <strong>Agentic Lab</strong> provides optional paid support for production
+      adoption, SSO and OAuth2 setup, CI/CD quality gates, and compliance reporting.
+    </p>
+    <p>
+      If this project saves you time or becomes part of your security workflow,
+      you can <a href="https://github.com/sponsors/dtkmn">sponsor the maintainer</a>
+      to support ongoing maintenance.
+    </p>
+    <a class="support-link" href="mailto:agentic.lab.au@gmail.com">&gt; OPEN_COMMUNICATION_CHANNEL</a>
+  </div>
+
+  <p class="home-status">_END OF LINE_</p>
+</div>

@@ -1,0 +1,276 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        // Build plugins resolve Jackson separately from the application's runtime BOM.
+        classpath platform('tools.jackson:jackson-bom:3.1.7')
+        classpath platform('com.fasterxml.jackson:jackson-bom:2.22.3')
+    }
+}
+
+plugins {
+    id 'java'
+    id 'jacoco'
+    id 'maven-publish'
+    id 'org.sonarqube' version '7.5.0.8588'
+    id 'org.springframework.boot' version '4.1.1'
+    id 'io.spring.dependency-management' version '1.1.7'
+    id 'org.cyclonedx.bom' version '3.4.1'
+}
+
+group = 'mcp.server.zap'
+version = '0.17.1'
+def extensionApiPublicationVersion = version.toString()
+
+springBoot {
+    buildInfo {
+        excludes = ['time', 'group', 'name', 'artifact']
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+sourceSets {
+    sampleExtension {
+        java {
+            srcDir 'examples/extensions/policy-metadata-extension/src/main/java'
+        }
+        resources {
+            srcDirs = ['examples/extensions/policy-metadata-extension/src/main/resources']
+        }
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+    sampleExtensionCompileOnly {
+        extendsFrom compileOnly
+    }
+    sampleExtensionAnnotationProcessor {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    set('springAiVersion', "2.0.1")
+    set('commonsCompressVersion', "1.28.0")
+    set('jackson-bom.version', "3.2.3")
+    set('netty.version', '4.2.18.Final')
+    set('postgresql.version', '42.7.14')
+    set('logback.version', '1.6.4')
+}
+
+dependencies {
+    implementation "io.github.dtkmn:mcp-gateway-core:${gatewayCoreVersion}"
+    implementation "io.github.dtkmn:mcp-gateway-spring-webflux:${gatewayCoreVersion}"
+    implementation 'org.springframework.ai:spring-ai-starter-mcp-server-webflux'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-oauth2-resource-server'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework:spring-aop'
+    implementation 'org.aspectj:aspectjweaver'
+    implementation 'org.flywaydb:flyway-core'
+    implementation('org.zaproxy:zap-clientapi:1.17.0') {
+        exclude group: 'org.jdom', module: 'jdom'
+    }
+    implementation 'org.apache.httpcomponents.client5:httpclient5'
+    implementation 'org.jdom:jdom2:2.0.6.1'
+    runtimeOnly 'org.flywaydb:flyway-database-postgresql'
+    runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
+    runtimeOnly 'org.postgresql:postgresql'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
+    testImplementation 'org.testcontainers:testcontainers-postgresql'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    constraints {
+        testImplementation("org.apache.commons:commons-compress:${commonsCompressVersion}") {
+            because 'Testcontainers pulls commons-compress onto the test SBOM; keep the test classpath off vulnerable versions.'
+        }
+    }
+
+    sampleExtensionCompileOnly 'org.springframework.boot:spring-boot-autoconfigure'
+    sampleExtensionCompileOnly 'org.springframework:spring-context'
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.ai:spring-ai-bom:${springAiVersion}"
+        // Re-import last so Jackson 3's annotation constraint wins over Boot's Jackson 2 BOM.
+        mavenBom "tools.jackson:jackson-bom:${project.ext['jackson-bom.version']}"
+    }
+}
+
+tasks.register('extensionApiJar', Jar) {
+    group = 'build'
+    description = 'Packages the public extension API contracts without application runtime internals.'
+    dependsOn tasks.named('classes')
+    archiveBaseName = 'mcp-zap-extension-api'
+    archiveClassifier = ''
+    from sourceSets.main.output
+    include 'mcp/server/zap/extension/api/**'
+    manifest {
+        attributes(
+                'MCP-ZAP-Extension-Api-Version': project.version,
+                'MCP-ZAP-Extension-Api-Scope': 'policy,protection,evidence,metadata',
+                'MCP-ZAP-Extension-Api-Compatibility': 'experimental'
+        )
+    }
+}
+
+sourceSets.sampleExtension.compileClasspath += files(tasks.named('extensionApiJar'))
+
+tasks.named('compileSampleExtensionJava') {
+    dependsOn tasks.named('extensionApiJar')
+}
+
+tasks.register('samplePolicyMetadataExtensionJar', Jar) {
+    group = 'build'
+    description = 'Packages the public sample policy metadata extension separately from the gateway runtime.'
+    dependsOn tasks.named('sampleExtensionClasses')
+    archiveClassifier = 'sample-policy-metadata-extension'
+    from sourceSets.sampleExtension.output
+    manifest {
+        attributes(
+                'MCP-ZAP-Extension-Id': 'sample-policy-metadata',
+                'MCP-ZAP-Extension-Name': 'Sample Policy Metadata Extension',
+                'MCP-ZAP-Extension-Depends-On': 'mcp-zap-extension-api',
+                'MCP-ZAP-Extension-Loads-Via': 'spring-auto-configuration'
+        )
+    }
+}
+
+publishing {
+    repositories {
+        maven {
+            name = 'extensionApiPublicPreviewStaging'
+            url = layout.buildDirectory.dir('extension-api-public-preview-publication').get().asFile.toURI()
+        }
+    }
+    publications {
+        extensionApiPublicPreview(MavenPublication) {
+            groupId = 'io.github.dtkmn'
+            artifactId = 'mcp-zap-extension-api'
+            artifact tasks.named('extensionApiJar')
+            pom {
+                name = 'MCP ZAP Extension API'
+                description = 'Experimental public extension contracts for MCP ZAP Server.'
+                withXml {
+                    def root = asNode()
+                    root.dependencyManagement?.each { root.remove(it) }
+                    root.dependencies?.each { root.remove(it) }
+                }
+            }
+        }
+    }
+}
+
+tasks.register('standalonePolicyMetadataExtensionJar', GradleBuild) {
+    group = 'build'
+    description = 'Builds the standalone sample extension against the staged public-preview API publication.'
+    dependsOn project.tasks.named('publishExtensionApiPublicPreviewPublicationToExtensionApiPublicPreviewStagingRepository')
+    dir = file('examples/extensions/standalone-policy-metadata-extension')
+    tasks = ['jar']
+    startParameter.projectProperties = [
+            extensionApiGroup         : 'io.github.dtkmn',
+            extensionApiVersion       : extensionApiPublicationVersion,
+            extensionApiRepositoryUrl : layout.buildDirectory.dir('extension-api-public-preview-publication').get().asFile.absolutePath
+    ]
+}
+
+tasks.register('cleanStandalonePolicyMetadataExtensionOutput', Delete) {
+    group = 'verification'
+    description = 'Removes generated output from the standalone sample extension.'
+    delete file('examples/extensions/standalone-policy-metadata-extension/build')
+    delete file('examples/extensions/standalone-policy-metadata-extension/.gradle')
+}
+
+tasks.named('test') {
+    inputs.files(
+            fileTree('examples/policy-bundles') { include '*.json' }
+    )
+    useJUnitPlatform {
+        excludeTags 'docker'
+    }
+}
+
+tasks.register('dockerTest', Test) {
+    group = 'verification'
+    description = 'Runs the Docker-backed integration tests.'
+    // Optionally test a specific ZAP image tag or digest.
+    def zapTestImage = providers.environmentVariable('ZAP_TEST_IMAGE').orElse('')
+    inputs.property('zapTestImage', zapTestImage)
+    environment 'ZAP_TEST_IMAGE', zapTestImage.get()
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'docker'
+    }
+    shouldRunAfter tasks.named('test')
+}
+
+jacoco {
+    toolVersion = '0.8.15'
+}
+
+tasks.named('jacocoTestReport') {
+    dependsOn tasks.named('test')
+    mustRunAfter tasks.named('dockerTest')
+    // Include Docker coverage when it exists, without starting Docker tests.
+    executionData tasks.named('dockerTest').get()
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+
+sonar {
+    properties {
+        property 'sonar.projectKey', 'dtkmn_mcp-zap-server'
+        property 'sonar.organization', 'dtkmn'
+        property 'sonar.host.url', 'https://sonarcloud.io'
+        // Retain the resources and extension examples indexed by Automatic Analysis.
+        property 'sonar.sources', (sourceSets.main.allSource.srcDirs +
+                sourceSets.sampleExtension.allJava.srcDirs +
+                [file('examples/extensions/standalone-policy-metadata-extension/src/main/java')])
+                .findAll { it.isDirectory() }
+        property 'sonar.java.binaries', sourceSets.main.output.classesDirs +
+                sourceSets.sampleExtension.output.classesDirs +
+                files('examples/extensions/standalone-policy-metadata-extension/build/classes/java/main')
+        property 'sonar.coverage.jacoco.xmlReportPaths',
+                layout.buildDirectory.file('reports/jacoco/test/jacocoTestReport.xml').get().asFile.absolutePath
+    }
+}
+
+tasks.named('sonar') {
+    dependsOn tasks.named('jacocoTestReport')
+    dependsOn tasks.named('sampleExtensionClasses')
+    dependsOn tasks.named('standalonePolicyMetadataExtensionJar')
+}
+
+tasks.named('assemble') {
+    dependsOn tasks.named('extensionApiJar')
+    dependsOn tasks.named('samplePolicyMetadataExtensionJar')
+}
+
+tasks.named('clean') {
+    dependsOn tasks.named('cleanStandalonePolicyMetadataExtensionOutput')
+}

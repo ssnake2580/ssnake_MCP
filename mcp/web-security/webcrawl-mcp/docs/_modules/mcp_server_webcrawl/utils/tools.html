@@ -1,0 +1,301 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../../">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mcp_server_webcrawl.utils.tools &mdash; mcp-server-webcrawl  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            mcp-server-webcrawl
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../guides.html">Setup Guides</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../prompts.html">Prompt Routines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../interactive.html">Interactive Mode</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../modules.html">mcp_server_webcrawl</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">mcp-server-webcrawl</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">Module code</a></li>
+          <li class="breadcrumb-item"><a href="../utils.html">mcp_server_webcrawl.utils</a></li>
+      <li class="breadcrumb-item active">mcp_server_webcrawl.utils.tools</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for mcp_server_webcrawl.utils.tools</h1><div class="highlight"><pre>
+<span></span><span class="kn">from</span> <span class="nn">mcp.types</span> <span class="kn">import</span> <span class="n">Tool</span>
+
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.resources</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">ResourceResultType</span><span class="p">,</span>
+    <span class="n">RESOURCES_FIELDS_BASE</span><span class="p">,</span>
+    <span class="n">RESOURCES_FIELDS_OPTIONS</span><span class="p">,</span>
+    <span class="n">RESOURCES_DEFAULT_SORT_MAPPING</span><span class="p">,</span>
+    <span class="n">RESOURCES_TOOL_NAME</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span> <span class="nn">mcp_server_webcrawl.models.sites</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">SiteResult</span><span class="p">,</span>
+    <span class="n">SITES_FIELDS_DEFAULT</span><span class="p">,</span>
+    <span class="n">SITES_FIELDS_BASE</span><span class="p">,</span>
+    <span class="n">SITES_TOOL_NAME</span><span class="p">,</span>
+<span class="p">)</span>
+
+<div class="viewcode-block" id="get_crawler_tools">
+<a class="viewcode-back" href="../../../mcp_server_webcrawl.utils.html#mcp_server_webcrawl.utils.tools.get_crawler_tools">[docs]</a>
+<span class="k">def</span> <span class="nf">get_crawler_tools</span><span class="p">(</span><span class="n">sites</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SiteResult</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Generate crawler tools based on available sites.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        sites: optional list of site results to include in tool descriptions</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        List of Tool objects for sites and resources</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="c1"># you&#39;d think maybe pass these in, but no, descriptions will also require tweaking</span>
+    <span class="c1"># each crawler having its own peculiarities -- just let the subclass hack this</span>
+    <span class="c1"># into whatever misshapen ball of clay it needs to be</span>
+
+    <span class="n">sites_field_options</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">SITES_FIELDS_DEFAULT</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">SITES_FIELDS_BASE</span><span class="p">))</span>
+    <span class="n">resources_type_options</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">ResourceResultType</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+    <span class="n">resources_sort_options</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">RESOURCES_DEFAULT_SORT_MAPPING</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+    <span class="n">sites_display</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">([</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">s</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> (site: </span><span class="si">{</span><span class="n">s</span><span class="o">.</span><span class="n">id</span><span class="si">}</span><span class="s2">)&quot;</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sites</span><span class="p">])</span> <span class="k">if</span> <span class="n">sites</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">sites_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">id</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sites</span><span class="p">]</span>
+
+    <span class="n">tools</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="n">Tool</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="n">SITES_TOOL_NAME</span><span class="p">,</span>
+            <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Retrieves a list of sites (project websites or crawl directories).&quot;</span><span class="p">,</span>
+            <span class="n">inputSchema</span><span class="o">=</span><span class="p">{</span>
+                <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;object&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;properties&quot;</span><span class="p">:</span> <span class="p">{</span>
+                    <span class="s2">&quot;ids&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;array&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;items&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;integer&quot;</span><span class="p">},</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="s2">&quot;List of project IDs to retrieve. Leave empty for all projects.&quot;</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;fields&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;array&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;items&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;enum&quot;</span><span class="p">:</span> <span class="n">sites_field_options</span>
+                        <span class="p">},</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;List of additional fields to include in the response beyond the defaults &quot;</span>
+                            <span class="s2">&quot;(id, name, type, urls) Empty list means default fields only. Options include created (ISO 8601), &quot;</span>
+                            <span class="s2">&quot;modified (ISO 8601).&quot;</span><span class="p">)</span>
+                    <span class="p">}</span>
+                <span class="p">},</span>
+                <span class="s2">&quot;required&quot;</span><span class="p">:</span> <span class="p">[]</span>
+            <span class="p">},</span>
+        <span class="p">),</span>
+        <span class="n">Tool</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="n">RESOURCES_TOOL_NAME</span><span class="p">,</span>
+            <span class="n">description</span><span class="o">=</span> <span class="p">(</span><span class="s2">&quot;Searches for resources (webpages, images, CSS, JS, etc.) across web crawler projects and &quot;</span>
+                <span class="s2">&quot;retrieves specified fields. &quot;</span>
+                <span class="s2">&quot;Supports boolean queries and field searching, along with site filtering to &quot;</span>
+                <span class="s2">&quot;filter with fine control. &quot;</span>
+                <span class="s2">&quot;To find a site homepage reliably, query type: html AND url: example.com (crawled domain) with sort=&#39;+url&#39; and a LIMIT of 1. &quot;</span>
+                <span class="s2">&quot;This pattern works consistently across all crawlers.&quot;</span>
+                <span class="s2">&quot;Most sites indexed by this tool will be small to moderately sized websites. &quot;</span>
+                <span class="s2">&quot;Don&#39;t assume most keywords will generate results; start broader on first search (until you have a feel for results). &quot;</span>
+                <span class="s2">&quot;A vital aspect of this API is field control; you can open up the limit wide when dealing with lightweight &quot;</span>
+                <span class="s2">&quot;fields and dial way back when using larger fields, like content. Adjust dynamically. The best strategy &quot;</span>
+                <span class="s2">&quot;balances preserving the user&#39;s context window while minimizing number of queries necessary to answer their question.&quot;</span>
+            <span class="p">),</span>
+            <span class="n">inputSchema</span><span class="o">=</span><span class="p">{</span>
+                <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;object&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;properties&quot;</span><span class="p">:</span> <span class="p">{</span>
+                    <span class="s2">&quot;query&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;string&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;The query field is the workhorse of the API and supports fulltext boolean queries &quot;</span>
+                            <span class="s2">&quot;along with field searching using the name: value pattern. &quot;</span>
+                            <span class="s2">&quot;Fields supported include page/resource id as id: &lt;resource_id|int&gt; (OR together for multiple docs), &quot;</span>
+                            <span class="s2">&quot;HTTP status as status: &lt;code|int&gt;, URL as url: &lt;url|str&gt;, and content type as type: &lt;type|str&gt;. &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;Valid types include (</span><span class="si">{</span><span class="s1">&#39;, &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">resources_type_options</span><span class="p">)</span><span class="si">}</span><span class="s2">). &quot;</span>
+                            <span class="s2">&quot;Additionally, headers as headers: &lt;term|str&gt; and content as content: &lt;term|str&gt; can be &quot;</span>
+                            <span class="s2">&quot;searched specifically. You would only search content when fulltext search is diluted by other field hits. &quot;</span>
+                            <span class="s2">&quot;For the status field, numerical operators are supported, e.g. status: &gt;=400. &quot;</span>
+                            <span class="s2">&quot;For the url and type fields, along with fulltext search terms (fieldless), FTS5 stem* suffix &quot;</span>
+                            <span class="s2">&quot;wildcarding is enabled. An empty query returns all results. &quot;</span>
+                            <span class="s2">&quot;A query MUST use one of these formats: (1) empty query for unfiltered results, (2) single keyword, &quot;</span>
+                            <span class="s2">&quot;(3) quoted phrase: </span><span class="se">\&quot;</span><span class="s2">keyword1 keyword2</span><span class="se">\&quot;</span><span class="s2">, (4) &quot;</span>
+                            <span class="s2">&quot;explicit AND: keyword1 AND type: html, (5) explicit OR: keyword1 OR keyword2, or (6) advanced boolean: &quot;</span>
+                            <span class="s2">&quot;(keyword1 OR keyword2) AND (status: 200 AND type: html). &quot;</span>
+                            <span class="s2">&quot;The search index does not support stemming, use wildcards (keyword*), or the boolean OR and your &quot;</span>
+                            <span class="s2">&quot;imagination instead.&quot;</span>
+                        <span class="p">)</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;sites&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;array&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;items&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;enum&quot;</span><span class="p">:</span> <span class="n">sites_ids</span>
+                        <span class="p">},</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;List of crawl site IDs to filter search results to a specific site. In most &quot;</span>
+                            <span class="s2">&quot;scenarios, you should filter to only one site, but multiple site filtering is offered for &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;advanced search scenarios. Available sites include </span><span class="si">{</span><span class="n">sites_display</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;fields&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;array&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;items&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;enum&quot;</span><span class="p">:</span> <span class="n">RESOURCES_FIELDS_OPTIONS</span>
+                        <span class="p">},</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;List of additional fields to include in the response beyond the base fields &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="s1">&#39;, &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">RESOURCES_FIELDS_BASE</span><span class="p">)</span><span class="si">}</span><span class="s2">) returned for all results. &quot;</span>
+                            <span class="s2">&quot;Empty list means base fields only. Use headers and content to retrieve raw HTTP contents, &quot;</span>
+                            <span class="s2">&quot;and size to collect file size in bytes. &quot;</span>
+                            <span class="s2">&quot;The content field can lead to large results and should be used judiciously with LIMIT. &quot;</span>
+                            <span class="s2">&quot;Fields must be explicitly requested, even when used with sort. &quot;</span><span class="p">)</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;sort&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;enum&quot;</span><span class="p">:</span> <span class="n">resources_sort_options</span><span class="p">,</span>
+                        <span class="s2">&quot;default&quot;</span><span class="p">:</span> <span class="s2">&quot;+url&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;Sort order for results. Prefixed with + for ascending, - for descending &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="s1">&#39;, &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">resources_sort_options</span><span class="p">)</span><span class="si">}</span><span class="s2">). &quot;</span>
+                        <span class="s2">&quot;? is a special option for random sort, useful in statistical sampling. The API expects exactly &quot;</span>
+                        <span class="s2">&quot;one of the enum values above, not a quoted string.&quot;</span><span class="p">)</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;limit&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;integer&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="s2">&quot;Maximum number of results to return. Default is 20, max is 100.&quot;</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;offset&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;integer&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="s2">&quot;Number of results to skip for pagination. Default is 0.&quot;</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;extras&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;array&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;items&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;enum&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;thumbnails&quot;</span><span class="p">,</span> <span class="s2">&quot;markdown&quot;</span><span class="p">,</span> <span class="s2">&quot;snippets&quot;</span><span class="p">,</span> <span class="s2">&quot;regex&quot;</span><span class="p">,</span> <span class="s2">&quot;xpath&quot;</span><span class="p">]</span>
+                        <span class="p">},</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;Optional array of extra features to include in results. Available options include:</span><span class="se">\n</span><span class="s2">&quot;</span>
+                            <span class="s2">&quot;- &#39;thumbnails&#39;: generates base64 encoded thumbnails for image resources that can be viewed and &quot;</span>
+                            <span class="s2">&quot;analyzed by AI models. Enables image description, content analysis, and visual understanding while&quot;</span>
+                            <span class="s2">&quot;keeping token output minimal. Only works for image &quot;</span>
+                            <span class="s2">&quot;(img) types, which can be filtered using `type: img` in queries. SVG is not supported.</span><span class="se">\n</span><span class="s2">&quot;</span>
+                            <span class="s2">&quot;- &#39;markdown&#39;: transforms the HTML content field into concise markdown, &quot;</span>
+                            <span class="s2">&quot;reducing token usage and improving readability for LLMs.</span><span class="se">\n</span><span class="s2">&quot;</span>
+                            <span class="s2">&quot;- &#39;snippets&#39;: matches fulltext queries to contextual keyword usage within the content. When &quot;</span>
+                            <span class="s2">&quot;used without requesting the content field (or markdown extra), it can provide an efficient means &quot;</span>
+                            <span class="s2">&quot;of refining a search without pulling down the complete page contents. Also great for rendering &quot;</span>
+                            <span class="s2">&quot;old school hit-highlighted results as a list, like Google search in 1999. Works with HTML, CSS, JS, &quot;</span>
+                            <span class="s2">&quot;or any text-based, crawled file.</span><span class="se">\n</span><span class="s2">&quot;</span>
+                            <span class="s2">&quot;- &#39;regex&#39;: extracts regular expression matches from crawled files such as HTML, CSS, JavaScript, &quot;</span>
+                            <span class="s2">&quot;etc.. Not as precise a tool as xpath for HTML, but supports any text file as a data source. &quot;</span>
+                            <span class="s2">&quot;- &#39;xpath&#39;: extracts xpath selector data. Supports count(). Use xpath&#39;s text() for &quot;</span>
+                            <span class="s2">&quot;text only, element selectors for HTML data. Only supported for HTML, other &quot;</span>
+                            <span class="s2">&quot;types will be ignored. Sometimes referred to as scraping.&quot;</span>
+                            <span class="s2">&quot;&quot;</span><span class="p">)</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;extrasRegex&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;array&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;items&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;string&quot;</span>
+                        <span class="p">},</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;Array of regular expression patterns to extract content. &quot;</span>
+                        <span class="s2">&quot;Examples: `</span><span class="se">\\</span><span class="s2">d</span><span class="si">{3}</span><span class="s2">-</span><span class="se">\\</span><span class="s2">d</span><span class="si">{3}</span><span class="s2">-</span><span class="se">\\</span><span class="s2">d</span><span class="si">{4}</span><span class="s2">` (phone numbers), `https?://[^</span><span class="se">\\</span><span class="s2">s]+` (URLs). &quot;</span>
+                        <span class="s2">&quot;Use capture groups `(pattern)` to extract specific parts. &quot;</span>
+                        <span class="s2">&quot;Only used when &#39;regex&#39; is included in the extras array. &quot;</span>
+                        <span class="s2">&quot;Results include matches, capture groups, and position information.&quot;</span><span class="p">)</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;extrasXpath&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;array&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;items&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;string&quot;</span>
+                        <span class="p">},</span>
+                        <span class="s2">&quot;description&quot;</span><span class="p">:</span> <span class="p">(</span><span class="s2">&quot;Array of XPath expressions to extract specific content from HTML resources. &quot;</span>
+                            <span class="s2">&quot;Each XPath should be a valid selector expression like `/html/body/h1`, `//h1/text()`, &quot;</span>
+                            <span class="s2">&quot;//a, //a/@href, or count(//a). If you need many values (such as connected a/text() &quot;</span>
+                            <span class="s2">&quot;and a/@href), request elements to preserve the relationship. &quot;</span>
+                            <span class="s2">&quot;Use text() or @name when targeting text, elements will return outer HTML. &quot;</span>
+                            <span class="s2">&quot;Only used when &#39;xpath&#39; is included in the extras array. Many xpath expressions can be &quot;</span>
+                            <span class="s2">&quot;passed at once to extract multiple selectors. Results are grouped by document within results. &quot;</span><span class="p">)</span>
+                    <span class="p">}</span>
+                <span class="p">},</span>
+                <span class="s2">&quot;required&quot;</span><span class="p">:</span> <span class="p">[]</span>
+            <span class="p">},</span>
+        <span class="p">),</span>
+    <span class="p">]</span>
+
+    <span class="k">return</span> <span class="n">tools</span></div>
+
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, pragmar.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

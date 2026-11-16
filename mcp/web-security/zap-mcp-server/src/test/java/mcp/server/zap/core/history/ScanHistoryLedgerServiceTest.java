@@ -1,0 +1,650 @@
+package mcp.server.zap.core.history;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import mcp.server.zap.core.configuration.ApiKeyProperties;
+import mcp.server.zap.core.configuration.ScanHistoryLedgerProperties;
+import mcp.server.zap.core.gateway.GatewayRecordFactory;
+import mcp.server.zap.core.gateway.TargetDescriptor;
+import mcp.server.zap.core.model.ScanJob;
+import mcp.server.zap.core.model.ScanJobStatus;
+import mcp.server.zap.core.model.ScanJobType;
+import mcp.server.zap.core.service.jobstore.InMemoryScanJobStore;
+import mcp.server.zap.core.service.protection.ClientWorkspaceResolver;
+import mcp.server.zap.core.service.protection.RequestIdentityHolder;
+import mcp.server.zap.extension.api.evidence.EvidenceMetadataEnricher;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class ScanHistoryLedgerServiceTest {
+    private InMemoryScanHistoryStore historyStore;
+    private InMemoryScanJobStore scanJobStore;
+    private ScanHistoryLedgerService service;
+    private ObjectMapper objectMapper;
+
+    @BeforeEach
+    void setUp() {
+        RequestIdentityHolder.set("client-a", "client-a");
+        historyStore = new InMemoryScanHistoryStore();
+        scanJobStore = new InMemoryScanJobStore();
+        objectMapper = new ObjectMapper().rebuild().findAndAddModules().build();
+        ScanHistoryLedgerProperties properties = new ScanHistoryLedgerProperties();
+        properties.setMaxListEntries(10);
+        properties.setMaxExportEntries(10);
+        properties.setRetentionDays(180);
+        service = new ScanHistoryLedgerService(
+                historyStore,
+                scanJobStore,
+                properties,
+                new ClientWorkspaceResolver(new ApiKeyProperties()),
+                new GatewayRecordFactory(),
+                objectMapper
+        );
+    }
+
+    @AfterEach
+    void tearDown() {
+        RequestIdentityHolder.clear();
+    }
+
+    @Test
+    void queueJobsAppearAsQueryableHistoryEntries() {
+        ScanJob job = new ScanJob(
+                "job-1",
+                ScanJobType.ACTIVE_SCAN,
+                Map.of("targetUrl", "https://app.example.com", "recurse", "true", "policy", "Baseline"),
+                Instant.parse("2026-05-04T00:00:00Z"),
+                3,
+                "client-a",
+                "idem-a"
+        );
+        job.incrementAttempts();
+        job.markRunning("zap-active-1");
+        job.updateProgress(45);
+        scanJobStore.upsertAll(java.util.List.of(job));
+
+        String list = service.listHistory("scan_job", "running", "app.example.com", 5);
+        String detail = service.getHistoryEntry("job:job-1");
+
+        assertThat(list)
+                .contains("Scan history ledger")
+                .contains("job:job-1 [scan_job]")
+                .contains("Status: running")
+                .contains("Target: https://app.example.com");
+        assertThat(detail)
+                .contains("Entry ID: job:job-1")
+                .contains("Backend Reference: zap-active-1")
+                .contains("lastKnownProgress: 45");
+    }
+
+    @Test
+    void ajaxHistoryDoesNotPresentQueueLifecycleAsCrawlProgress() {
+        for (ScanJobStatus status : List.of(ScanJobStatus.SUCCEEDED, ScanJobStatus.CANCELLED)) {
+            ScanJob job = new ScanJob(
+                    "ajax-" + status,
+                    ScanJobType.AJAX_SPIDER,
+                    Map.of("targetUrl", "https://spa.example.com/" + status),
+                    Instant.now(),
+                    3,
+                    "client-a",
+                    null
+            );
+            job.markRunning("ajax-spider:1");
+            if (status == ScanJobStatus.SUCCEEDED) {
+                job.markSucceeded(100);
+            } else {
+                job.updateProgress(100);
+                job.markCancelled();
+            }
+            scanJobStore.upsertAll(List.of(job));
+            service.recordReportArtifact("/zap/wrk/ajax.html", "traditional-html-plus",
+                    job.getParameters().get("targetUrl"), Map.of());
+
+            String detail = service.getHistoryEntry("job:" + job.getId());
+            String handoff = service.exportCustomerHandoff("ajax-check", "/" + status, 10);
+
+            assertThat(detail).contains("progress: unavailable").doesNotContain("lastKnownProgress");
+            assertThat(handoff).contains("progress unavailable").doesNotContain("100%");
+            if (status == ScanJobStatus.SUCCEEDED) {
+                assertThat(detail).contains("crawlOutcome: unknown (ZAP reports stopped)");
+                assertThat(service.listHistory("scan_job", "succeeded", null, 10))
+                        .contains("Crawl Outcome: unknown (ZAP reports stopped)");
+                assertThat(handoff).contains("crawl outcome unknown (ZAP reports stopped)")
+                        .contains("Browser crawl completion is unconfirmed")
+                        .contains("Readiness: CAVEAT");
+            } else {
+                assertThat(detail).contains("Status: cancelled");
+                assertThat(handoff).contains("Cancelled");
+            }
+        }
+    }
+
+    @Test
+    void clientHistoryPreservesNativeProgressWithoutClaimingSuccessfulCoverage() {
+        ScanJob job = new ScanJob("client-job", ScanJobType.CLIENT_SPIDER,
+                Map.of("targetUrl", "https://spa.example.com/client"), Instant.now(), 3, "client-a", null);
+        job.markRunning("7");
+        job.markSucceeded(100);
+        scanJobStore.upsertAll(List.of(job));
+        service.recordReportArtifact("/zap/wrk/client.html", "traditional-html-plus",
+                job.getParameters().get("targetUrl"), Map.of());
+
+        assertThat(service.getHistoryEntry("job:client-job"))
+                .contains("Backend Reference: 7", "lastKnownProgress: 100", "crawlOutcome: unknown (ZAP reports stopped)")
+                .doesNotContain("authenticated: true");
+        assertThat(service.exportCustomerHandoff("client-check", "/client", 10))
+                .contains("crawl outcome unknown (ZAP reports stopped)", "Browser crawl completion is unconfirmed", "Readiness: CAVEAT");
+    }
+
+    @Test
+    void clientHistoryMarksCrawlsWithAConfiguredUserAsAuthenticated() {
+        ScanJob job = new ScanJob("client-auth-job", ScanJobType.CLIENT_SPIDER,
+                Map.of("targetUrl", "https://spa.example.com/client", "contextName", "Application", "userName", "alice"),
+                Instant.now(), 3, "client-a", null);
+        job.markRunning("8");
+        scanJobStore.upsertAll(List.of(job));
+
+        assertThat(service.getHistoryEntry("job:client-auth-job"))
+                .contains("Backend Reference: 8", "authenticated: true");
+    }
+
+    @Test
+    void historicalDirectScansAndReportArtifactsRemainReadableAndExportable() throws Exception {
+        historyStore.append(historicalDirectEntry(
+                "hist_active_77", "active_scan", "active-77",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://api.example.com", "api.example.com"),
+                "client-a", "client-a",
+                Map.of("policy", "Baseline")
+        ));
+        service.recordReportArtifact(
+                "/zap/wrk/zap-report-77.json",
+                "traditional-json-plus",
+                "https://api.example.com",
+                Map.of("template", "traditional-json-plus")
+        );
+
+        String list = service.listHistory(null, null, "api.example.com", 10);
+        String export = service.exportHistory(null, null, "api.example.com", 10);
+        JsonNode root = objectMapper.readTree(export);
+
+        assertThat(list)
+                .contains("[scan_run]")
+                .contains("[report_artifact]")
+                .contains("active-77")
+                .contains("/zap/wrk/zap-report-77.json");
+        assertThat(root.path("version").asInt()).isEqualTo(1);
+        assertThat(root.path("entryCount").asInt()).isEqualTo(2);
+        assertThat(root.path("entries").findValuesAsString("evidenceType"))
+                .contains("scan_run", "report_artifact");
+        assertThat(service.getHistoryEntry("hist_active_77"))
+                .contains("Evidence Type: scan_run", "Status: started", "Execution Mode: direct", "Backend Reference: active-77");
+    }
+
+    @Test
+    void evidenceMetadataEnricherAppliesToReportAndQueuedEvidence() throws Exception {
+        InMemoryScanJobStore enrichedJobStore = new InMemoryScanJobStore();
+        EvidenceMetadataEnricher failingEnricher = request -> {
+            throw new IllegalStateException("metadata extension failed");
+        };
+        EvidenceMetadataEnricher enricher = request -> Map.of(
+                "extensionProvider", "test-evidence-extension",
+                "extensionEvidenceType", request.evidenceType(),
+                "extensionStatus", request.status(),
+                "extensionTarget", request.targetUrl() == null ? "none" : request.targetUrl(),
+                "existing", "extension-must-not-rewrite-core-metadata",
+                "template", "extension-must-not-rewrite-core-metadata"
+        );
+        ScanHistoryLedgerService enrichedService = new ScanHistoryLedgerService(
+                new InMemoryScanHistoryStore(),
+                enrichedJobStore,
+                properties(),
+                new ClientWorkspaceResolver(new ApiKeyProperties()),
+                new GatewayRecordFactory(),
+                objectMapper,
+                List.of(failingEnricher, enricher)
+        );
+
+        enrichedService.recordReportArtifact(
+                "/zap/wrk/zap-report-extension.json",
+                "traditional-json-plus",
+                "https://api.example.com",
+                Map.of("existing", "kept", "template", "core-template")
+        );
+        ScanJob job = new ScanJob(
+                "job-extension",
+                ScanJobType.ACTIVE_SCAN,
+                Map.of("targetUrl", "https://api.example.com/queued"),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                3,
+                "client-a",
+                "idem-extension"
+        );
+        job.markRunning("zap-extension");
+        enrichedJobStore.upsertAll(java.util.List.of(job));
+
+        JsonNode root = objectMapper.readTree(enrichedService.exportHistory(null, null, "api.example.com", 10));
+
+        assertThat(metadataFor(root, "report_artifact"))
+                .containsEntry("existing", "kept")
+                .containsEntry("extensionProvider", "test-evidence-extension")
+                .containsEntry("extensionTarget", "https://api.example.com")
+                .containsEntry("extensionEvidenceType", "report_artifact")
+                .containsEntry("extensionStatus", "generated")
+                .containsEntry("template", "core-template");
+        assertThat(metadataFor(root, "scan_job"))
+                .containsEntry("extensionEvidenceType", "scan_job")
+                .containsEntry("extensionStatus", "running")
+                .containsEntry("extensionTarget", "https://api.example.com/queued");
+    }
+
+    @Test
+    void defaultWorkspaceBoundaryFiltersStoredAndJobDerivedHistory() {
+        historyStore.append(historicalDirectEntry("hist_spider_a", "spider", "spider-client-a",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://a.example.com", "a.example.com"),
+                "client-a", "client-a", Map.of()));
+        historyStore.append(historicalDirectEntry("hist_spider_b", "spider", "spider-client-b",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://b.example.com", "b.example.com"),
+                "client-b", "client-b", Map.of()));
+        ScanJob clientBJob = new ScanJob(
+                "job-client-b",
+                ScanJobType.ACTIVE_SCAN,
+                Map.of("targetUrl", "https://b.example.com/queued"),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                3,
+                "client-b",
+                "idem-b"
+        );
+        scanJobStore.upsertAll(java.util.List.of(clientBJob));
+
+        RequestIdentityHolder.set("client-a", "client-a");
+        String list = service.listHistory(null, null, null, 10);
+
+        assertThat(list)
+                .contains("spider-client-a")
+                .doesNotContain("spider-client-b", "job:job-client-b", "b.example.com");
+    }
+
+    private ScanHistoryLedgerProperties properties() {
+        ScanHistoryLedgerProperties properties = new ScanHistoryLedgerProperties();
+        properties.setMaxListEntries(10);
+        properties.setMaxExportEntries(10);
+        properties.setRetentionDays(180);
+        return properties;
+    }
+
+    private ScanHistoryEntry historicalDirectEntry(String id, String operationKind, String backendReference,
+                                                   TargetDescriptor target, String clientId, String workspaceId,
+                                                   Map<String, String> metadata) {
+        return new ScanHistoryEntry(id, Instant.now(), "scan_run", operationKind, "started", "zap", target,
+                "direct", backendReference, null, null, null, null, clientId, workspaceId, metadata);
+    }
+
+    private Map<String, String> metadataFor(JsonNode root, String evidenceType) {
+        for (JsonNode entry : root.path("entries")) {
+            if (evidenceType.equals(entry.path("evidenceType").asString())) {
+                ObjectMapper mapper = new ObjectMapper();
+                return mapper.convertValue(
+                        entry.path("metadata"),
+                        mapper.getTypeFactory().constructMapType(Map.class, String.class, String.class)
+                );
+            }
+        }
+        throw new AssertionError("No entry found for evidence type " + evidenceType);
+    }
+
+    @Test
+    void releaseEvidenceBundleSummarizesEntriesAndWarnings() throws Exception {
+        ScanJob runningJob = new ScanJob(
+                "job-release-running",
+                ScanJobType.ACTIVE_SCAN,
+                Map.of("targetUrl", "https://api.example.com/queued"),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                3,
+                "client-a",
+                "release-idem"
+        );
+        runningJob.incrementAttempts();
+        runningJob.markRunning("zap-active-release");
+        scanJobStore.upsertAll(java.util.List.of(runningJob));
+        historyStore.append(historicalDirectEntry(
+                "hist_active_release", "active_scan", "active-release",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://api.example.com", "api.example.com"),
+                "client-a", "client-a",
+                Map.of("policy", "Baseline")
+        ));
+        service.recordReportArtifact(
+                "/zap/wrk/release-report.json",
+                "traditional-json-plus",
+                "https://api.example.com",
+                Map.of("template", "traditional-json-plus")
+        );
+
+        String bundle = service.exportReleaseEvidence("pilot-alpha", "api.example.com", 10);
+        JsonNode root = objectMapper.readTree(bundle);
+
+        assertThat(root.path("purpose").asString()).isEqualTo("release_evidence");
+        assertThat(root.path("releaseName").asString()).isEqualTo("pilot-alpha");
+        assertThat(root.path("summary").path("entryCount").asInt()).isEqualTo(3);
+        assertThat(root.path("summary").path("byEvidenceType").path("scan_job").asInt()).isEqualTo(1);
+        assertThat(root.path("summary").path("byEvidenceType").path("scan_run").asInt()).isEqualTo(1);
+        assertThat(root.path("summary").path("byEvidenceType").path("report_artifact").asInt()).isEqualTo(1);
+        assertThat(root.path("summary").path("hasScanEvidence").asBoolean()).isTrue();
+        assertThat(root.path("summary").path("hasReportArtifact").asBoolean()).isTrue();
+        assertThat(root.path("summary").path("nonTerminalScanJobs").asInt()).isEqualTo(1);
+        assertThat(root.path("entries").findValuesAsString("id"))
+                .contains("job:job-release-running");
+        assertThat(root.path("warnings").toString())
+                .contains("not terminal")
+                .doesNotContain("No report artifact");
+    }
+
+    @Test
+    void releaseEvidenceBundleWarnsWhenEvidenceIsIncomplete() throws Exception {
+        historyStore.append(historicalDirectEntry(
+                "hist_spider_only", "spider", "spider-only",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://scan-only.example.com", "scan-only.example.com"),
+                "client-a", "client-a",
+                Map.of()
+        ));
+
+        JsonNode scanOnly = objectMapper.readTree(
+                service.exportReleaseEvidence(null, "scan-only.example.com", 5)
+        );
+        JsonNode empty = objectMapper.readTree(
+                service.exportReleaseEvidence("empty-release", "missing.example.com", 5)
+        );
+
+        assertThat(scanOnly.path("releaseName").asString()).isEqualTo("unnamed-release");
+        assertThat(scanOnly.path("summary").path("hasScanEvidence").asBoolean()).isTrue();
+        assertThat(scanOnly.path("summary").path("hasReportArtifact").asBoolean()).isFalse();
+        assertThat(scanOnly.path("warnings").toString())
+                .contains("No report artifact")
+                .doesNotContain("No scan evidence");
+        assertThat(empty.path("summary").path("entryCount").asInt()).isZero();
+        assertThat(empty.path("warnings").toString())
+                .contains("No scan history entries matched");
+    }
+
+    @Test
+    void customerHandoffOmitsInternalLedgerFieldsAndRawMetadata() {
+        ScanJob job = new ScanJob(
+                "job-customer-safe",
+                ScanJobType.SPIDER_SCAN,
+                Map.of("targetUrl", "https://shop.example.com"),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                2,
+                "client-a",
+                "customer-idem-key"
+        );
+        job.incrementAttempts();
+        job.markRunning("zap-spider-9");
+        job.markSucceeded(100);
+        scanJobStore.upsertAll(java.util.List.of(job));
+        service.recordReportArtifact(
+                "/zap/wrk/internal-report.html",
+                "traditional-html-plus",
+                "https://shop.example.com",
+                Map.of("template", "traditional-html-plus", "internalTicket", "SEC-123")
+        );
+
+        String handoff = service.exportCustomerHandoff("pilot-public", "shop.example.com", 10);
+
+        assertThat(handoff)
+                .contains("Customer Evidence Handoff")
+                .contains("Handoff: pilot-public")
+                .contains("Evidence Window: filtered selection")
+                .contains("Readiness: PASS")
+                .contains("https://shop.example.com")
+                .contains("Queued Scan: Spider Scan")
+                .contains("Succeeded, progress 100%")
+                .contains("HTML report generated")
+                .contains(
+                        "Acceptance Checklist",
+                        "- [x] Evidence window has entries",
+                        "- [x] Scan evidence is included",
+                        "- [x] Report evidence is included",
+                        "- [x] At least one target has scan and report evidence",
+                        "- [x] Terminal queued scan evidence is included",
+                        "- [x] No target relies only on direct scan launch evidence",
+                        "- [x] No unfinished queued scans",
+                        "- [x] Evidence window stayed within export limit",
+                        "Customer-Safe Redaction Contract",
+                        "- Raw ledger IDs: excluded",
+                        "- Internal artifact paths: excluded",
+                        "- Raw metadata and idempotency keys: excluded",
+                        "- Internal filter selector: excluded",
+                        "Customer Package Contents",
+                        "Attach reviewed report files separately")
+                .doesNotContain(
+                        "job-customer-safe",
+                        "job:",
+                        "zap-spider-9",
+                        "client-a",
+                        "workspace",
+                        "backendReference",
+                        "artifactLocation",
+                        "customer-idem-key",
+                        "idempotencyKey",
+                        "/zap/wrk",
+                        "SEC-123"
+                );
+    }
+
+    @Test
+    void customerHandoffChecklistFlagsMissingReportAndLimitRisk() {
+        historyStore.append(historicalDirectEntry(
+                "hist_spider_checklist", "spider", "spider-checklist-1",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://checklist.example.com", "checklist.example.com"),
+                "client-a", "client-a",
+                Map.of()
+        ));
+
+        String handoff = service.exportCustomerHandoff("pilot-checklist", "checklist.example.com", 1);
+
+        assertThat(handoff)
+                .contains(
+                        "Readiness: FAIL",
+                        "Acceptance Checklist",
+                        "- [x] Evidence window has entries",
+                        "- [x] Scan evidence is included",
+                        "- [ ] Report evidence is included",
+                        "- [ ] At least one target has scan and report evidence",
+                        "- [ ] Terminal queued scan evidence is included",
+                        "- [ ] No target relies only on direct scan launch evidence",
+                        "- [x] No unfinished queued scans",
+                        "- [ ] Evidence window stayed within export limit",
+                        "No report evidence was included",
+                        "The handoff reached the export limit")
+                .doesNotContain("spider-checklist-1");
+    }
+
+    @Test
+    void customerHandoffFailsWhenScanAndReportTargetsDoNotMatch() {
+        ScanJob job = new ScanJob(
+                "job-target-a",
+                ScanJobType.SPIDER_SCAN,
+                Map.of("targetUrl", "https://scan-only.example.com"),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                2,
+                "client-a",
+                "target-mismatch-idem"
+        );
+        job.incrementAttempts();
+        job.markRunning("zap-spider-target-a");
+        job.markSucceeded(100);
+        scanJobStore.upsertAll(java.util.List.of(job));
+        service.recordReportArtifact(
+                "/zap/wrk/report-target-b.html",
+                "traditional-html-plus",
+                "https://report-only.example.com",
+                Map.of("template", "traditional-html-plus")
+        );
+
+        String handoff = service.exportCustomerHandoff("pilot-mismatch", "example.com", 10);
+
+        assertThat(handoff)
+                .contains(
+                        "Readiness: FAIL",
+                        "- [x] Scan evidence is included",
+                        "- [x] Report evidence is included",
+                        "- [ ] At least one target has scan and report evidence",
+                        "No target has both scan evidence and report evidence")
+                .doesNotContain("job-target-a", "zap-spider-target-a", "target-mismatch-idem", "/zap/wrk");
+    }
+
+    @Test
+    void customerHandoffCorrelatesDefaultPortsAndTrailingSlashes() {
+        ScanJob job = new ScanJob(
+                "job-normalized-target",
+                ScanJobType.SPIDER_SCAN,
+                Map.of("targetUrl", "https://normalize.example.com/"),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                2,
+                "client-a",
+                "normalized-idem"
+        );
+        job.incrementAttempts();
+        job.markRunning("zap-spider-normalized");
+        job.markSucceeded(100);
+        scanJobStore.upsertAll(java.util.List.of(job));
+        service.recordReportArtifact(
+                "/zap/wrk/normalized.html",
+                "traditional-html-plus",
+                "https://normalize.example.com:443",
+                Map.of("template", "traditional-html-plus")
+        );
+
+        String handoff = service.exportCustomerHandoff("pilot-normalized", "normalize.example.com", 10);
+
+        assertThat(handoff)
+                .contains(
+                        "Readiness: PASS",
+                        "- [x] At least one target has scan and report evidence",
+                        "- [x] Terminal queued scan evidence is included");
+    }
+
+    @Test
+    void customerHandoffCaveatsMixedDirectAndQueuedTargetProof() {
+        historyStore.append(historicalDirectEntry(
+                "hist_spider_direct_target", "spider", "spider-direct-target",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://direct-only.example.com", "direct-only.example.com"),
+                "client-a", "client-a",
+                Map.of()
+        ));
+        service.recordReportArtifact(
+                "/zap/wrk/direct-only.html",
+                "traditional-html-plus",
+                "https://direct-only.example.com",
+                Map.of("template", "traditional-html-plus")
+        );
+        ScanJob queuedJob = new ScanJob(
+                "job-queued-target",
+                ScanJobType.SPIDER_SCAN,
+                Map.of("targetUrl", "https://queued-complete.example.com"),
+                Instant.parse("2026-05-06T00:00:00Z"),
+                2,
+                "client-a",
+                "queued-complete-idem"
+        );
+        queuedJob.incrementAttempts();
+        queuedJob.markRunning("zap-spider-queued-complete");
+        queuedJob.markSucceeded(100);
+        scanJobStore.upsertAll(java.util.List.of(queuedJob));
+        service.recordReportArtifact(
+                "/zap/wrk/queued-complete.html",
+                "traditional-html-plus",
+                "https://queued-complete.example.com",
+                Map.of("template", "traditional-html-plus")
+        );
+
+        String handoff = service.exportCustomerHandoff("pilot-mixed-proof", "example.com", 10);
+
+        assertThat(handoff)
+                .contains(
+                        "Readiness: CAVEAT",
+                        "- [x] At least one target has scan and report evidence",
+                        "- [x] Terminal queued scan evidence is included",
+                        "- [ ] No target relies only on direct scan launch evidence",
+                        "Some targets only have direct scan launch evidence",
+                        "https://direct-only.example.com")
+                .doesNotContain(
+                        "spider-direct-target",
+                        "job-queued-target",
+                        "zap-spider-queued-complete",
+                        "queued-complete-idem",
+                        "/zap/wrk");
+    }
+
+    @Test
+    void customerHandoffDoesNotEchoInternalArtifactPathFilters() {
+        service.recordReportArtifact(
+                "/zap/wrk/private/internal-report.html",
+                "traditional-html-plus",
+                "https://path-filter.example.com",
+                Map.of("template", "traditional-html-plus")
+        );
+        historyStore.append(historicalDirectEntry(
+                "hist_spider_private_filter", "spider", "spider-private-filter",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://path-filter.example.com", "path-filter.example.com"),
+                "client-a", "client-a",
+                Map.of()
+        ));
+
+        String handoff = service.exportCustomerHandoff(
+                "pilot-path-filter",
+                "/zap/wrk/private/internal-report.html",
+                10
+        );
+
+        assertThat(handoff)
+                .contains("Evidence Window: filtered selection")
+                .contains("https://path-filter.example.com")
+                .contains("HTML report generated")
+                .doesNotContain(
+                        "/zap/wrk",
+                        "private/internal-report.html",
+                        "spider-private-filter",
+                        "Target Filter"
+                );
+    }
+
+    @Test
+    void customerHandoffFlagsDirectScanStartsAsLaunchEvidenceOnly() {
+        historyStore.append(historicalDirectEntry(
+                "hist_active_direct", "active_scan", "active-direct-1",
+                new TargetDescriptor(TargetDescriptor.Kind.WEB, "https://direct.example.com", "direct.example.com"),
+                "client-a", "client-a",
+                Map.of("policy", "Baseline")
+        ));
+        service.recordReportArtifact(
+                "/zap/wrk/direct-report.html",
+                "traditional-html-plus",
+                "https://direct.example.com",
+                Map.of("template", "traditional-html-plus")
+        );
+
+        String handoff = service.exportCustomerHandoff("pilot-direct", "direct.example.com", 10);
+
+        assertThat(handoff)
+                .contains("Readiness: CAVEAT")
+                .contains("Some targets only have direct scan launch evidence")
+                .contains("- [ ] Terminal queued scan evidence is included")
+                .contains("- [ ] No target relies only on direct scan launch evidence")
+                .contains("Direct Scan Start: Active Scan")
+                .doesNotContain("active-direct-1", "/zap/wrk/direct-report.html");
+    }
+
+    @Test
+    void unknownEntryReturnsBoundedError() {
+        assertThatThrownBy(() -> service.getHistoryEntry("hist_missing"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("No scan history entry found for ID: hist_missing");
+    }
+}
