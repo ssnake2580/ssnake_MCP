@@ -1,0 +1,389 @@
+"""Write and regenerate ``mcp-lock.json`` (ADR-0005).
+
+:func:`regenerate` builds the new full document as a plain ``dict`` (never a
+serialised ``LockFile`` model instance) so that foreign top-level sections —
+``trees``, ``tools``, anything unrecognised — pass through completely
+untouched as the exact Python values :func:`json.loads` produced when the
+existing file was read.  :func:`serialize` then renders the *whole* document,
+including those foreign sections, through
+:func:`mcp_audit.advisory.canonical.canonicalize` — the format-level
+requirement ADR-0005 §2 places on ``mcp-lock.json`` so that two independent,
+possibly cross-language producers (mcp-audit and the #88 tree generator)
+always agree on the bytes for a value neither one has changed.
+
+mcp-audit's own ``checksum`` covers only the sub-document it owns
+(:func:`mcp_audit.lock.model.owned_subdocument`) — see ADR-0005 §10. The
+``tools`` section, once ``lock --connect`` has populated it, is mcp-audit's
+too and carries its own ``_checksum`` (:mod:`mcp_audit.lock.tool_digests`).
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+from mcp_audit import __version__
+from mcp_audit._fs import atomic_write
+from mcp_audit.advisory.canonical import CanonicalError, canonicalize
+from mcp_audit.analyzers.rug_pull import compute_hashes, server_key
+from mcp_audit.lock import guardrail_section, section_digests, tool_digests
+from mcp_audit.lock.identity import build_identity, relative_config_path
+from mcp_audit.lock.model import (
+    LOCK_VERSION,
+    RESERVED_FOREIGN_KEYS,
+    SECTION_DIGESTS_KEY,
+    STRUCTURAL_KEYS,
+    compute_checksum,
+    unsupported_version,
+)
+from mcp_audit.lock.resolve import resolve_package
+from mcp_audit.models import ServerConfig
+from mcp_audit.registry.loader import KnownServerRegistry
+
+
+class LockWriteError(Exception):
+    """The document cannot be safely serialised.
+
+    Raised instead of letting :class:`~mcp_audit.advisory.canonical.CanonicalError`
+    propagate as a traceback — ADR-0005 §2 rule 3 / §10's checkpoint-review
+    fix: a clean message naming the oversized section, never a bare
+    traceback and never a silently truncated write.
+    """
+
+
+def load_existing(path: Path) -> dict | None:
+    """Load an existing lock document, or ``None`` if absent/unreadable.
+
+    Args:
+        path: Path to ``mcp-lock.json``.
+
+    Returns:
+        The parsed document, or ``None`` when the file does not exist or is
+        not valid JSON (treated the same as "no lock yet" for *writing* —
+        ``lock --verify`` is the command that reports a genuinely corrupt
+        file as a finding, not this loader).
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _relative_config_path(config_path: Path, root: Path) -> str:
+    """Return *config_path* as a repo-relative or ``~``-relative string.
+
+    Never an absolute, machine-specific path — ADR-0005's "never contains an
+    absolute path" invariant.
+
+    Delegates to :func:`mcp_audit.lock.identity.relative_config_path` so the
+    string written here is byte-identical to the one
+    :func:`mcp_audit.lock.identity.match_key` computes at verify time (R61) —
+    the two must never drift, since that string is now half of a server's
+    lock identity.
+
+    Args:
+        config_path: The absolute path to a discovered config file.
+        root: The project root ``lock`` was run against.
+
+    Returns:
+        A POSIX-style relative path (project-relative when under *root*,
+        ``~/...`` when under ``$HOME``, otherwise just the file name as a
+        last resort — a file under neither is out of the lock's scope and
+        ``verify`` will skip it, so that fallback is a label, not a key).
+    """
+    relative = relative_config_path(config_path, root)
+    return relative if relative is not None else config_path.resolve().name
+
+
+def build_entry(
+    server: ServerConfig,
+    root: Path,
+    *,
+    offline: bool,
+    registry: KnownServerRegistry | None,
+    existing: dict | None,
+    now: str,
+) -> dict:
+    """Build one server's lock entry.
+
+    Args:
+        server: A parsed MCP server configuration.
+        root: The project root ``lock`` was run against.
+        offline: Suppress all network resolution when ``True``.
+        registry: The known-server registry (for ``known_hashes`` and
+            ``capabilities``).
+        existing: The previous entry for this server key, if any — used to
+            preserve ``first_locked`` and (via
+            :func:`mcp_audit.lock.resolve.resolve_package`) implement
+            write-on-change for ``resolved_at``.
+        now: ISO-8601 timestamp for this run, used only for a genuinely new
+            server's ``first_locked``.
+
+    Returns:
+        A dict matching :class:`~mcp_audit.lock.model.LockEntry`'s shape.
+    """
+    package = resolve_package(
+        server,
+        offline=offline,
+        registry=registry,
+        existing=(existing or {}).get("package"),
+    )
+    capabilities: list[str] | None = None
+    if package is not None and registry is not None:
+        registry_entry = registry.get(package["name"])
+        if registry_entry is not None:
+            capabilities = registry_entry.capabilities
+
+    return {
+        "client": server.client,
+        "name": server.name,
+        "config": _relative_config_path(server.config_path, root),
+        "identity": build_identity(server),
+        "package": package,
+        "env_keys": sorted(server.env.keys()),
+        "header_keys": sorted(server.headers.keys()),
+        "capabilities": capabilities,
+        "first_locked": (existing or {}).get("first_locked", now),
+        "hashes": compute_hashes(server),
+    }
+
+
+def regenerate(
+    existing_doc: dict | None,
+    servers: list[ServerConfig],
+    root: Path,
+    *,
+    offline: bool,
+    registry: KnownServerRegistry | None,
+    tool_records: dict[str, dict] | None = None,
+    guardrail_entries: dict[str, dict] | None = None,
+) -> dict:
+    """Build the new full lock document from the current server list.
+
+    Foreign top-level sections in *existing_doc* (``trees``, a ``tools``
+    section from another producer, and anything unrecognised) are copied
+    through verbatim as the exact parsed Python values — never re-derived,
+    never touched.  An mcp-audit-owned ``tools`` section is rebuilt by
+    :func:`mcp_audit.lock.tool_digests.merge_section`: records from
+    *tool_records* replace earlier ones, records for servers no longer locked
+    are dropped, and the rest carry forward.  Used by both
+    ``mcp-audit lock`` and ``mcp-audit lock --accept``: the two commands
+    perform the same regeneration; ``--accept`` exists as the explicit,
+    named step in the "review the drift, then re-lock" workflow.
+
+    Args:
+        existing_doc: The previously loaded document, or ``None`` for a
+            first-time lock.
+        servers: All servers this run of ``lock`` discovered.
+        root: The project root ``lock`` was run against.
+        offline: Suppress all network resolution when ``True``.
+        registry: The known-server registry.
+        tool_records: ``{lock key: tool_digests.server_record(...)}`` from
+            ``lock --connect``; ``None`` when tools were not enumerated.
+        guardrail_entries: ``{repo-relative path: guardrail_section.entry(...)}``
+            for the repository's own guardrail files (STORY-0143). An empty
+            dict drops an owned ``guardrails`` section; ``None`` leaves the
+            existing one as it is. Another producer's ``guardrails`` section
+            is never touched.
+
+    Returns:
+        The new full document, including a freshly computed ``checksum``
+        (ADR-0005 §10 — scoped to ``{lock_version, generated_by, servers}``
+        only).
+
+    Raises:
+        LockWriteError: *tool_records* were given but ``tools`` belongs to
+            another producer (ADR-0005 §1: never overwrite another
+            producer's section); or the existing mcp-audit ``tools`` section
+            fails its own checksum and *tool_records* is ``None`` (carrying
+            it forward would re-checksum a hand edit into a valid record).
+            With *tool_records*, a section that fails its checksum is
+            discarded and only this run's records are written. Also raised
+            when *existing_doc* declares a ``lock_version`` newer than this
+            mcp-audit writes (rewriting it would silently downgrade the
+            file), or its ``section_digests`` is not an object.
+
+    The document is written as ``lock_version`` 2: ``section_digests`` keeps
+    every other producer's entries verbatim and recomputes mcp-audit's own
+    (:func:`mcp_audit.lock.section_digests.merge`).
+    """
+    newer = unsupported_version(existing_doc or {})
+    if newer is not None:
+        raise LockWriteError(
+            f"The existing lock declares lock_version {newer}, newer than this "
+            f"mcp-audit writes ({LOCK_VERSION}). Upgrade mcp-audit rather than "
+            "overwrite it — see docs/lock.md."
+        )
+    existing_servers: dict = (existing_doc or {}).get("servers", {})
+    now = datetime.now(UTC).isoformat()
+
+    new_servers: dict[str, dict] = {}
+    for server in servers:
+        key = server_key(server)
+        new_servers[key] = build_entry(
+            server,
+            root,
+            offline=offline,
+            registry=registry,
+            existing=existing_servers.get(key),
+            now=now,
+        )
+
+    doc: dict = {}
+    if existing_doc:
+        for key, value in existing_doc.items():
+            if key not in STRUCTURAL_KEYS and key != "servers":
+                doc[key] = value
+    for key in RESERVED_FOREIGN_KEYS:
+        doc.setdefault(key, {} if key == "trees" else None)
+
+    existing_tools = doc[tool_digests.TOOLS_KEY]
+    if tool_records is not None:
+        check_tools_writable(existing_doc)
+    if existing_tools is None or tool_digests.is_owned(existing_tools):
+        if tools_tampered(existing_doc):
+            if tool_records is None:
+                raise LockWriteError(
+                    "The lock's `tools` section does not match its own "
+                    "checksum (hand-edited or corrupted), so mcp-audit will not "
+                    "carry it forward. Inspect `git diff mcp-lock.json`, then "
+                    "re-record it from the live servers with "
+                    "`mcp-audit lock --accept --connect`."
+                )
+            existing_tools = None  # start over: keep nothing from it
+        doc[tool_digests.TOOLS_KEY] = tool_digests.merge_section(
+            existing_tools, tool_records or {}, keep_keys=set(new_servers)
+        )
+
+    existing_guards = doc.get(guardrail_section.GUARDRAILS_KEY)
+    if guardrail_entries is not None and (
+        existing_guards is None or guardrail_section.is_owned(existing_guards)
+    ):
+        built = guardrail_section.build_section(guardrail_entries)
+        if built is None:
+            doc.pop(guardrail_section.GUARDRAILS_KEY, None)
+        else:
+            doc[guardrail_section.GUARDRAILS_KEY] = built
+
+    doc["lock_version"] = LOCK_VERSION
+    doc["generated_by"] = f"mcp-audit/{__version__}"
+    doc["generated_at"] = now
+    doc["servers"] = new_servers
+    try:
+        doc[SECTION_DIGESTS_KEY] = section_digests.merge(
+            (existing_doc or {}).get(SECTION_DIGESTS_KEY), doc
+        )
+    except ValueError as exc:  # includes CanonicalError
+        raise LockWriteError(
+            f"Cannot write `{SECTION_DIGESTS_KEY}`: {exc}. Inspect "
+            "`mcp-lock.json`; mcp-audit will not overwrite another producer's "
+            "entries — see docs/lock.md."
+        ) from None
+    doc["checksum"] = compute_checksum(doc)
+    return doc
+
+
+def tools_tampered(existing_doc: dict | None) -> bool:
+    """Whether *existing_doc*'s mcp-audit ``tools`` section fails its checksum."""
+    section = (existing_doc or {}).get(tool_digests.TOOLS_KEY)
+    return tool_digests.is_owned(section) and not tool_digests.checksum_ok(section)
+
+
+def check_tools_writable(existing_doc: dict | None) -> None:
+    """Raise unless ``lock --connect`` may write the ``tools`` section.
+
+    Called before any server is started, as well as by :func:`regenerate`.
+
+    Raises:
+        LockWriteError: ``tools`` belongs to another producer or to a newer
+            mcp-audit schema (ADR-0005 §1: never overwrite another
+            producer's section).
+    """
+    section = (existing_doc or {}).get(tool_digests.TOOLS_KEY)
+    if section is None or tool_digests.is_owned(section):
+        return
+    producer = section.get("_producer") if isinstance(section, dict) else None
+    raise LockWriteError(
+        "The lock's `tools` section was written by "
+        f"{producer or 'another tool'!s} (or a newer mcp-audit), so "
+        "mcp-audit will not overwrite it. Remove that section first if "
+        "mcp-audit should record tool definitions here — see docs/lock.md."
+    )
+
+
+def _find_oversized_key(doc: dict) -> str:
+    """Identify which top-level key overflows the canonicalization bound.
+
+    Used only on the (rare) error path — :func:`serialize` has already
+    established that canonicalizing the whole document fails.
+    """
+    for key, value in doc.items():
+        try:
+            canonicalize({key: value})
+        except CanonicalError:
+            return key
+    return "<unknown>"
+
+
+def serialize(doc: dict) -> bytes:
+    """Render the full document to its on-disk bytes.
+
+    The on-disk format *is* the RFC 8785 canonical encoding — ADR-0005 §2
+    rule 2 — so that a section neither producer has touched reproduces
+    identical bytes on every write, regardless of which implementation
+    (or language) wrote it.
+
+    Args:
+        doc: The full lock document (owned sections + any foreign ones).
+
+    Returns:
+        Canonical UTF-8 bytes ready to write to disk.
+
+    Raises:
+        LockWriteError: A top-level section is too large to canonicalize
+            safely.  The message names the offending section — ADR-0005
+            §2 rule 3 / §10: never a bare traceback, never a partial write.
+    """
+    try:
+        return canonicalize(doc)
+    except CanonicalError:
+        offending = _find_oversized_key(doc)
+        raise LockWriteError(
+            f"{offending!r} section is too large for mcp-audit to process "
+            "safely (exceeds an internal canonicalization size bound), or "
+            "holds text with no canonical encoding (a lone UTF-16 surrogate). "
+            "This is a limitation of mcp-audit's own processing, not a "
+            "problem with your lock file — see docs/lock.md."
+        ) from None
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write *data* to *path* atomically, like ``fix --apply``.
+
+    The lock lives in a repository, so the temporary file is never a fixed
+    ``<name>.tmp`` (a repo can plant that as a symlink); see
+    :func:`mcp_audit._fs.atomic_write`. Written owner-only (0o600): git
+    records no read bits, so a teammate's checkout gets their own umask.
+
+    Args:
+        path: Destination file path.
+        data: Bytes to write.
+    """
+    atomic_write(path, data)
+
+
+def write_lock(path: Path, doc: dict) -> None:
+    """Serialize *doc* and write it atomically to *path*.
+
+    Args:
+        path: Destination ``mcp-lock.json`` path.
+        doc: The full lock document, as built by :func:`regenerate`.
+
+    Raises:
+        LockWriteError: See :func:`serialize`.
+    """
+    write_atomic(path, serialize(doc))

@@ -1,0 +1,277 @@
+# `mcp-audit diff` — MCP-aware diff for PRs and CI gates
+
+`mcp-audit diff <base> <head>` compares two MCP configuration states and surfaces
+what changed in MCP terms — servers, tools, capabilities, environment-variable
+references, external endpoints, and credentials — with risk classification.
+
+## PR Comment Output
+
+**`--format pr-comment` is the recommended output for any team already using the
+GitHub Action.** It posts a concise, GitHub-flavored Markdown summary directly on
+the PR conversation tab, putting MCP security in front of every reviewer — not
+just the engineer who ran the scanner.
+
+```bash
+# One-liner for local preview
+mcp-audit diff HEAD~1 HEAD --format pr-comment
+
+# Pipe straight into gh CLI
+mcp-audit diff HEAD~1 HEAD --format pr-comment | gh pr comment --body-file -
+```
+
+Output is capped at 100 lines with each changed server wrapped in a collapsible
+`<details>` block. All output lines are ≤ 100 characters wide (renders cleanly
+in the GitHub PR conversation view without horizontal scroll).
+
+**No-change case:** when base and head are identical, `--format pr-comment`
+outputs a clean "No MCP configuration changes detected" message and exits 0.
+
+### Copy-paste GitHub Actions workflow
+
+The fastest way to add PR-comment diffs to a repo is `examples/github-actions/diff-pr-comment.yml`
+(also at [`examples/github-actions/diff-pr-comment.yml`](../examples/github-actions/diff-pr-comment.yml)):
+
+```yaml
+name: MCP Diff (PR Comment)
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  mcp-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install mcp-audit
+        uses: adudley78/setup-mcp-audit@v1
+
+      - name: Scan base commit
+        run: |
+          git checkout ${{ github.event.pull_request.base.sha }}
+          mcp-audit scan --format json -o base.json || true
+
+      - name: Scan head commit
+        run: |
+          git checkout ${{ github.event.pull_request.head.sha }}
+          mcp-audit scan --format json -o head.json || true
+
+      - name: MCP-aware diff
+        run: |
+          mcp-audit diff base.json head.json \
+            --format pr-comment \
+            --severity-threshold medium \
+            > diff-output.md
+        continue-on-error: true
+
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('diff-output.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+```
+
+For teams using the composite action, `mode: diff` is a shorter alternative —
+see [`examples/github-actions/diff-mode.yml`](../examples/github-actions/diff-mode.yml).
+
+### When to prefer `diff-pr-comment.yml` over `mode: diff`
+
+| Approach | When to use |
+|----------|-------------|
+| `diff-pr-comment.yml` (explicit steps) | Full control over scan flags, separate base/head scans, custom comment body |
+| `mode: diff` in composite action | Simplest setup; single-step YAML; no separate install |
+
+---
+
+## JSON output
+
+The `--format json` output is a flat JSON array — one record per changed entity.
+Pipe it into `jq`, syslog, or your SIEM.
+
+```bash
+mcp-audit diff HEAD~1 HEAD --format json | jq '.[] | select(.severity == "HIGH")'
+```
+
+### JSON record schema
+
+Each record has:
+
+```json
+{
+  "change_type": "added" | "removed" | "changed",
+  "entity_type": "server" | "tool" | "capability" | "env_var" | "endpoint" | "credential",
+  "entity_name": "string",
+  "before": null | { ... },
+  "after": null | { ... },
+  "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO",
+  "owasp_mcp_top_10": ["MCP01", ...],
+  "parent_server": "string | null",
+  "command_diff": null | {
+    "before_command": ..., "after_command": ...,
+    "before_args": ..., "after_args": ...
+  },
+  "note": "string (only when set)"
+}
+```
+
+`note` is present on a changed server whose remote host or port moved, e.g. `remote host changed from a.example to b.example` (STORY-0135). Only the hostname and port are quoted, never userinfo or query strings.
+
+## Other output formats
+
+| Format | Flag | Use case |
+|--------|------|----------|
+| Terminal (Rich) | `--format terminal` (default) | Local development |
+| JSON | `--format json` | Machine-readable, syslog/SIEM |
+| PR-comment Markdown | `--format pr-comment` | GitHub PR comments, CI summaries |
+
+## When to use `diff` vs `scan`
+
+| Use case | Command |
+|----------|---------|
+| Full security audit of the current state | `mcp-audit scan` |
+| "What did this PR change, and how risky is it?" | `mcp-audit diff base head` |
+| Continuous monitoring on every config write | `mcp-audit watch` |
+
+`diff` is additive — it does not replace `scan`. AppSec teams typically run both:
+`scan` in the baseline CI workflow and `diff` on every pull request.
+
+## Input formats
+
+Each of `<base>` and `<head>` can be:
+
+- **A directory path** — all MCP configs discovered under that directory (same
+  discovery logic as `mcp-audit scan --path`).
+- **A JSON file path** — either a `mcp-audit scan --output-file` ScanResult JSON
+  or a raw MCP config JSON (`mcpServers` / `servers` root key). A `.toml` file
+  is read as Codex's `config.toml` and `.gemini/settings.json` as Gemini CLI's
+  settings (see [clients.md](clients.md)).
+- **A git ref** — any ref that `git show` can resolve: a SHA, `HEAD~3`, a branch
+  name, a tag. mcp-audit checks each known MCP config path at that ref,
+  including `.codex/config.toml` and `.gemini/settings.json`.
+
+```bash
+# Compare two directories
+mcp-audit diff configs/before/ configs/after/
+
+# Compare a saved scan against the current state
+mcp-audit diff scan-baseline.json configs/
+
+# Compare two git commits (most useful in CI)
+mcp-audit diff HEAD~1 HEAD
+mcp-audit diff $GITHUB_BASE_REF $GITHUB_HEAD_REF
+```
+
+**Scan files hold redacted launch arguments (since STORY-0108).** A ScanResult
+JSON replaces a credential in a server's `command`, `args` or `url` (URL user
+info such as a database password, or a known token format) with `[REDACTED]`,
+and the value of a secret-named flag that matches no known token format
+(`--password VALUE`, `--api-key=VALUE`) with `[REDACTED-FLAG]`. `diff` counts
+`[REDACTED]` in those fields as a hardcoded credential (CRITICAL) and
+`[REDACTED-FLAG]` as a possible one (HIGH, "Possible credential flag value"),
+so a credential added between two scan files is still reported. Flags named
+for a setting rather than a secret (`--auth-type`, `--keys-dir`,
+`--api-key-file`) and values such as `none`, `oauth`, paths, URLs and `$VAR`
+references are left alone. What a scan file can no longer show:
+
+- **Rotation is invisible between two scan files.** Two different secrets both
+  read `[REDACTED]`, so replacing one credential with another is not a change.
+  Compare directories or git refs to see it.
+- **Scans from before and after the change don't compare cleanly.** A scan file
+  written by an older mcp-audit has the secret in clear; diffing it against a
+  newer one reports the argument as changed. Re-run the older scan, or compare
+  config directories.
+- **Scan file against a directory** (or git ref): when exactly one side holds
+  redaction markers, `diff` compares both sides in their redacted form, so an
+  unchanged config reads as unchanged. A credential rotated in that pairing is
+  not visible, as with two scan files.
+- **Directory against directory, or git ref against git ref**: neither side
+  holds markers, so values are compared as written and a rotated credential
+  (argument, connection string, environment variable, URL query) is reported
+  as a change. The report prints redacted before/after values.
+- User info is redacted when it has a password (`user:pass@`) or when the user
+  name is not a plain account name (a token such as `https://ghp_…@github.com`
+  or `glpat-…@`). A plain account name such as `git@` in
+  `git+ssh://git@github.com/…` is kept and is not a credential.
+- Since STORY-0118 the scan file also redacts: secret-named query parameters
+  (`?token=`, `?api_key=`, `?sig=`, `?access_token=`, `?password=`, `?auth=`,
+  `?secret=`, `?key=`), credential headers in an argument
+  (`--header "X-API-Key: v"`, `Cookie:`, `Authorization:` with any scheme),
+  `Password=`/`Pwd=`/`secret=` pairs in a connection string, `curl -u user:pass`,
+  the value after `--password` even when it starts with `-`, Base64-looking URL
+  user info, and `servers[].env` values for every client (a credential in an
+  environment variable becomes `[REDACTED-FLAG]`, or `[REDACTED]` for a known
+  token format; `${VAR}` references and plain settings such as
+  `NODE_ENV=production` stay). Environment values are redacted by kind rather
+  than all at once so that every variable is not read as a credential. A secret
+  inside a single command string (`"command": "npx x --token abc"`) is still
+  recognised only in the shapes above.
+- `--format pr-comment`, `--format json` and the terminal output redact
+  `command`, `args` and URLs for every input kind (directories, git refs and
+  scan files) before they print or truncate them (STORY-0118). Where neither
+  input is a scan file, the comparison itself uses the real values.
+
+## Severity classification
+
+| Severity | Triggers |
+|----------|---------|
+| CRITICAL | Hardcoded credential in args/env values; newly-created toxic-flow pair |
+| HIGH | New server with shell-exec or file-write capability; new external endpoint; new high-value credential env-var reference (AWS, GCP, Azure, GitHub) |
+| MEDIUM | New tools added; new/changed env-var references; command or args changed |
+| LOW | New server with sanctioned capabilities, no credentials, no external endpoints |
+| INFO | Server removed |
+
+## Severity threshold and exit codes
+
+`--severity-threshold <level>` filters changes to only those at or above the
+given level. Exit codes mirror `mcp-audit scan`:
+
+- `0` — no changes at or above the threshold.
+- `1` — one or more changes at or above the threshold.
+- `2` — error (invalid input, git ref not found, etc.).
+
+```bash
+# Block the build only on HIGH+ MCP changes
+mcp-audit diff HEAD~1 HEAD --severity-threshold high
+```
+
+## GitHub Action integration
+
+Add `mode: diff` to the existing action — no separate workflow needed:
+
+```yaml
+- name: MCP diff
+  uses: adudley78/mcp-audit@v0.30.0
+  with:
+    mode: diff
+    severity-threshold: medium
+```
+
+When running on a `pull_request` event, the action automatically posts the
+PR-comment Markdown as a comment on the PR conversation tab.
+
+See [`examples/github-actions/diff-pr-comment.yml`](../examples/github-actions/diff-pr-comment.yml)
+for the explicit step-by-step workflow (recommended when you need separate scan
+flags for base and head).
+
+## Edge cases
+
+- **Renamed server** (same command + package, new `name` key): reported as
+  `server changed`, not `removed + added`.
+- **Reordered tools array**: no diff reported — tool comparison uses set equality.
+- **Whitespace-only JSON changes**: no diff reported.
+- **Git ref with no MCP configs**: returns empty list (no diff). Clear error
+  if the ref itself cannot be resolved.

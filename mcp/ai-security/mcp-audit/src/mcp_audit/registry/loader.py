@@ -1,0 +1,754 @@
+"""Known-server registry: load, query, and typosquat-check MCP package names.
+
+The registry is a versioned JSON dataset of legitimate MCP servers that the
+supply chain analyzer queries instead of a hardcoded package list.
+
+Resolution order when locating the registry file:
+  1. Caller-supplied ``path`` argument (explicit override).
+  2. User-cached registry: ``<user-config-dir>/mcp-audit/registry/known-servers.json``
+     (written by ``mcp-audit update-registry``; path resolved via ``platformdirs``).
+  3. PyInstaller frozen binary: resolved from ``sys._MEIPASS/registry/``.
+  4. importlib.resources (pip-installed wheel at
+     ``mcp_audit/registry/known-servers.json``).
+  5. Dev / editable install fallback: repo-root ``registry/known-servers.json``.
+
+Research basis: Levenshtein edit distance for typosquatting detection.
+Ref: "Typosquatting in Package Managers" — Vu et al., NDSS 2021
+  https://www.ndss-symposium.org/ndss-paper/detecting-node-js-package-name-squatting/
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Literal
+
+from platformdirs import user_config_dir
+from pydantic import BaseModel, ValidationError
+
+# ── PEP 503 normalisation ──────────────────────────────────────────────────────
+
+_PEP503_RE: re.Pattern[str] = re.compile(r"[-_.]+")
+
+
+def normalize_pypi_name(name: str) -> str:
+    """Normalise a Python package name per PEP 503.
+
+    Collapses runs of ``-``, ``_``, and ``.`` into a single ``-`` and
+    lowercases the result, making ``mcp_server_filesystem``,
+    ``MCP-Server-Filesystem``, and ``mcp-server-filesystem`` identical.
+
+    Args:
+        name: Raw package or module name.
+
+    Returns:
+        Normalised lowercase name.
+    """
+    return _PEP503_RE.sub("-", name).lower()
+
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+_USER_CACHE_PATH = (
+    Path(user_config_dir("mcp-audit")) / "registry" / "known-servers.json"
+)
+
+
+def _resolve_bundled_path() -> Path:
+    """Locate the bundled ``known-servers.json`` regardless of execution context.
+
+    Resolution order (delegated to :func:`~mcp_audit._paths.resolve_bundled_resource`):
+
+    1. PyInstaller frozen binary (``sys._MEIPASS/registry/known-servers.json``).
+    2. importlib.resources (pip-installed wheel at
+       ``mcp_audit/registry/known-servers.json``).
+    3. Dev / editable install fallback (repo-root
+       ``registry/known-servers.json``).
+
+    Returns:
+        Path to the bundled registry file.  The path may not exist if the
+        package was installed without the registry file (e.g. a bare source
+        checkout without running the package install).
+    """
+    from mcp_audit._paths import resolve_bundled_resource  # noqa: PLC0415
+
+    _dev_fallback = (
+        Path(__file__).parent.parent.parent.parent / "registry" / "known-servers.json"
+    )
+    result = resolve_bundled_resource(
+        package="mcp_audit.registry",
+        subdir="known-servers.json",
+        frozen_subpath="registry/known-servers.json",
+        dev_fallback=_dev_fallback,
+    )
+    return result if result is not None else _dev_fallback
+
+
+BUNDLED_REGISTRY_PATH: Path = _resolve_bundled_path()
+
+
+# ── Errors ───────────────────────────────────────────────────────────────────
+
+
+class RegistryLoadError(ValueError):
+    """A registry file exists but cannot be loaded (malformed JSON or a
+    duplicate entry name caught by :meth:`KnownServerRegistry._build_name_index`).
+
+    Subclasses ``ValueError`` on purpose: existing ``except ValueError`` call
+    sites (``cli/fix.py``'s ``_resolve_findings`` catch, and anything else
+    that already treats a bad registry as "just a ValueError") keep working
+    unchanged and automatically get the improved, path-naming,
+    recovery-hinting message below with no code change at their end. New call
+    sites that want to react *specifically* to a corrupt registry (as opposed
+    to some unrelated ``ValueError`` elsewhere in the same try block) should
+    catch ``RegistryLoadError``, not the broader ``ValueError`` — see
+    ``cli/scan.py``, ``cli/vet.py``, and ``cli/shadow.py``.
+
+    R45: found by re-running R43's transient "Duplicate registry entry" crash
+    deliberately instead of writing it off as noise. ``scan``, ``vet``, and
+    ``shadow`` had no catch at all around registry construction and printed a
+    raw Python traceback; ``fix`` and ``check`` happened to already catch
+    ``ValueError``/``Exception`` broadly, but neither message named the
+    offending file or said how to recover. This class fixes both: every
+    caller now gets the same path + reason + recovery text, whether it
+    catches broadly or narrowly.
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        """Build the error, storing *path* and *reason* for programmatic use.
+
+        Args:
+            path: The resolved registry file path that failed to load.
+            reason: Human-readable description of why (already includes any
+                nested exception detail — e.g. the JSON decoder message, or
+                :meth:`KnownServerRegistry._build_name_index`'s own duplicate-
+                name explanation).
+        """
+        self.path = path
+        self.reason = reason
+        super().__init__(
+            f"Registry file could not be loaded: {path}\n"
+            f"  Reason: {reason}\n"
+            "  To recover: delete this file, then run 'mcp-audit "
+            "update-registry' to fetch a fresh copy (or pass --registry to "
+            "use a different file)."
+        )
+
+
+# ── Data models ────────────────────────────────────────────────────────────────
+
+
+class RegistryEntry(BaseModel):
+    """A single entry in the known-server registry."""
+
+    name: str
+    source: Literal["npm", "pip", "github", "docker"]
+    repo: str | None
+    maintainer: str
+    verified: bool
+    last_verified: str
+    known_versions: list[str]
+    tags: list[str]
+
+    # Which package-manager ecosystem this entry belongs to.
+    # "npm"  — installed via npx/bunx/pnpx/yarn dlx (default for backward compat)
+    # "pypi" — installed via uvx/pipx/pip/python -m
+    # "any"  — ecosystem-agnostic (included in both npm and pypi comparison pools)
+    package_ecosystem: Literal["npm", "pypi", "any"] = "npm"
+
+    # Hash-based integrity pinning (Layer 1 supply chain attestation).
+    # key = version string (e.g. "0.6.2")
+    # value = "sha256:<hex>"
+    # None means no hashes have been pinned for this entry yet.
+    known_hashes: dict[str, str] | None = None
+
+    # Coarse-grained capability labels consumed by the toxic-flow analyzer
+    # (e.g. ["file_read", "file_write", "network_out"]).  ``None`` means the
+    # registry has no capability data for this entry and the toxic-flow
+    # analyzer should fall back to its keyword-matching logic.
+    capabilities: list[str] | None = None
+
+    # Supply chain risk metadata — populated manually or via scripts/enrich_registry.py.
+    # None means data has not been collected for this entry yet.
+
+    # ISO date string (YYYY-MM-DD) when the package was first published to npm/PyPI.
+    # A very recent first-publish date on an otherwise unknown package is a risk signal.
+    first_published: str | None = None
+
+    # Weekly download count sourced from npm or PyPI at last_verified time.
+    # Very low download counts on a package claiming to be widely-used is a risk signal.
+    weekly_downloads: int | None = None
+
+    # Ordered list of publisher account names that have released this package,
+    # most recent first. A new unknown publisher displacing the original is a
+    # risk signal for an account-takeover supply chain attack.
+    publisher_history: list[str] | None = None
+
+    # True when this package has an established CI-based publish pipeline with
+    # Sigstore provenance enabled. A missing attestation on such a package is a
+    # MEDIUM signal, not a neutral absence.
+    attestation_expected: bool = False
+
+    # CVE IDs (or other advisory IDs) known to affect this package.
+    # Populated from public disclosures. Used by --check-vulns to surface
+    # findings without requiring a live OSV.dev query.
+    known_vulnerabilities: list[str] | None = None
+
+    # Structured vulnerability records for this package.
+    # Each entry is a dict with keys: cve, cvss, description, fixed_in.
+    # Default empty list — entries without vuln data omit this field.
+    known_vulns: list[dict] = []
+
+    # The first semantic version released after the package used calendar
+    # versions (STORY-0105).  ``@modelcontextprotocol/server-filesystem`` went
+    # 0.6.2 -> 2025.1.14 ... 2026.8.31 -> 1.0.0, so this is "1.0.0": a semantic
+    # pin below it predates every calendar release, one at or above it came
+    # after them.  SC-004 uses it to order a pin against a fix recorded in the
+    # other scheme.  ``None`` (the default) means no switch back is recorded.
+    semver_resumed_at: str | None = None
+
+    # The upstream repository says the package is archived and gets no further
+    # fixes (STORY-0140).  The eleven reference servers moved to
+    # github.com/modelcontextprotocol/servers-archived, whose README says "No
+    # security updates or bug fixes will be provided".  ``archived`` drives
+    # SC-010 and the vet verdict; ``archive_notice`` is the URL that says so;
+    # ``successor`` names a replacement only when the upstream notice does.
+    archived: bool = False
+    archive_notice: str | None = None
+    successor: str | None = None
+
+
+# ── Registry class ─────────────────────────────────────────────────────────────
+
+
+class KnownServerRegistry:
+    """An in-memory snapshot of the known-server registry.
+
+    Attributes:
+        entries: All parsed registry entries.
+        schema_version: Registry schema version string.
+        last_updated: ISO date string of the last registry update.
+    """
+
+    def __init__(self, path: Path | None = None, offline: bool = False) -> None:
+        """Load the registry from *path*, user cache, or bundled fallback.
+
+        Args:
+            path: Explicit path to a registry JSON file.  When ``None``, the
+                loader tries the user cache then the bundled registry.
+            offline: When ``True``, skip the user-local cache at
+                ``<user-config-dir>/mcp-audit/registry/known-servers.json`` and load
+                directly from the bundled registry.  Equivalent to passing
+                ``path=BUNDLED_REGISTRY_PATH`` but does not override an
+                explicit *path* argument.
+
+        Raises:
+            FileNotFoundError: If no registry file can be located.
+            RegistryLoadError: If the located registry file's JSON is
+                malformed, an entry fails schema validation, or two entries
+                share the same (case-insensitive) ``name`` — see
+                :meth:`_build_name_index`. Subclasses ``ValueError``, so
+                existing ``except ValueError`` call sites keep working.
+        """
+        resolved = self._locate(path, offline=offline)
+        raw = resolved.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RegistryLoadError(
+                resolved, f"Malformed registry JSON: {exc}"
+            ) from exc
+
+        self.schema_version: str = str(data.get("schema_version", "unknown"))
+        self.last_updated: str = str(data.get("last_updated", "unknown"))
+
+        raw_entries = data.get("entries", [])
+        try:
+            self.entries: list[RegistryEntry] = [
+                RegistryEntry.model_validate(e) for e in raw_entries
+            ]
+        except ValidationError as exc:
+            raise RegistryLoadError(resolved, f"Invalid entry data: {exc}") from exc
+
+        # Build a lowercase name → entry index for O(1) exact lookups (all entries).
+        #
+        # ``name`` is a *global* key here, not scoped by ``package_ecosystem``:
+        # get()/is_known() are called by toxic_flow, the rule engine, governance,
+        # attestation, and shadow-risk analyzers with no ecosystem context at all
+        # (they just want "is this token a known package"). Only supply_chain's
+        # npm branch and vet's npm branch treat get()/is_known() as npm-scoped —
+        # they never call this constructor with two same-named entries in mind.
+        # A second entry with the same lowercased name therefore cannot be
+        # resolved safely: silently keeping "whichever the dict saw last" lets
+        # get() return an unrelated entry's verified/capabilities data depending
+        # on JSON array order, which is exactly how vet and toxic-flow reported
+        # wrong data for "mcp-server-git" (an npm entry for an unrelated security
+        # canary package collided with the real, verified PyPI entry). Fail
+        # loudly at load time instead so the collision is fixed in the data, not
+        # silently outrun in a lookup.
+        try:
+            self._name_index = self._build_name_index(self.entries)
+        except ValueError as exc:
+            # Wrap, don't change: _build_name_index's own raise (message,
+            # condition) is untouched — this only adds the file path and
+            # recovery instructions that a static method operating on a bare
+            # entries list has no way to know. See RegistryLoadError's
+            # docstring for why this stays a ValueError subclass.
+            raise RegistryLoadError(resolved, str(exc)) from exc
+
+        # PyPI-ecosystem sub-index (PEP 503 normalised name → entry).
+        self._pypi_entries: list[RegistryEntry] = [
+            e for e in self.entries if e.package_ecosystem in ("pypi", "any")
+        ]
+        self._pypi_norm_index: dict[str, RegistryEntry] = {
+            normalize_pypi_name(e.name): e for e in self._pypi_entries
+        }
+
+        # npm-ecosystem sub-index (lowercased name → entry). Mirrors the PyPI
+        # sub-index above so npm-scoped callers (supply_chain's npm branch,
+        # vet's npm branch) never resolve a PyPI-only entry by name collision.
+        # npm names are case-sensitive in practice, but the pre-existing
+        # ecosystem-agnostic index already lowercases, so this sub-index keeps
+        # that behaviour rather than introducing a second comparison
+        # convention. No PEP 503 normalisation — that is a Python-packaging
+        # rule and does not apply to npm package names.
+        self._npm_entries: list[RegistryEntry] = [
+            e for e in self.entries if e.package_ecosystem in ("npm", "any")
+        ]
+        self._npm_name_index: dict[str, RegistryEntry] = {
+            e.name.lower(): e for e in self._npm_entries
+        }
+
+    # ── Query methods ──────────────────────────────────────────────────────────
+
+    def get(self, name: str) -> RegistryEntry | None:
+        """Return the registry entry for *name*, or ``None`` if not found.
+
+        Args:
+            name: Package name to look up (case-insensitive).
+
+        Returns:
+            :class:`RegistryEntry` when the name is a known-legitimate entry,
+            otherwise ``None``.
+        """
+        return self._name_index.get(name.lower())
+
+    def is_known(self, name: str) -> bool:
+        """Return True if *name* exactly matches a registry entry (case-insensitive).
+
+        Args:
+            name: Package name to look up.
+
+        Returns:
+            ``True`` when the name is a known-legitimate entry.
+        """
+        return name.lower() in self._name_index
+
+    def find_closest(self, name: str, threshold: int = 2) -> RegistryEntry | None:
+        """Return the closest registry entry within *threshold* edit distance.
+
+        Returns ``None`` for exact matches (the caller should use
+        :meth:`is_known` to filter those out first) and for names that are
+        farther than *threshold* edits from every entry.
+
+        Args:
+            name: Lowercase package name to check.
+            threshold: Maximum Levenshtein distance to consider (inclusive).
+
+        Returns:
+            Closest :class:`RegistryEntry`, or ``None``.
+        """
+        lower = name.lower()
+
+        # Exact match → not a typosquat.
+        if lower in self._name_index:
+            return None
+
+        closest_entry: RegistryEntry | None = None
+        min_dist = threshold + 1  # sentinel: one beyond threshold
+
+        for entry in self.entries:
+            d = levenshtein(lower, entry.name.lower())
+            if d == 0:
+                # Should not happen given the index check above, but guard anyway.
+                return None
+            if d < min_dist:
+                min_dist = d
+                closest_entry = entry
+                if d == 1:
+                    break  # can't do better without an exact match
+
+        return closest_entry if min_dist <= threshold else None
+
+    def names(self) -> list[str]:
+        """Return all entry names (original casing) for external iteration.
+
+        Returns:
+            List of package name strings from every registry entry.
+        """
+        return [e.name for e in self.entries]
+
+    def is_known_pypi(self, name: str) -> bool:
+        """Return ``True`` if *name* exactly matches a PyPI registry entry.
+
+        Comparison uses PEP 503 normalisation so ``mcp_server_filesystem`` and
+        ``mcp-server-filesystem`` are treated as the same name.
+
+        Args:
+            name: Package or module name to look up.
+
+        Returns:
+            ``True`` when the normalised name is a known-good PyPI entry.
+        """
+        return normalize_pypi_name(name) in self._pypi_norm_index
+
+    def get_pypi(self, name: str) -> RegistryEntry | None:
+        """Return the registry entry for PyPI package *name*, or ``None``.
+
+        Uses PEP 503 normalisation so ``mcp_server_filesystem`` and
+        ``mcp-server-filesystem`` resolve to the same entry.
+
+        Args:
+            name: Package or module name to look up.
+
+        Returns:
+            :class:`RegistryEntry` when the name matches a known PyPI entry,
+            otherwise ``None``.
+        """
+        return self._pypi_norm_index.get(normalize_pypi_name(name))
+
+    def find_closest_pypi(self, name: str, threshold: int = 2) -> RegistryEntry | None:
+        """Return the closest PyPI registry entry within *threshold* edit distance.
+
+        Compares *name* (PEP 503 normalised) against all entries whose
+        ``package_ecosystem`` is ``"pypi"`` or ``"any"``.  Returns ``None``
+        for exact matches (use :meth:`is_known_pypi` to filter those first) and
+        for names farther than *threshold* edits from every entry.
+
+        Args:
+            name: Package name to check (normalisation applied internally).
+            threshold: Maximum Levenshtein distance to consider (inclusive).
+
+        Returns:
+            Closest :class:`RegistryEntry`, or ``None``.
+        """
+        norm = normalize_pypi_name(name)
+
+        if norm in self._pypi_norm_index:
+            return None  # exact match — not a typosquat
+
+        closest_entry: RegistryEntry | None = None
+        min_dist = threshold + 1  # sentinel
+
+        for entry in self._pypi_entries:
+            d = levenshtein(norm, normalize_pypi_name(entry.name))
+            if d == 0:
+                return None  # shouldn't happen given the index check above
+            if d < min_dist:
+                min_dist = d
+                closest_entry = entry
+                if d == 1:
+                    break  # can't improve without an exact match
+
+        return closest_entry if min_dist <= threshold else None
+
+    def get_pypi_names(self) -> set[str]:
+        """Return PEP 503-normalised names for all PyPI ecosystem entries.
+
+        Useful for testing and external tooling that needs the full PyPI
+        comparison pool.
+
+        Returns:
+            Set of normalised package name strings.
+        """
+        return {normalize_pypi_name(e.name) for e in self._pypi_entries}
+
+    def is_known_npm(self, name: str) -> bool:
+        """Return ``True`` if *name* exactly matches an npm registry entry.
+
+        Comparison is case-insensitive, matching the existing ecosystem-agnostic
+        index. No PEP 503 normalisation is applied — that is a Python-packaging
+        rule and does not apply to npm package names.
+
+        Args:
+            name: Package name to look up.
+
+        Returns:
+            ``True`` when the name is a known-good npm entry.
+        """
+        return name.lower() in self._npm_name_index
+
+    def get_npm(self, name: str) -> RegistryEntry | None:
+        """Return the registry entry for npm package *name*, or ``None``.
+
+        Only matches entries whose ``package_ecosystem`` is ``"npm"`` or
+        ``"any"`` — a same-named PyPI-only entry is never returned here.
+
+        Args:
+            name: Package name to look up (case-insensitive).
+
+        Returns:
+            :class:`RegistryEntry` when the name matches a known npm entry,
+            otherwise ``None``.
+        """
+        return self._npm_name_index.get(name.lower())
+
+    def find_closest_npm(self, name: str, threshold: int = 2) -> RegistryEntry | None:
+        """Return the closest npm registry entry within *threshold* edit distance.
+
+        Compares *name* (lowercased) against all entries whose
+        ``package_ecosystem`` is ``"npm"`` or ``"any"`` — a PyPI-only entry is
+        never a typosquat comparison target for an npm package name. Returns
+        ``None`` for exact matches (use :meth:`is_known_npm` to filter those
+        first) and for names farther than *threshold* edits from every entry.
+
+        Args:
+            name: Package name to check (lowercased internally).
+            threshold: Maximum Levenshtein distance to consider (inclusive).
+
+        Returns:
+            Closest :class:`RegistryEntry`, or ``None``.
+        """
+        lower = name.lower()
+
+        if lower in self._npm_name_index:
+            return None  # exact match — not a typosquat
+
+        closest_entry: RegistryEntry | None = None
+        min_dist = threshold + 1  # sentinel
+
+        for entry in self._npm_entries:
+            d = levenshtein(lower, entry.name.lower())
+            if d == 0:
+                return None  # shouldn't happen given the index check above
+            if d < min_dist and not scoped_parts_close(lower, entry.name.lower()):
+                continue
+            if d < min_dist:
+                min_dist = d
+                closest_entry = entry
+                if d == 1:
+                    break  # can't improve without an exact match
+
+        return closest_entry if min_dist <= threshold else None
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_name_index(
+        entries: list[RegistryEntry],
+    ) -> dict[str, RegistryEntry]:
+        """Build the lowercase-name → entry index, rejecting name collisions.
+
+        Registry entry names must be globally unique (case-insensitively)
+        across the whole file, regardless of ``source`` / ``package_ecosystem``.
+        ``get()`` and ``is_known()`` are the ecosystem-agnostic lookup path
+        used by most callers (toxic_flow, the rule engine, governance,
+        attestation, shadow-risk) — they have no way to disambiguate two
+        entries that share a name, so a collision here means one of the two
+        entries is wrong (a duplicate, a misclassified ecosystem, or a bogus
+        submission) and must be fixed in the data, not papered over by
+        picking whichever entry happened to load last.
+
+        Args:
+            entries: Parsed registry entries, in file order.
+
+        Returns:
+            Mapping of lowercased name to its unique :class:`RegistryEntry`.
+
+        Raises:
+            ValueError: If two or more entries share a lowercased name.
+        """
+        index: dict[str, RegistryEntry] = {}
+        for entry in entries:
+            key = entry.name.lower()
+            existing = index.get(key)
+            if existing is not None:
+                raise ValueError(
+                    f"Duplicate registry entry name {entry.name!r}: "
+                    f"one entry is source={existing.source!r} "
+                    f"(package_ecosystem={existing.package_ecosystem!r}, "
+                    f"verified={existing.verified}), another is "
+                    f"source={entry.source!r} "
+                    f"(package_ecosystem={entry.package_ecosystem!r}, "
+                    f"verified={entry.verified}). get()/is_known() perform "
+                    "ecosystem-agnostic lookups by name, so two entries "
+                    "sharing a name would make lookups non-deterministic. "
+                    "Rename or remove one of the conflicting entries."
+                )
+            index[key] = entry
+        return index
+
+    @staticmethod
+    def _locate(path: Path | None, offline: bool = False) -> Path:
+        """Resolve the registry file path from explicit arg, cache, or bundle.
+
+        Args:
+            path: Explicit path override.  When supplied, *offline* has no effect.
+            offline: When ``True``, skip the user-cache path and resolve directly
+                to the bundled registry.
+        """
+        if path is not None:
+            # Security: resolve() canonicalises the path (eliminates .., symlinks).
+            # No boundary check needed — the user may legitimately point anywhere.
+            path = path.resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"Registry file not found: {path}")
+            return path
+
+        if not offline and _USER_CACHE_PATH.exists():
+            return _USER_CACHE_PATH
+
+        if BUNDLED_REGISTRY_PATH.exists():
+            return BUNDLED_REGISTRY_PATH
+
+        raise FileNotFoundError(
+            "No registry file found. Run 'mcp-audit update-registry' to fetch "
+            f"the latest, or ensure the package is installed correctly. "
+            f"(searched: {_USER_CACHE_PATH}, {BUNDLED_REGISTRY_PATH})"
+        )
+
+
+# ── Module-level convenience ───────────────────────────────────────────────────
+
+
+def load_registry(
+    path: Path | None = None, offline: bool = False
+) -> KnownServerRegistry:
+    """Load and return a :class:`KnownServerRegistry`.
+
+    Resolution order (unless *path* is given):
+    1. User-local cache at ``<user-config-dir>/mcp-audit/registry/known-servers.json``
+       (resolved via ``platformdirs``; skipped when *offline* is ``True``).
+    2. Bundled registry shipped with the package.
+
+    Args:
+        path: Optional explicit registry file path.  Overrides the resolution
+            order entirely — *offline* has no effect when *path* is supplied.
+        offline: When ``True``, skip the user-local cache and use only the
+            bundled registry.  Useful for reproducible scans that must not
+            depend on externally-written cache files.
+
+    Returns:
+        Populated :class:`KnownServerRegistry` instance.
+    """
+    return KnownServerRegistry(path=path, offline=offline)
+
+
+# ── Levenshtein implementation ─────────────────────────────────────────────────
+
+
+# A scope or name part that differs from the registry entry's counts as a
+# lookalike only when at most this fraction of the entry part's characters
+# were edited (Q-015).
+_SCOPED_PART_MAX_EDIT_FRACTION = 3
+
+
+def _split_scoped(name: str) -> tuple[str, str] | None:
+    """Return ``(scope, name)`` for ``@scope/name``, or ``None`` if unscoped."""
+    if not name.startswith("@") or "/" not in name:
+        return None
+    scope, _, rest = name[1:].partition("/")
+    return scope, rest
+
+
+def scoped_parts_close(candidate: str, entry_name: str) -> bool:
+    """Return whether two scoped npm names are close part by part (Q-015).
+
+    A whole-string edit distance of 3 made ``@netlify/mcp`` a typosquat of
+    ``@mintlify/mcp``: two real vendors whose short scopes share most letters.
+    An npm scope is an owned namespace, so a lookalike works only if each
+    part a reader compares still looks like the original.  When both names
+    are scoped, the scope and the name are compared separately, and every
+    part that differs must have no more than a third of the entry part's
+    length edited, counting an adjacent swap as one edit (optimal string
+    alignment, so ``@azrue/mcp`` is one edit from ``@azure/mcp``).
+    ``mintlify`` is 8 characters, so at most 2 edits; ``netlify`` needs 3.
+    Real squats stay in: a one- or two-letter slip
+    in a scope (``@modelcontextprotocal/...``) or a name
+    (``@modelcontextprotocol/server-filesytem``), or both.
+
+    Unscoped names, or one scoped and one unscoped, are not split and keep
+    the whole-string comparison.
+
+    Args:
+        candidate: The configured package name, lowercased.
+        entry_name: The registry entry's name, lowercased.
+
+    Returns:
+        ``True`` when the pair stays a typosquat candidate.
+    """
+    a, b = _split_scoped(candidate), _split_scoped(entry_name)
+    if a is None or b is None:
+        return True
+    for part_a, part_b in zip(a, b, strict=True):
+        dist = osa_distance(part_a, part_b)
+        if dist and dist * _SCOPED_PART_MAX_EDIT_FRACTION > len(part_b):
+            return False
+    return True
+
+
+def osa_distance(a: str, b: str) -> int:
+    """Return the optimal-string-alignment distance between *a* and *b*.
+
+    Levenshtein distance plus one operation: swapping two adjacent
+    characters counts as a single edit (Damerau's observation that
+    transpositions are among the commonest typing errors).  O(len(a) *
+    len(b)) time, three rows of memory.
+
+    Args:
+        a: First string.
+        b: Second string.
+
+    Returns:
+        The number of single-character insertions, deletions, substitutions
+        and adjacent transpositions needed to turn *a* into *b*.
+    """
+    if a == b:
+        return 0
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[len(b)]
+
+
+def levenshtein(a: str, b: str) -> int:
+    """Compute the Levenshtein edit distance between two strings.
+
+    Standard Wagner-Fischer edit distance. Uses a space-optimised two-row DP
+    approach: O(min(|a|,|b|)) space, O(|a| * |b|) time.
+
+    Canonical implementation — imported by
+    :mod:`mcp_audit.analyzers.supply_chain` for typosquatting detection.
+
+    Args:
+        a: First string.
+        b: Second string.
+
+    Returns:
+        Non-negative integer edit distance.
+    """
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    m, n = len(a), len(b)
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        curr = [i] + [0] * n
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(
+                curr[j - 1] + 1,
+                prev[j] + 1,
+                prev[j - 1] + cost,
+            )
+        prev = curr
+    return prev[n]

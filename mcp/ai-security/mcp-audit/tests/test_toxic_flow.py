@@ -1,0 +1,1595 @@
+"""Tests for the ToxicFlowAnalyzer — cross-server capability combinations.
+
+Test strategy:
+- Unit tests for tag_server() covering known-package lookup, keyword matching,
+  and tool-name matching (layer 3, runtime enumeration data).
+- Integration tests for analyze_all() covering all TOXIC-001…TOXIC-007 rules,
+  self-pair (single server with both capabilities), cross-pair (two separate
+  servers), and negative cases (no dangerous combination).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from mcp_audit.analyzers.toxic_flow import (
+    INTEGRITY_PAIRS,
+    KNOWN_SERVERS,
+    KNOWN_TAG_ONLY_CAPABILITIES,
+    TOXIC_AND_INTEGRITY_PAIRS,
+    TOXIC_PAIRS,
+    Capability,
+    TagOnlyCapability,
+    TagOnlyKind,
+    ToxicFlowAnalyzer,
+    ToxicPair,
+    compute_dead_capabilities,
+    tag_server,
+)
+from mcp_audit.models import ServerConfig, Severity, TransportType
+from mcp_audit.registry.loader import KnownServerRegistry, RegistryEntry
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+_CFG = Path("/tmp/mcp.json")  # noqa: S108
+
+
+def _server(
+    name: str,
+    command: str = "npx",
+    args: list[str] | None = None,
+    raw: dict | None = None,
+    client: str = "cursor",
+) -> ServerConfig:
+    return ServerConfig(
+        name=name,
+        client=client,
+        config_path=_CFG,
+        transport=TransportType.STDIO,
+        command=command,
+        args=args or [],
+        raw=raw or {},
+    )
+
+
+def _fs() -> ServerConfig:
+    """Filesystem server — FILE_READ + FILE_WRITE."""
+    return _server(
+        "filesystem",
+        args=["-y", "@modelcontextprotocol/server-filesystem", "/home"],
+    )
+
+
+def _fetch() -> ServerConfig:
+    """Fetch server — NETWORK_OUT."""
+    return _server("fetch", args=["-y", "@modelcontextprotocol/server-fetch"])
+
+
+def _github() -> ServerConfig:
+    """GitHub server — GIT + NETWORK_OUT."""
+    return _server("github", args=["-y", "@modelcontextprotocol/server-github"])
+
+
+def _postgres() -> ServerConfig:
+    """Postgres server — DATABASE."""
+    return _server("postgres", args=["-y", "@modelcontextprotocol/server-postgres"])
+
+
+def _gmail() -> ServerConfig:
+    """Gmail server — EMAIL + NETWORK_OUT."""
+    return _server("gmail", args=["-y", "@modelcontextprotocol/server-gmail"])
+
+
+def _puppeteer() -> ServerConfig:
+    """Puppeteer server — BROWSER + NETWORK_OUT."""
+    return _server("puppeteer", args=["-y", "@modelcontextprotocol/server-puppeteer"])
+
+
+def _shell_server() -> ServerConfig:
+    """Unknown server whose name implies SHELL_EXEC via keyword matching."""
+    return _server("bash-runner", command="bash", args=["run.sh"])
+
+
+def _vault_server() -> ServerConfig:
+    """Unknown server whose name implies SECRETS via keyword matching."""
+    return _server("vault-client", command="node", args=["vault-connector.js"])
+
+
+def _memory() -> ServerConfig:
+    """Memory server — no dangerous capabilities."""
+    return _server("memory", args=["-y", "@modelcontextprotocol/server-memory"])
+
+
+# ── tag_server — known-package lookup ────────────────────────────────────────
+
+
+class TestTagServerKnownPackages:
+    def test_filesystem_package_gives_file_caps(self) -> None:
+        caps = tag_server(_fs())
+        assert Capability.FILE_READ in caps
+        assert Capability.FILE_WRITE in caps
+
+    def test_fetch_package_gives_network_cap(self) -> None:
+        caps = tag_server(_fetch())
+        assert Capability.NETWORK_OUT in caps
+        assert Capability.FILE_READ not in caps
+
+    def test_github_package_gives_git_and_network(self) -> None:
+        caps = tag_server(_github())
+        assert Capability.GIT in caps
+        assert Capability.NETWORK_OUT in caps
+
+    def test_postgres_package_gives_database_cap(self) -> None:
+        caps = tag_server(_postgres())
+        assert Capability.DATABASE in caps
+
+    def test_gmail_package_gives_email_and_network(self) -> None:
+        caps = tag_server(_gmail())
+        assert Capability.EMAIL in caps
+        assert Capability.NETWORK_OUT in caps
+
+    def test_puppeteer_package_gives_browser_and_network(self) -> None:
+        caps = tag_server(_puppeteer())
+        assert Capability.BROWSER in caps
+        assert Capability.NETWORK_OUT in caps
+
+    def test_memory_package_has_no_dangerous_caps(self) -> None:
+        caps = tag_server(_memory())
+        assert caps == frozenset()
+
+    def test_known_servers_fallback_dict_covers_expected_keys(self) -> None:
+        """Verify the in-module KNOWN_SERVERS fallback contains expected keys.
+
+        This fallback is only used when the JSON registry is unavailable.
+        For registry coverage, see test_tag_server_uses_registry_capabilities.
+        """
+        assert "@modelcontextprotocol/server-filesystem" in KNOWN_SERVERS
+        assert "@modelcontextprotocol/server-fetch" in KNOWN_SERVERS
+        assert "@modelcontextprotocol/server-github" in KNOWN_SERVERS
+
+    def test_git_package_gives_git_and_file_read(self) -> None:
+        server = _server("git", args=["-y", "@modelcontextprotocol/server-git"])
+        caps = tag_server(server)
+        assert Capability.GIT in caps
+        assert Capability.FILE_READ in caps
+
+
+# ── tag_server — keyword matching ────────────────────────────────────────────
+
+
+class TestTagServerKeywords:
+    def test_command_bash_implies_shell_exec(self) -> None:
+        caps = tag_server(_shell_server())
+        assert Capability.SHELL_EXEC in caps
+
+    def test_arg_containing_postgres_implies_database(self) -> None:
+        server = _server("db", command="node", args=["pg-server.js", "--database"])
+        caps = tag_server(server)
+        assert Capability.DATABASE in caps
+
+    def test_arg_containing_vault_implies_secrets(self) -> None:
+        caps = tag_server(_vault_server())
+        assert Capability.SECRETS in caps
+
+    def test_name_containing_fetch_implies_network(self) -> None:
+        server = _server("my-fetch-server", command="node", args=["server.js"])
+        caps = tag_server(server)
+        assert Capability.NETWORK_OUT in caps
+
+    def test_arg_http_implies_network(self) -> None:
+        server = _server("api", command="python", args=["server.py", "--http"])
+        caps = tag_server(server)
+        assert Capability.NETWORK_OUT in caps
+
+    def test_arg_sqlite_implies_database(self) -> None:
+        server = _server("lite", command="python", args=["sqlite_server.py"])
+        caps = tag_server(server)
+        assert Capability.DATABASE in caps
+
+    def test_arg_smtp_implies_email(self) -> None:
+        server = _server("mailer", command="node", args=["smtp-relay.js"])
+        caps = tag_server(server)
+        assert Capability.EMAIL in caps
+
+    def test_arg_playwright_implies_browser(self) -> None:
+        server = _server("scraper", command="npx", args=["playwright", "serve"])
+        caps = tag_server(server)
+        assert Capability.BROWSER in caps
+
+    def test_arg_github_implies_git(self) -> None:
+        server = _server("vcs", command="node", args=["github-mcp.js"])
+        caps = tag_server(server)
+        assert Capability.GIT in caps
+
+    def test_arg_curl_implies_network(self) -> None:
+        server = _server("downloader", command="curl", args=["https://example.com"])
+        caps = tag_server(server)
+        assert Capability.NETWORK_OUT in caps
+
+    def test_server_with_no_recognisable_keywords_has_no_caps(self) -> None:
+        server = _server("unknown-thing", command="ruby", args=["my_gem.rb"])
+        caps = tag_server(server)
+        assert caps == frozenset()
+
+
+# ── tag_server — layer 3: tool-name matching ──────────────────────────────────
+
+
+class TestTagServerToolNames:
+    def test_tool_named_read_file_implies_file_caps(self) -> None:
+        server = _server(
+            "enumerated",
+            command="node",
+            args=["server.js"],
+            raw={
+                "tools": [
+                    {"name": "read_file", "description": "Reads a file from disk"},
+                ]
+            },
+        )
+        caps = tag_server(server)
+        assert Capability.FILE_READ in caps
+
+    def test_tool_description_mentioning_http_implies_network(self) -> None:
+        server = _server(
+            "enumerated",
+            command="node",
+            args=["server.js"],
+            raw={
+                "tools": [
+                    {
+                        "name": "do_thing",
+                        "description": "Makes an http request to the given URL",
+                    },
+                ]
+            },
+        )
+        caps = tag_server(server)
+        assert Capability.NETWORK_OUT in caps
+
+    def test_tool_names_augment_existing_caps(self) -> None:
+        # Known package gives FILE_READ/WRITE; runtime tools add NETWORK_OUT.
+        server = ServerConfig(
+            name="filesystem",
+            client="cursor",
+            config_path=_CFG,
+            transport=TransportType.STDIO,
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-filesystem", "/home"],
+            raw={
+                "tools": [
+                    {"name": "fetch_remote", "description": "Fetches a URL"},
+                ]
+            },
+        )
+        caps = tag_server(server)
+        assert Capability.FILE_READ in caps
+        assert Capability.NETWORK_OUT in caps
+
+    def test_non_dict_tools_entries_are_skipped(self) -> None:
+        server = _server(
+            "weird",
+            raw={"tools": ["not-a-dict", None, 42]},
+        )
+        # Should not raise; just produce no extra caps.
+        caps = tag_server(server)
+        assert isinstance(caps, frozenset)
+
+
+# ── analyze_all — negative cases ─────────────────────────────────────────────
+
+
+class TestAnalyzeAllNegative:
+    def test_no_servers_produces_no_findings(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([])
+        assert findings == []
+
+    def test_single_server_with_only_file_caps_produces_no_findings(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs()])
+        assert findings == []
+
+    def test_two_filesystem_servers_produce_no_findings(self) -> None:
+        """Same capabilities — no dangerous combination between them."""
+        fs_a = _server("fs-a", args=["-y", "@modelcontextprotocol/server-filesystem"])
+        fs_b = _server("fs-b", args=["-y", "@modelcontextprotocol/server-filesystem"])
+        findings = ToxicFlowAnalyzer().analyze_all([fs_a, fs_b])
+        assert findings == []
+
+    def test_memory_server_alone_produces_no_findings(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_memory()])
+        assert findings == []
+
+    def test_two_memory_servers_produce_no_findings(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_memory(), _memory()])
+        assert findings == []
+
+    def test_analyze_single_server_is_always_empty(self) -> None:
+        """Single-server analyze() is a no-op — toxic flow needs pairs."""
+        assert ToxicFlowAnalyzer().analyze(_fs()) == []
+        assert ToxicFlowAnalyzer().analyze(_fetch()) == []
+
+
+# ── analyze_all — TOXIC-001: file read + network ──────────────────────────────
+
+
+class TestToxic001:
+    def test_filesystem_and_fetch_trigger_toxic001(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        ids = {f.id for f in findings}
+        assert "TOXIC-001" in ids
+
+    def test_finding_names_both_servers(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        # Both server names must appear somewhere in the finding.
+        combined = f"{toxic001.server} {toxic001.evidence}"
+        assert "filesystem" in combined
+        assert "fetch" in combined
+
+    def test_severity_is_high(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        assert toxic001.severity == Severity.HIGH
+
+    def test_analyzer_field_is_toxic_flow(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        assert all(f.analyzer == "toxic_flow" for f in findings)
+
+    def test_finding_path_is_set(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        assert toxic001.finding_path is not None
+
+    def test_reverse_order_still_triggers_toxic001(self) -> None:
+        """Pair detection should be symmetric — order in the list doesn't matter."""
+        findings = ToxicFlowAnalyzer().analyze_all([_fetch(), _fs()])
+        assert any(f.id == "TOXIC-001" for f in findings)
+
+    def test_cwe_is_present(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        assert toxic001.cwe is not None
+
+
+# ── analyze_all — TOXIC-002: file read + email ────────────────────────────────
+
+
+class TestToxic002:
+    def test_filesystem_and_gmail_trigger_toxic002(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _gmail()])
+        assert any(f.id == "TOXIC-002" for f in findings)
+
+    def test_severity_is_high(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _gmail()])
+        f = next(x for x in findings if x.id == "TOXIC-002")
+        assert f.severity == Severity.HIGH
+
+
+# ── analyze_all — TOXIC-003: secrets + network ────────────────────────────────
+
+
+class TestToxic003:
+    def test_vault_and_fetch_trigger_toxic003(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_vault_server(), _fetch()])
+        assert any(f.id == "TOXIC-003" for f in findings)
+
+    def test_severity_is_critical(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_vault_server(), _fetch()])
+        f = next(x for x in findings if x.id == "TOXIC-003")
+        assert f.severity == Severity.CRITICAL
+
+    def test_finding_names_both_servers(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_vault_server(), _fetch()])
+        f = next(x for x in findings if x.id == "TOXIC-003")
+        combined = f"{f.server} {f.evidence}"
+        assert "vault-client" in combined
+        assert "fetch" in combined
+
+
+# ── analyze_all — TOXIC-004: file read + shell ────────────────────────────────
+
+
+class TestToxic004:
+    def test_filesystem_and_shell_trigger_toxic004(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _shell_server()])
+        assert any(f.id == "TOXIC-004" for f in findings)
+
+    def test_severity_is_high(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _shell_server()])
+        f = next(x for x in findings if x.id == "TOXIC-004")
+        assert f.severity == Severity.HIGH
+
+
+# ── analyze_all — TOXIC-005: database + network ───────────────────────────────
+
+
+class TestToxic005:
+    def test_postgres_and_fetch_trigger_toxic005(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_postgres(), _fetch()])
+        assert any(f.id == "TOXIC-005" for f in findings)
+
+    def test_severity_is_high(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_postgres(), _fetch()])
+        f = next(x for x in findings if x.id == "TOXIC-005")
+        assert f.severity == Severity.HIGH
+
+
+# ── analyze_all — TOXIC-006: shell + network ──────────────────────────────────
+
+
+class TestToxic006:
+    def test_shell_and_fetch_trigger_toxic006(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_shell_server(), _fetch()])
+        assert any(f.id == "TOXIC-006" for f in findings)
+
+    def test_severity_is_critical(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_shell_server(), _fetch()])
+        f = next(x for x in findings if x.id == "TOXIC-006")
+        assert f.severity == Severity.CRITICAL
+
+    def test_finding_names_both_servers(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_shell_server(), _fetch()])
+        f = next(x for x in findings if x.id == "TOXIC-006")
+        combined = f"{f.server} {f.evidence}"
+        assert "bash-runner" in combined
+        assert "fetch" in combined
+
+
+# ── analyze_all — TOXIC-007: git + network ────────────────────────────────────
+
+
+class TestToxic007:
+    def test_github_server_alone_triggers_toxic007_self_pair(self) -> None:
+        """GitHub has both GIT and NETWORK_OUT — triggers TOXIC-007 as self-pair."""
+        findings = ToxicFlowAnalyzer().analyze_all([_github()])
+        assert any(f.id == "TOXIC-007" for f in findings)
+
+    def test_git_server_and_fetch_trigger_toxic007(self) -> None:
+        git = _server("git", args=["-y", "@modelcontextprotocol/server-git"])
+        findings = ToxicFlowAnalyzer().analyze_all([git, _fetch()])
+        assert any(f.id == "TOXIC-007" for f in findings)
+
+    def test_severity_is_medium(self) -> None:
+        git = _server("git", args=["-y", "@modelcontextprotocol/server-git"])
+        findings = ToxicFlowAnalyzer().analyze_all([git, _fetch()])
+        f = next(x for x in findings if x.id == "TOXIC-007")
+        assert f.severity == Severity.MEDIUM
+
+
+# ── analyze_all — INTEG-001: file write + shell execution (R37) ──────────────
+
+
+class TestInteg001:
+    """FILE_WRITE + SHELL_EXEC ('plant-then-execute') — the integrity axis
+    added in R37. Distinct finding-ID prefix (INTEG-*, not TOXIC-*) because
+    this is an integrity claim (state change/persistence), not exfiltration.
+    """
+
+    def test_filesystem_and_shell_server_trigger_integ001(self) -> None:
+        """Cross-server: a file-writing server + a separate shell-exec
+        server is the plant-then-execute chain INTEG-001 exists to catch."""
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _shell_server()])
+        assert any(f.id == "INTEG-001" for f in findings)
+
+    def test_severity_is_high(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _shell_server()])
+        f = next(x for x in findings if x.id == "INTEG-001")
+        assert f.severity == Severity.HIGH
+
+    def test_analyzer_field_is_toxic_flow(self) -> None:
+        """INTEG-001 is produced by ToxicFlowAnalyzer, same as TOXIC-*; the
+        distinction users filter on is the finding ID prefix, not the
+        analyzer name (matches how sast/rules/agent_files IDs work)."""
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _shell_server()])
+        f = next(x for x in findings if x.id == "INTEG-001")
+        assert f.analyzer == "toxic_flow"
+
+    def test_cwe_is_present(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _shell_server()])
+        f = next(x for x in findings if x.id == "INTEG-001")
+        assert f.cwe is not None
+
+    def test_everything_server_self_pair_triggers_integ001(self) -> None:
+        """server-everything has FILE_WRITE and SHELL_EXEC on one server."""
+        everything = _server(
+            "everything",
+            args=["-y", "@modelcontextprotocol/server-everything"],
+        )
+        findings = ToxicFlowAnalyzer().analyze_all([everything])
+        assert any(f.id == "INTEG-001" for f in findings)
+
+    def test_finding_names_both_servers(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _shell_server()])
+        f = next(x for x in findings if x.id == "INTEG-001")
+        combined = f"{f.server} {f.evidence}"
+        assert "filesystem" in combined
+        assert "bash-runner" in combined
+
+    def test_the_annoyed_user_fixture_filesystem_plus_fetch_does_not_fire(
+        self,
+    ) -> None:
+        """The R37 measurement's central finding: a scoped filesystem server
+        (FILE_READ+FILE_WRITE) paired with a fetch server (NETWORK_OUT) is
+        an extremely common, benign combination — "read local project files
+        and look things up online." A general FILE_WRITE + NETWORK_OUT pair
+        would have fired here (this is exactly the shape of 60 of the
+        cross-server hits measured across the registry), which is why that
+        pair was rejected. INTEG-001 only pairs FILE_WRITE with SHELL_EXEC,
+        which neither server has, so nothing fires — the legitimate
+        filesystem+fetch user is not flagged.
+        """
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        assert not any(f.id == "INTEG-001" for f in findings)
+
+    def test_filesystem_alone_does_not_fire(self) -> None:
+        """A filesystem server with no shell-exec anywhere in the scan is the
+        single most common real-world MCP setup and must not fire INTEG-001
+        on its own — its capability set has FILE_WRITE but no SHELL_EXEC."""
+        findings = ToxicFlowAnalyzer().analyze_all([_fs()])
+        assert not any(f.id == "INTEG-001" for f in findings)
+
+
+# ── INTEGRITY_PAIRS list integrity ────────────────────────────────────────────
+
+
+class TestIntegrityPairsIntegrity:
+    def test_integ_001_defined(self) -> None:
+        ids = {tp.finding_id for tp in INTEGRITY_PAIRS}
+        assert "INTEG-001" in ids
+
+    def test_no_finding_id_overlaps_toxic_pairs(self) -> None:
+        """INTEG-* and TOXIC-* must never share a finding ID — that is the
+        whole point of keeping them as separate lists (R37)."""
+        toxic_ids = {tp.finding_id for tp in TOXIC_PAIRS}
+        integrity_ids = {tp.finding_id for tp in INTEGRITY_PAIRS}
+        assert toxic_ids.isdisjoint(integrity_ids)
+
+    def test_no_integ_id_starts_with_toxic_prefix(self) -> None:
+        for tp in INTEGRITY_PAIRS:
+            assert not tp.finding_id.startswith("TOXIC-"), (
+                f"{tp.finding_id} reuses the TOXIC- prefix — exfiltration "
+                "and integrity are different claims and must stay "
+                "distinguishable by ID prefix alone."
+            )
+
+    def test_toxic_and_integrity_pairs_is_the_concatenation(self) -> None:
+        assert TOXIC_AND_INTEGRITY_PAIRS == TOXIC_PAIRS + INTEGRITY_PAIRS
+
+    @pytest.mark.parametrize("tp", INTEGRITY_PAIRS, ids=lambda tp: tp.finding_id)
+    def test_each_pair_has_cwe(self, tp: ToxicPair) -> None:
+        assert tp.cwe is not None, f"{tp.finding_id} is missing a CWE"
+
+    @pytest.mark.parametrize("tp", INTEGRITY_PAIRS, ids=lambda tp: tp.finding_id)
+    def test_each_pair_has_non_empty_remediation(self, tp: ToxicPair) -> None:
+        assert tp.remediation.strip()
+
+    @pytest.mark.parametrize("tp", INTEGRITY_PAIRS, ids=lambda tp: tp.finding_id)
+    def test_each_pair_has_non_empty_description(self, tp: ToxicPair) -> None:
+        assert tp.description.strip()
+
+    @pytest.mark.parametrize("tp", INTEGRITY_PAIRS, ids=lambda tp: tp.finding_id)
+    def test_integrity_pair_severities_are_critical_high_or_medium(
+        self, tp: ToxicPair
+    ) -> None:
+        assert tp.severity in {Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM}
+
+
+# ── Self-pair (single server with both capabilities) ──────────────────────────
+
+
+class TestSelfPair:
+    def test_github_self_pair_names_single_server(self) -> None:
+        """GitHub alone provides GIT+NETWORK_OUT — self-pair finding."""
+        findings = ToxicFlowAnalyzer().analyze_all([_github()])
+        toxic007 = next((f for f in findings if f.id == "TOXIC-007"), None)
+        assert toxic007 is not None
+        # Self-pair: server label is just the server's own name.
+        assert "+" not in toxic007.server
+        assert "github" in toxic007.server
+
+    def test_self_pair_evidence_mentions_both_capabilities(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_github()])
+        toxic007 = next(f for f in findings if f.id == "TOXIC-007")
+        assert "git" in toxic007.evidence
+        assert "network_out" in toxic007.evidence
+
+    def test_everything_server_triggers_multiple_self_pairs(self) -> None:
+        """server-everything has FILE_READ, FILE_WRITE, NETWORK_OUT, SHELL_EXEC."""
+        everything = _server(
+            "everything",
+            args=["-y", "@modelcontextprotocol/server-everything"],
+        )
+        findings = ToxicFlowAnalyzer().analyze_all([everything])
+        finding_ids = {f.id for f in findings}
+        # Should hit at least TOXIC-001 (file+network) and TOXIC-006 (shell+network).
+        assert "TOXIC-001" in finding_ids
+        assert "TOXIC-006" in finding_ids
+
+    def test_server_with_only_sink_capability_no_self_pair(self) -> None:
+        """NETWORK_OUT alone is not a source for any toxic rule."""
+        findings = ToxicFlowAnalyzer().analyze_all([_fetch()])
+        assert findings == []
+
+
+# ── Cross-server findings — metadata checks ───────────────────────────────────
+
+
+class TestCrossServerFindingMetadata:
+    def test_cross_server_label_contains_plus(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        assert "+" in toxic001.server
+
+    def test_same_client_preserved(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        assert toxic001.client == "cursor"
+
+    def test_different_clients_labelled_multiple(self) -> None:
+        fs = _server(
+            "filesystem",
+            args=["-y", "@modelcontextprotocol/server-filesystem"],
+            client="cursor",
+        )
+        fetch = _server(
+            "fetch",
+            args=["-y", "@modelcontextprotocol/server-fetch"],
+            client="vscode",
+        )
+        findings = ToxicFlowAnalyzer().analyze_all([fs, fetch])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        assert toxic001.client == "multiple"
+
+    def test_finding_path_set_to_source_server_config(self) -> None:
+        fs = _server(
+            "filesystem",
+            args=["-y", "@modelcontextprotocol/server-filesystem"],
+        )
+        findings = ToxicFlowAnalyzer().analyze_all([fs, _fetch()])
+        toxic001 = next(f for f in findings if f.id == "TOXIC-001")
+        assert toxic001.finding_path == str(_CFG)
+
+
+# ── Multiple pairs in one scan ────────────────────────────────────────────────
+
+
+class TestMultiplePairs:
+    def test_three_servers_produce_multiple_findings(self) -> None:
+        """filesystem + postgres + fetch: TOXIC-001 and TOXIC-005 should fire."""
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _postgres(), _fetch()])
+        finding_ids = {f.id for f in findings}
+        assert "TOXIC-001" in finding_ids
+        assert "TOXIC-005" in finding_ids
+
+    def test_no_duplicate_findings_for_same_pair_and_rule(self) -> None:
+        """Each (server pair, rule) should emit at most one finding."""
+        findings = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        toxic001_count = sum(1 for f in findings if f.id == "TOXIC-001")
+        assert toxic001_count == 1
+
+    def test_four_servers_no_unexpected_cross_contamination(self) -> None:
+        """Two inert servers added shouldn't create extra toxic findings."""
+        findings_without = ToxicFlowAnalyzer().analyze_all([_fs(), _fetch()])
+        findings_with = ToxicFlowAnalyzer().analyze_all(
+            [_fs(), _fetch(), _memory(), _memory()]
+        )
+        ids_without = {f.id for f in findings_without}
+        ids_with = {f.id for f in findings_with}
+        assert ids_without == ids_with
+
+
+# ── TOXIC_PAIRS list integrity ────────────────────────────────────────────────
+
+
+class TestToxicPairsIntegrity:
+    def test_all_seven_pairs_defined(self) -> None:
+        ids = {tp.finding_id for tp in TOXIC_PAIRS}
+        for n in range(1, 8):
+            assert f"TOXIC-{n:03d}" in ids
+
+    def test_no_duplicate_finding_ids(self) -> None:
+        ids = [tp.finding_id for tp in TOXIC_PAIRS]
+        assert len(ids) == len(set(ids))
+
+    def test_each_pair_has_cwe(self) -> None:
+        for tp in TOXIC_PAIRS:
+            assert tp.cwe is not None, f"{tp.finding_id} is missing a CWE"
+
+    @pytest.mark.parametrize("tp", TOXIC_PAIRS, ids=lambda tp: tp.finding_id)
+    def test_each_pair_has_non_empty_remediation(self, tp: ToxicPair) -> None:
+        assert tp.remediation.strip()
+
+    @pytest.mark.parametrize("tp", TOXIC_PAIRS, ids=lambda tp: tp.finding_id)
+    def test_each_pair_has_non_empty_description(self, tp: ToxicPair) -> None:
+        assert tp.description.strip()
+
+    @pytest.mark.parametrize("tp", TOXIC_PAIRS, ids=lambda tp: tp.finding_id)
+    def test_toxic_pair_severities_are_critical_high_or_medium(
+        self, tp: ToxicPair
+    ) -> None:
+        """Each ToxicPair must carry CRITICAL, HIGH, or MEDIUM severity.
+
+        CRITICAL: highest-risk capability combinations (e.g. shell + network exfil).
+        HIGH:     serious but slightly lower-risk pairings.
+        MEDIUM:   lower-impact dangerous pairs (e.g. read-only data + exfil path).
+        INFO and LOW are not valid for toxic-flow findings.
+        """
+        from mcp_audit.models import Severity
+
+        assert tp.severity in {Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM}
+
+
+# ── Registry-driven capability tagging ────────────────────────────────────────
+
+
+def _stub_registry(entries: list[RegistryEntry]) -> KnownServerRegistry:
+    """Build an in-memory KnownServerRegistry from explicit entries.
+
+    Bypasses __init__ so the test doesn't touch the bundled JSON or the
+    user-local cache.
+    """
+    reg = KnownServerRegistry.__new__(KnownServerRegistry)
+    reg.schema_version = "test"
+    reg.last_updated = "test"
+    reg.entries = entries
+    reg._name_index = {e.name.lower(): e for e in entries}  # noqa: SLF001
+    return reg
+
+
+def _npm_entry(name: str, capabilities: list[str] | None) -> RegistryEntry:
+    """Construct a minimal RegistryEntry with the given capabilities."""
+    return RegistryEntry(
+        name=name,
+        source="npm",
+        repo=None,
+        maintainer="test",
+        verified=False,
+        last_verified="2026-04-20",
+        known_versions=[],
+        tags=[],
+        capabilities=capabilities,
+    )
+
+
+class TestTagServerWithRegistry:
+    """Registry-backed capability lookup must take precedence over keywords."""
+
+    def test_tag_server_uses_registry_capabilities(self) -> None:
+        """Registry capability list is returned verbatim, skipping heuristics."""
+        package = "@example/some-custom-server"
+        reg = _stub_registry([_npm_entry(package, ["file_read"])])
+
+        # "postgres" arg would normally trigger DATABASE via keyword matching.
+        # Because the registry is authoritative, only FILE_READ is returned.
+        server = _server(
+            "some-custom",
+            command="npx",
+            args=["-y", package, "--postgres-uri", "..."],
+        )
+
+        caps = tag_server(server, registry=reg)
+        assert caps == frozenset({Capability.FILE_READ})
+
+    def test_tag_server_falls_back_when_no_capabilities(self) -> None:
+        """Entry present but capabilities=None → keyword matching still runs."""
+        reg = _stub_registry([_npm_entry("@modelcontextprotocol/server-fetch", None)])
+        caps = tag_server(_fetch(), registry=reg)
+        # KNOWN_SERVERS fallback + keyword matching both tag NETWORK_OUT.
+        assert Capability.NETWORK_OUT in caps
+
+    def test_tag_server_falls_back_when_no_registry(self) -> None:
+        """No registry passed → behaviour matches the pre-migration code path."""
+        caps_no_reg = tag_server(_fs(), registry=None)
+        caps_default = tag_server(_fs())
+        assert caps_no_reg == caps_default
+        assert Capability.FILE_READ in caps_no_reg
+        assert Capability.FILE_WRITE in caps_no_reg
+
+    def test_tag_server_empty_registry_capabilities_suppresses_fallback(
+        self,
+    ) -> None:
+        """capabilities=[] means 'no dangerous capabilities' — not a trigger."""
+        package = "@example/inert-server"
+        reg = _stub_registry([_npm_entry(package, [])])
+        # Name contains 'fetch' which would keyword-match NETWORK_OUT — but
+        # the registry says the package has no capabilities.
+        server = _server("fetchy", command="npx", args=["-y", package])
+        caps = tag_server(server, registry=reg)
+        assert caps == frozenset()
+
+    def test_analyzer_uses_injected_registry(self) -> None:
+        """ToxicFlowAnalyzer threads the registry through to tag_server."""
+        # Override filesystem to declare only NETWORK_OUT via the registry —
+        # if the analyzer honours registry data, the normal filesystem+fetch
+        # TOXIC-001 finding should NOT fire (both servers only have NETWORK_OUT).
+        reg = _stub_registry(
+            [
+                _npm_entry("@modelcontextprotocol/server-filesystem", ["network_out"]),
+                _npm_entry("@modelcontextprotocol/server-fetch", ["network_out"]),
+            ]
+        )
+        analyzer = ToxicFlowAnalyzer(registry=reg)
+        findings = analyzer.analyze_all([_fs(), _fetch()])
+        assert not any(f.id == "TOXIC-001" for f in findings)
+
+
+class TestRegistryEntryCapabilitiesField:
+    """The new `capabilities` field must be backward-compatible."""
+
+    def test_registry_entry_capabilities_field_optional(self) -> None:
+        """Old JSON (pre-migration) without `capabilities` still deserialises."""
+        entry = RegistryEntry.model_validate(
+            {
+                "name": "x",
+                "source": "npm",
+                "repo": None,
+                "maintainer": "test",
+                "verified": False,
+                "last_verified": "2026-04-20",
+                "known_versions": [],
+                "tags": [],
+            }
+        )
+        assert entry.capabilities is None
+
+    def test_registry_entry_accepts_capabilities_list(self) -> None:
+        entry = RegistryEntry.model_validate(
+            {
+                "name": "y",
+                "source": "npm",
+                "repo": None,
+                "maintainer": "test",
+                "verified": False,
+                "last_verified": "2026-04-20",
+                "known_versions": [],
+                "tags": [],
+                "capabilities": ["file_read", "network_out"],
+            }
+        )
+        assert entry.capabilities == ["file_read", "network_out"]
+
+    def test_bundled_registry_tags_known_servers(self) -> None:
+        """The bundled registry must carry capability data for migrated entries."""
+        from mcp_audit.registry.loader import load_registry  # noqa: PLC0415
+
+        reg = load_registry()
+        fs_entry = reg.get("@modelcontextprotocol/server-filesystem")
+        assert fs_entry is not None
+        assert fs_entry.capabilities is not None
+        assert "file_read" in fs_entry.capabilities
+        assert "file_write" in fs_entry.capabilities
+
+
+# ── R35: tag-only capability allowlist ────────────────────────────────────────
+
+
+class TestComputeDeadCapabilities:
+    """compute_dead_capabilities(): capabilities in no TOXIC_PAIRS/CAPABILITY_FLOWS."""
+
+    def test_dead_capabilities_are_exactly_the_known_allowlist(self) -> None:
+        """The hard, on-every-PR guarantee: nothing dead is unaccounted for.
+
+        A change to TOXIC_PAIRS, CAPABILITY_FLOWS, or the Capability enum
+        lives entirely in toxic_flow.py/attack_paths.py and would not
+        otherwise trigger registry-drift.yml (which only runs on changes to
+        the registry file or scripts/audit_registry.py) — this test is the
+        only mechanism that catches a new tag-only capability on every PR.
+        """
+        known = frozenset(t.capability for t in KNOWN_TAG_ONLY_CAPABILITIES)
+        unexpected = compute_dead_capabilities() - known
+        assert unexpected == frozenset(), (
+            f"Capability values {unexpected} participate in no TOXIC_PAIRS "
+            "entry and no CAPABILITY_FLOWS edge, and are not declared in "
+            "KNOWN_TAG_ONLY_CAPABILITIES. Either wire them into a detection "
+            "path or add them to that allowlist with a reason."
+        )
+
+    def test_cloud_is_currently_dead(self) -> None:
+        """Sanity check that the computation actually finds CLOUD dead —
+        guards against the check accidentally always passing vacuously."""
+        assert Capability.CLOUD in compute_dead_capabilities()
+
+    def test_file_write_is_no_longer_dead(self) -> None:
+        """R35 flagged FILE_WRITE as dead (SUSPECTED_GAP). R37 measured the
+        gap (see GAPS.md) and added INTEG-001 (FILE_WRITE + SHELL_EXEC) to
+        INTEGRITY_PAIRS, so FILE_WRITE now participates in a real detection
+        path via TOXIC_AND_INTEGRITY_PAIRS. Pinned here so a future
+        regression that silently drops INTEG-001 (or removes FILE_WRITE as
+        its source) is caught rather than reverting to the old dead state
+        unnoticed."""
+        assert Capability.FILE_WRITE not in compute_dead_capabilities()
+
+    def test_a_capability_used_as_a_toxic_pair_source_is_not_dead(self) -> None:
+        assert Capability.FILE_READ not in compute_dead_capabilities()
+
+    def test_a_capability_used_only_in_capability_flows_is_not_dead(self) -> None:
+        # BROWSER is not a TOXIC_PAIRS source/sink but IS a CAPABILITY_FLOWS
+        # source (browser -> network_out / email) in attack_paths.py.
+        assert Capability.BROWSER not in compute_dead_capabilities()
+
+
+class TestKnownTagOnlyCapabilitiesAllowlist:
+    """The allowlist's shape: every entry must justify itself and its kind."""
+
+    def test_every_entry_has_a_non_empty_reason(self) -> None:
+        for entry in KNOWN_TAG_ONLY_CAPABILITIES:
+            assert entry.reason.strip()
+
+    def test_every_entry_has_a_valid_kind(self) -> None:
+        for entry in KNOWN_TAG_ONLY_CAPABILITIES:
+            assert entry.kind in {
+                TagOnlyKind.DELIBERATE_DEFERRAL,
+                TagOnlyKind.SUSPECTED_GAP,
+            }
+
+    def test_cloud_is_a_deliberate_deferral(self) -> None:
+        entry = next(
+            t for t in KNOWN_TAG_ONLY_CAPABILITIES if t.capability == Capability.CLOUD
+        )
+        assert entry.kind == TagOnlyKind.DELIBERATE_DEFERRAL
+
+    def test_file_write_is_no_longer_in_the_allowlist(self) -> None:
+        """R37 resolved FILE_WRITE's SUSPECTED_GAP entry by wiring INTEG-001
+        (FILE_WRITE + SHELL_EXEC) into INTEGRITY_PAIRS — FILE_WRITE is no
+        longer tag-only, so it must not appear in this allowlist at all.
+        An entry reappearing here would mean FILE_WRITE went dead again
+        (e.g. INTEG-001 was removed) without a fresh measurement."""
+        assert not any(
+            t.capability == Capability.FILE_WRITE for t in KNOWN_TAG_ONLY_CAPABILITIES
+        )
+
+    def test_no_duplicate_capabilities_in_allowlist(self) -> None:
+        caps = [t.capability for t in KNOWN_TAG_ONLY_CAPABILITIES]
+        assert len(caps) == len(set(caps))
+
+    def test_empty_reason_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="empty reason"):
+            TagOnlyCapability(
+                capability=Capability.SECRETS,
+                kind=TagOnlyKind.DELIBERATE_DEFERRAL,
+                reason="   ",
+            )
+
+
+class TestCloudOnlyEntryYieldsNoToxicFlowFindings:
+    """Empirical proof for CLOUD's KNOWN_TAG_ONLY_CAPABILITIES entry.
+
+    R35 requires demonstrating, not just reasoning about, the claim that a
+    server whose entire capability set is {CLOUD} produces zero toxic-flow
+    findings — the exact bad state the entirely-tag-only-entry check in
+    scripts/audit_registry.py exists to catch before it enters real data.
+    """
+
+    def test_cloud_only_registry_entry_yields_no_toxic_flow_findings(self) -> None:
+        package = "@example/cloud-only-server"
+        reg = _stub_registry([_npm_entry(package, ["cloud"])])
+        server = _server("cloud-only", command="npx", args=["-y", package])
+
+        # tag_server really does resolve this server to {CLOUD} alone via the
+        # registry-first override — not a guess about what it would do.
+        caps = tag_server(server, registry=reg)
+        assert caps == frozenset({Capability.CLOUD})
+
+        analyzer = ToxicFlowAnalyzer(registry=reg)
+        # Self-pair: {CLOUD} alone can never supply both a TOXIC_PAIRS source
+        # and sink, since it is neither.
+        assert analyzer.analyze_all([server]) == []
+        # Cross-pair against a real NETWORK_OUT sink: still nothing, because
+        # CLOUD is not a valid TOXIC_PAIRS source for any sink — pairing it
+        # with the capability it is mechanically equivalent to (network
+        # calls are HTTPS) does not make it participate.
+        assert analyzer.analyze_all([server, _fetch()]) == []
+
+
+# ── STORY-0101: COMMS_OUT (posting to a shared service) ──────────────────────
+
+_REPO_REGISTRY = (
+    Path(__file__).resolve().parent.parent / "registry" / "known-servers.json"
+)
+_COMMS_PAIRS = {
+    "TOXIC-008": Capability.FILE_READ,
+    "TOXIC-009": Capability.SECRETS,
+    "TOXIC-010": Capability.DATABASE,
+    "TOXIC-011": Capability.SHELL_EXEC,
+}
+
+
+def _repo_registry() -> KnownServerRegistry:
+    """The registry file in this checkout (never the user-local cache)."""
+    return KnownServerRegistry(path=_REPO_REGISTRY)
+
+
+def _gitlab() -> ServerConfig:
+    """GitLab server — GIT + COMMS_OUT (no NETWORK_OUT)."""
+    return _server("gitlab", args=["-y", "@modelcontextprotocol/server-gitlab"])
+
+
+def _slack() -> ServerConfig:
+    """Slack server — NETWORK_OUT + COMMS_OUT."""
+    return _server("slack", args=["-y", "@modelcontextprotocol/server-slack"])
+
+
+def _ids(findings: list) -> set[str]:
+    return {f.id for f in findings}
+
+
+class TestCommsOutTaggingKnownPackages:
+    def test_github_package_gives_comms_out(self) -> None:
+        caps = tag_server(_github())
+        assert caps == frozenset(
+            {Capability.GIT, Capability.NETWORK_OUT, Capability.COMMS_OUT}
+        )
+
+    def test_gitlab_package_gives_git_and_comms_out_only(self) -> None:
+        assert tag_server(_gitlab()) == frozenset(
+            {Capability.GIT, Capability.COMMS_OUT}
+        )
+
+    def test_slack_package_gives_network_and_comms_out(self) -> None:
+        assert tag_server(_slack()) == frozenset(
+            {Capability.NETWORK_OUT, Capability.COMMS_OUT}
+        )
+
+    @pytest.mark.parametrize(
+        ("package", "expected"),
+        [
+            (
+                "@modelcontextprotocol/server-github",
+                {"git", "network_out", "comms_out"},
+            ),
+            ("@modelcontextprotocol/server-gitlab", {"git", "comms_out"}),
+            ("@modelcontextprotocol/server-slack", {"network_out", "comms_out"}),
+            (
+                "mcp-atlassian",
+                {"file_read", "file_write", "network_out", "comms_out"},
+            ),
+            ("@autoposting.ai/cli", {"network_out", "comms_out"}),
+        ],
+    )
+    def test_bundled_registry_declares_comms_out(
+        self, package: str, expected: set[str]
+    ) -> None:
+        entry = _repo_registry().get(package)
+        assert entry is not None
+        assert set(entry.capabilities or []) == expected
+
+    def test_email_server_in_registry_is_email_not_comms_out(self) -> None:
+        """Email stays EMAIL (an existing wired sink), never COMMS_OUT."""
+        entry = _repo_registry().get("@palisadeemail/mcp")
+        assert entry is not None
+        assert "email" in (entry.capabilities or [])
+        assert "comms_out" not in (entry.capabilities or [])
+
+    def test_known_servers_fallback_matches_registry_for_comms_entries(self) -> None:
+        """The no-registry fallback must not disagree with the registry."""
+        reg = _repo_registry()
+        for package in (
+            "@modelcontextprotocol/server-github",
+            "@modelcontextprotocol/server-gitlab",
+            "@modelcontextprotocol/server-slack",
+        ):
+            entry = reg.get(package)
+            assert entry is not None
+            assert {c.value for c in KNOWN_SERVERS[package]} == set(
+                entry.capabilities or []
+            )
+
+    def test_registry_resolves_comms_out_through_tag_server(self) -> None:
+        caps = tag_server(_gitlab(), registry=_repo_registry())
+        assert caps == frozenset({Capability.GIT, Capability.COMMS_OUT})
+
+
+class TestCommsOutKeywords:
+    @pytest.mark.parametrize(
+        ("name", "command", "args"),
+        [
+            # The official GitHub server, remote, configured by name and URL.
+            ("github", None, []),
+            ("GitHub", None, []),
+            ("gh", "docker", ["run", "-i", "ghcr.io/github/github-mcp-server"]),
+            ("gl", "npx", ["-y", "@zereight/mcp-gitlab@2.0.0"]),
+            ("chat", "npx", ["-y", "slack-mcp-server@1.1.0"]),
+            ("chat", "npx", ["-y", "@zencoderai/slack-mcp-server"]),
+            ("bot", "node", ["discord-mcp/index.js"]),
+            ("tg", "uvx", ["telegram-mcp"]),
+            ("hook", "npx", ["-y", "mcp-webhook"]),
+            ("jira", "uvx", ["mcp-atlassian"]),
+            ("ado", "npx", ["-y", "@azure-devops/mcp", "contoso"]),
+            ("social", "npx", ["-y", "x-twitter-mcp"]),
+            # Pinned version: the registry lookup misses, the keyword still hits.
+            ("gh", "npx", ["-y", "@modelcontextprotocol/server-github@2025.4.8"]),
+        ],
+    )
+    def test_comms_platform_names_imply_comms_out(
+        self, name: str, command: str | None, args: list[str]
+    ) -> None:
+        server = ServerConfig(
+            name=name,
+            client="cursor",
+            config_path=_CFG,
+            command=command,
+            args=args,
+            url="https://example.invalid/mcp" if command is None else None,
+            transport=TransportType.STDIO if command else TransportType.SSE,
+        )
+        assert Capability.COMMS_OUT in tag_server(server)
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            # A locally built server living under a directory named github.
+            ["/Users/dev/github/my-tools/server.js"],
+            ["/home/dev/src/github.com/acme/notes-mcp/dist/index.js"],
+            ["C:\\Users\\dev\\github\\tools\\index.js"],
+            ["/srv/gitlab/runner-helper/index.js"],
+        ],
+    )
+    def test_code_host_in_a_path_does_not_imply_comms_out(
+        self, args: list[str]
+    ) -> None:
+        """A bare 'github' substring is not a comms keyword (FP guard)."""
+        caps = tag_server(_server("local-tools", command="node", args=args))
+        assert Capability.COMMS_OUT not in caps
+
+    _PLATFORMS = (
+        "slack",
+        "discord",
+        "telegram",
+        "webhook",
+        "twitter",
+        "tweet",
+        "mattermost",
+        "rocketchat",
+        "msteams",
+        "atlassian",
+        "confluence",
+        "azure-devops",
+        "mastodon",
+        "bluesky",
+    )
+
+    @pytest.mark.parametrize("platform", _PLATFORMS)
+    def test_platform_name_in_a_path_arg_is_silent(self, platform: str) -> None:
+        """A directory named after a platform is the user's data, not a poster."""
+        for arg in (
+            f"/Users/dev/code/{platform}-bot",
+            f"~/projects/{platform}",
+            f"./{platform}-notes",
+            f"C:\\Users\\dev\\{platform}",
+            f"--root=/srv/{platform}",
+        ):
+            caps = tag_server(_server("srv", args=["-y", "some-tool", arg]))
+            assert Capability.COMMS_OUT not in caps, arg
+
+    @pytest.mark.parametrize("platform", _PLATFORMS)
+    def test_platform_name_in_a_db_name_is_silent(self, platform: str) -> None:
+        for arg in (
+            f"postgres://localhost/{platform}",
+            f"--connection-string=mysql://u@h/{platform}s",
+            f"sqlite:///data/{platform}.db",
+        ):
+            caps = tag_server(
+                _server(
+                    "db",
+                    args=["-y", "@modelcontextprotocol/server-postgres", arg],
+                )
+            )
+            assert Capability.COMMS_OUT not in caps, arg
+
+    def test_pinned_filesystem_with_platform_named_directory_is_silent(
+        self,
+    ) -> None:
+        """No registry hit on a pinned launch, so heuristics run: the
+        directory argument must not make the file server a poster."""
+        server = _server(
+            "fs",
+            args=[
+                "-y",
+                "@modelcontextprotocol/server-filesystem@2025.1.14",
+                "/Users/dev/code/discord-bot",
+            ],
+        )
+        findings = ToxicFlowAnalyzer().analyze_all([server, _gitlab()])
+        assert Capability.COMMS_OUT not in tag_server(server)
+        # The only comms pair possible here would be fs + gitlab (TOXIC-008),
+        # which is correct; the fs server itself must not self-pair.
+        assert not [f for f in findings if f.server == "fs"]
+
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "$HOME/code/discord",
+            "${workspaceFolder}/discord",
+            "%USERPROFILE%/code/discord",
+            "--root=$HOME/discord",
+        ],
+    )
+    def test_env_var_rooted_path_is_not_a_poster(self, arg: str) -> None:
+        """A $VAR- or %VAR%-rooted path is a path, not a platform name (STORY-0104)."""
+        server = _server(
+            "fs",
+            args=["-y", "@modelcontextprotocol/server-filesystem@2025.1.14", arg],
+        )
+        assert Capability.COMMS_OUT not in tag_server(server)
+
+    def test_platform_named_database_gives_no_attack_path(self) -> None:
+        """summarize_attack_paths tags with no registry; a database called
+        'webhooks' must not become a CRITICAL/HIGH comms path."""
+        from mcp_audit.analyzers.attack_paths import summarize_attack_paths
+
+        db = _server(
+            "db",
+            args=[
+                "-y",
+                "@modelcontextprotocol/server-postgres",
+                "postgres://localhost/webhooks",
+            ],
+        )
+        findings = ToxicFlowAnalyzer().analyze_all([db])
+        summary = summarize_attack_paths([db], findings)
+        assert [p for p in summary.paths if p.sink_capability == "comms_out"] == []
+        assert not [f for f in findings if f.id.startswith("TOXIC-0")]
+
+    @pytest.mark.parametrize("platform", _PLATFORMS)
+    def test_platform_substring_inside_other_word_is_silent(
+        self, platform: str
+    ) -> None:
+        caps = tag_server(_server("srv", args=["-y", f"xx{platform}yy-tool"]))
+        assert Capability.COMMS_OUT not in caps
+
+    def test_github_path_still_implies_git(self) -> None:
+        """The GIT keyword rule is unchanged by the COMMS_OUT rule."""
+        caps = tag_server(
+            _server("local", command="node", args=["/Users/dev/github/x/index.js"])
+        )
+        assert Capability.GIT in caps
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+            ["-y", "smtp-mcp"],
+            ["-y", "mcp-server-git"],
+            ["-y", "@modelcontextprotocol/server-postgres"],
+            ["-y", "@notionhq/notion-mcp-server"],
+        ],
+    )
+    def test_non_comms_servers_are_not_comms_out(self, args: list[str]) -> None:
+        caps = tag_server(_server("srv", args=args))
+        assert Capability.COMMS_OUT not in caps
+
+    def test_email_keywords_stay_email(self) -> None:
+        caps = tag_server(_server("mail", args=["-y", "smtp-mcp"]))
+        assert Capability.EMAIL in caps
+        assert Capability.COMMS_OUT not in caps
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "add_issue_comment",
+            "create_pull_request",
+            "push_files",
+            "create_merge_request",
+            "slack_post_message",
+            "slack_reply_to_thread",
+            "confluence_add_comment",
+            "jira_create_issue",
+            "git_push",
+        ],
+    )
+    def test_write_tool_names_imply_comms_out(self, tool_name: str) -> None:
+        server = _server(
+            "enumerated",
+            command="node",
+            args=["server.js"],
+            raw={"tools": [{"name": tool_name, "description": "x"}]},
+        )
+        assert Capability.COMMS_OUT in tag_server(server)
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["get_issue", "list_issues", "get_pull_request_comments", "search_code"],
+    )
+    def test_read_tool_names_do_not_imply_comms_out(self, tool_name: str) -> None:
+        server = _server(
+            "enumerated",
+            command="node",
+            args=["server.js"],
+            raw={"tools": [{"name": tool_name, "description": "Read only."}]},
+        )
+        assert Capability.COMMS_OUT not in tag_server(server)
+
+
+_COMMS_SEVERITY = {
+    "TOXIC-008": Severity.HIGH,
+    "TOXIC-009": Severity.CRITICAL,
+    "TOXIC-010": Severity.HIGH,
+    "TOXIC-011": Severity.CRITICAL,
+}
+
+
+class TestCommsOutPairs:
+    """TOXIC-008..011: a data source next to a server that posts somewhere shared."""
+
+    @pytest.mark.parametrize(
+        ("source", "finding_id"),
+        [
+            (_fs, "TOXIC-008"),
+            (_vault_server, "TOXIC-009"),
+            (_postgres, "TOXIC-010"),
+            (_shell_server, "TOXIC-011"),
+        ],
+    )
+    def test_each_source_with_gitlab_fires_its_comms_pair(
+        self, source, finding_id: str
+    ) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([source(), _gitlab()])
+        hits = [f for f in findings if f.id == finding_id]
+        assert len(hits) == 1
+        f = hits[0]
+        assert f.severity == _COMMS_SEVERITY[finding_id]
+        assert f.analyzer == "toxic_flow"
+        assert f.server == f"{source().name} + gitlab"
+        assert "'comms_out'" in f.evidence
+        assert f.cwe
+
+    @pytest.mark.parametrize(
+        ("source", "finding_id"),
+        [(_fs, "TOXIC-008"), (_postgres, "TOXIC-010"), (_shell_server, "TOXIC-011")],
+    )
+    def test_reverse_order_still_fires(self, source, finding_id: str) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_gitlab(), source()])
+        hit = next(f for f in findings if f.id == finding_id)
+        assert hit.server == f"{source().name} + gitlab"
+
+    def test_gitlab_has_no_network_out_so_no_network_twin(self) -> None:
+        ids = _ids(ToxicFlowAnalyzer().analyze_all([_fs(), _gitlab()]))
+        assert "TOXIC-008" in ids
+        assert "TOXIC-001" not in ids
+
+    def test_github_reports_comms_pair_beside_its_network_twin(self) -> None:
+        """Registry GitHub keeps NETWORK_OUT: both claims are reported."""
+        ids = _ids(
+            ToxicFlowAnalyzer(registry=_repo_registry()).analyze_all([_fs(), _github()])
+        )
+        assert {"TOXIC-001", "TOXIC-008"} <= ids
+
+    def test_secrets_and_slack_fire_toxic009(self) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_vault_server(), _slack()])
+        assert "TOXIC-009" in _ids(findings)
+
+    def test_atlassian_alone_is_a_comms_self_pair(self) -> None:
+        """mcp-atlassian reads local files (attachment upload) and posts."""
+        server = _server("atlassian", command="uvx", args=["mcp-atlassian"])
+        findings = ToxicFlowAnalyzer(registry=_repo_registry()).analyze_all([server])
+        hit = next(f for f in findings if f.id == "TOXIC-008")
+        assert hit.server == "atlassian"
+
+    def test_posting_server_alone_without_a_source_fires_nothing_new(self) -> None:
+        for server in (_gitlab(), _slack()):
+            ids = _ids(ToxicFlowAnalyzer().analyze_all([server]))
+            assert not ids & set(_COMMS_PAIRS)
+
+    def test_git_plus_comms_out_is_not_a_pair(self) -> None:
+        """Measured and declined: it would fire on every GitHub/GitLab server
+        alone. GitHub alone still reports only TOXIC-007, as before."""
+        assert not any(
+            tp.source == Capability.GIT and tp.sink == Capability.COMMS_OUT
+            for tp in TOXIC_AND_INTEGRITY_PAIRS
+        )
+        assert ToxicFlowAnalyzer().analyze_all([_gitlab()]) == []
+        github_ids = _ids(ToxicFlowAnalyzer().analyze_all([_github()]))
+        assert github_ids == {"TOXIC-007"}
+
+    def test_fetch_is_not_a_comms_source(self) -> None:
+        ids = _ids(ToxicFlowAnalyzer().analyze_all([_fetch(), _gitlab()]))
+        assert not ids & set(_COMMS_PAIRS)
+
+    def test_email_sink_is_not_a_comms_pair(self) -> None:
+        ids = _ids(ToxicFlowAnalyzer().analyze_all([_fs(), _gmail()]))
+        assert "TOXIC-002" in ids
+        assert not ids & set(_COMMS_PAIRS)
+
+    def test_local_server_under_github_dir_does_not_pair_with_files(self) -> None:
+        """The FP the keyword design guards against, end to end."""
+        local = _server(
+            "my-tools", command="node", args=["/Users/dev/github/tools/index.js"]
+        )
+        ids = _ids(ToxicFlowAnalyzer().analyze_all([_fs(), local]))
+        assert not ids & set(_COMMS_PAIRS)
+
+
+class TestCommsPairsDefinition:
+    def test_four_comms_pairs_defined_with_expected_sources(self) -> None:
+        by_id = {tp.finding_id: tp for tp in TOXIC_PAIRS}
+        for finding_id, source in _COMMS_PAIRS.items():
+            tp = by_id[finding_id]
+            assert tp.source == source
+            assert tp.sink == Capability.COMMS_OUT
+            assert tp.severity == _COMMS_SEVERITY[finding_id]
+
+    def test_comms_pairs_live_in_toxic_pairs_not_integrity_pairs(self) -> None:
+        assert not any(tp.sink == Capability.COMMS_OUT for tp in INTEGRITY_PAIRS)
+
+    def test_no_comms_pair_ranks_below_its_network_twin(self) -> None:
+        """A post to a shared service is never ranked below a plain fetch."""
+        order = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW]
+        network = {
+            tp.source: tp.severity
+            for tp in TOXIC_PAIRS
+            if tp.sink == Capability.NETWORK_OUT
+        }
+        for tp in TOXIC_PAIRS:
+            if tp.sink != Capability.COMMS_OUT:
+                continue
+            assert tp.source in network
+            assert order.index(tp.severity) <= order.index(network[tp.source])
+
+    def test_comms_out_is_not_dead_and_not_allowlisted(self) -> None:
+        assert Capability.COMMS_OUT not in compute_dead_capabilities()
+        assert not any(
+            t.capability == Capability.COMMS_OUT for t in KNOWN_TAG_ONLY_CAPABILITIES
+        )
+
+
+class TestOfficialServersFixtureStaysBelowCritical:
+    """scripts/smoke_test.py check 5 scans this fixture at the critical
+    threshold and expects exit 0; filesystem + github is TOXIC-008 at HIGH."""
+
+    def test_official_fixture_has_comms_pair_but_no_critical(self) -> None:
+        import json as _json
+
+        from typer.testing import CliRunner
+
+        from mcp_audit.cli import app
+
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "real_servers"
+            / "official_mcp_servers.json"
+        )
+        res = CliRunner().invoke(
+            app, ["scan", "--path", str(fixture), "--format", "json"]
+        )
+        data = _json.loads(res.stdout[res.stdout.index("{") :])
+        by_id = {f["id"]: f["severity"].upper() for f in data["findings"]}
+        assert by_id.get("TOXIC-008") == "HIGH"
+        assert "CRITICAL" not in {
+            f["severity"].upper()
+            for f in data["findings"]
+            if f["id"].startswith("TOXIC-")
+        }
+        crit = CliRunner().invoke(
+            app,
+            ["scan", "--path", str(fixture), "--severity-threshold", "critical"],
+        )
+        assert crit.exit_code == 0
+
+
+# ── Container network flags are not a capability (STORY-0139, #260) ──────────
+
+_GH_IMAGE_ARGS = [
+    "run",
+    "-i",
+    "--rm",
+    "-e",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "ghcr.io/github/github-mcp-server",
+]
+
+
+def _container(command: str, network_args: list[str]) -> ServerConfig:
+    """The GitHub MCP image run in a container, with *network_args* after ``--rm``."""
+    args = _GH_IMAGE_ARGS[:3] + network_args + _GH_IMAGE_ARGS[3:]
+    return _server("github", command=command, args=args)
+
+
+_NETWORK_FLAG_FORMS = [
+    ["--network=none"],
+    ["--network", "none"],
+    ["--network", "bridge"],
+    ["--network=host"],
+    ["--net=host"],
+    ["--net", "host"],
+    ["--NETWORK=none"],
+    ["--network="],
+    ["--network=$NET"],
+]
+
+
+class TestContainerNetworkFlags:
+    """A docker/podman ``--network``/``--net`` flag never adds a capability."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "docker",
+            "podman",
+            "/usr/local/bin/docker",
+            "docker.exe",
+            r"C:\bin\podman.exe",
+        ],
+    )
+    @pytest.mark.parametrize("flag", _NETWORK_FLAG_FORMS)
+    def test_flag_is_neutral(self, command: str, flag: list[str]) -> None:
+        control = tag_server(_container(command, []))
+        assert Capability.NETWORK_OUT not in control
+        assert tag_server(_container(command, flag)) == control
+
+    @pytest.mark.parametrize("flag", _NETWORK_FLAG_FORMS)
+    def test_no_toxic007_from_flag(self, flag: list[str]) -> None:
+        findings = ToxicFlowAnalyzer().analyze_all([_container("docker", flag)])
+        assert not any(f.id == "TOXIC-007" for f in findings)
+
+    def test_issue_260_repro(self) -> None:
+        """#260 / Q-074 repro on ee557b8: --network=none fired TOXIC-007."""
+        server = _container("docker", ["--network=none"])
+        assert Capability.GIT in tag_server(server)
+        assert ToxicFlowAnalyzer().analyze_all([server]) == []
+
+    def test_trailing_flag_without_value(self) -> None:
+        server = _server("box", command="docker", args=["run", "image", "--network"])
+        assert Capability.NETWORK_OUT not in tag_server(server)
+
+    def test_network_image_still_tagged(self) -> None:
+        server = _server(
+            "fetch", command="docker", args=["run", "-i", "--network=none", "mcp/fetch"]
+        )
+        assert Capability.NETWORK_OUT in tag_server(server)
+
+    def test_non_container_command_keeps_network_keyword(self) -> None:
+        server = _server("tools", args=["-y", "network-mcp", "--network=none"])
+        assert Capability.NETWORK_OUT in tag_server(server)
+
+    def test_container_name_containing_network_still_tagged(self) -> None:
+        server = _server("network-probe", command="docker", args=["run", "image"])
+        assert Capability.NETWORK_OUT in tag_server(server)
+
+    def test_tool_descriptions_unchanged(self) -> None:
+        server = _server(
+            "box",
+            command="docker",
+            args=["run", "--network=none", "image"],
+            raw={"tools": [{"name": "probe", "description": "Send a network request"}]},
+        )
+        assert Capability.NETWORK_OUT in tag_server(server)
+
+
+class TestContainerNetworkFlagsFullScan:
+    """Whole-pipeline finding list for container network flags (#260 step 3).
+
+    COMM-036/037's own tests assert per rule; this pins every server finding,
+    so a toxic-flow pair reappearing on a network flag fails here.
+    CFHYG-* (the temp file's own permissions and location) are left out.
+    """
+
+    @pytest.mark.parametrize(
+        ("flag", "expected"),
+        [
+            ([], {"COMM-004", "COMM-022"}),
+            (["--network=none"], {"COMM-004", "COMM-022"}),
+            (["--network", "bridge"], {"COMM-004", "COMM-022"}),
+            (["--network=host"], {"COMM-004", "COMM-022", "COMM-037"}),
+            (["--net=host"], {"COMM-004", "COMM-022", "COMM-037"}),
+        ],
+    )
+    def test_exact_findings(
+        self, tmp_path: Path, flag: list[str], expected: set[str]
+    ) -> None:
+        import json
+
+        from mcp_audit.scanner import run_scan
+
+        server = {
+            "command": "docker",
+            "args": _GH_IMAGE_ARGS[:3] + flag + _GH_IMAGE_ARGS[3:],
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GH_TOKEN}"},
+        }
+        config = tmp_path / "mcp.json"
+        config.write_text(json.dumps({"mcpServers": {"github": server}}))
+        result = run_scan(extra_paths=[config], skip_rug_pull=True, offline=True)
+        ids = {f.id for f in result.findings if not f.id.startswith("CFHYG-")}
+        assert ids == expected

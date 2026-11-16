@@ -1,0 +1,150 @@
+[build-system]
+# Unpinned on purpose. The invariant is not a hatchling version — it is
+# that the emitted Core-Metadata is acceptable to the publish action's
+# bundled Twine. CI job `wheel-check` runs `uvx twine==7.0.0 check --strict`
+# on every PR (Twine 7.0.0 is what pypa/gh-action-pypi-publish v1.14.2
+# bundles). Do not pin hatchling in lockstep with that action.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-audit-scanner"
+version = "0.30.0"
+description = "Privacy-first security scanner for MCP server configurations"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
+authors = [
+    { name = "Adam Dudley", email = "adudley78@users.noreply.github.com" },
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "security",
+    "scanner",
+    "vulnerability-scanner",
+    "ai-security",
+    "llm-security",
+    "prompt-injection",
+    "supply-chain-security",
+    "ai-agents",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "typer>=0.12,<1.0",
+    "rich>=13.0,<16.0",
+    "pydantic>=2.0,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "watchdog>=4.0,<7.0",
+    "packaging>=21.0",
+    "platformdirs>=3.0",
+    "reportlab>=4.5.1",
+    # Surface idna as a direct dep so Dependabot tracks it explicitly.
+    # Floor at 3.15 resolves CVE-2026-45409 (quadratic DoS bypass in idna.encode()).
+    # Transitive path: mcp[optional] → httpx → anyio → idna.
+    "idna>=3.15",
+]
+
+[project.optional-dependencies]
+attestation = [
+    # cryptography is only used by attestation/sigstore_client.py for X.509
+    # parsing of Fulcio signing certificates; sigstore pulls it in transitively,
+    # but we pin an explicit range here so future sigstore upgrades cannot
+    # silently widen it.
+    "cryptography>=46.0.6,<51.0",
+    "sigstore>=4.2.0,<5.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "bandit>=1.7",
+    "mypy>=1.10",
+    "pyinstaller>=6.0",
+    "jsonschema>=4.0",
+    "playwright>=1.40",
+    # semgrep is intentionally NOT listed here. It is an external binary used
+    # by 'mcp-audit sast'; installing it into the uv venv causes its Python
+    # wrapper (pysemgrep) to fail with a pkg_resources import error when
+    # capture_output=True is used. Install semgrep separately on the system
+    # (e.g. 'pip install semgrep' or Homebrew). The runner handles the
+    # "not installed" case gracefully. CI installs semgrep via the action's
+    # own step, not from this extras list.
+    # Floor-pin urllib3 to close CVE-2026-44431 and CVE-2026-44432 (fixed 2.7.0).
+    # urllib3 is a transitive dep of the sigstore toolchain (dev only);
+    # it is not required by the core runtime.
+    "urllib3>=2.7.0",
+]
+mcp = [
+    "mcp>=1.0",
+    "httpx>=0.27,<1.0",  # SSE transport client (future use)
+]
+sbom = [
+    "cyclonedx-python-lib>=7.0,<12.0",
+]
+
+[project.scripts]
+mcp-audit = "mcp_audit._entry:main"
+
+[project.urls]
+Homepage = "https://github.com/adudley78/mcp-audit"
+Documentation = "https://github.com/adudley78/mcp-audit#readme"
+Repository = "https://github.com/adudley78/mcp-audit"
+Issues = "https://github.com/adudley78/mcp-audit/issues"
+Changelog = "https://github.com/adudley78/mcp-audit/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_audit"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Bundle the known-server registry inside the installed package so that
+# importlib.resources can locate it at mcp_audit/registry/known-servers.json.
+"registry/known-servers.json" = "mcp_audit/registry/known-servers.json"
+"registry/known-extension-vulns.json" = "mcp_audit/registry/known-extension-vulns.json"
+# OSV MAL-* records matched offline by SC-008 and `vet` (STORY-0097).
+"registry/known-malicious.json" = "mcp_audit/registry/known-malicious.json"
+# Bundle the community rules inside the installed package so that
+# importlib.resources can locate them at mcp_audit/rules/community/.
+"rules/community" = "mcp_audit/rules/community"
+# Bundle the Semgrep SAST rule pack inside the installed package.
+"semgrep-rules" = "mcp_audit/semgrep-rules"
+# Bundle the mcp-audit advisory-feed project public key so `feed verify` can
+# find it via importlib.resources without a network fetch.
+"keys/mcp-audit-feed.pub" = "mcp_audit/keys/mcp-audit-feed.pub"
+
+[tool.ruff]
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "S", "B", "A", "C4", "SIM"]
+ignore = ["S101"]  # Allow assert in tests
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.58.0",
+    "pytest-cov>=7.1.0",
+    "setuptools>=82.0.1",
+]

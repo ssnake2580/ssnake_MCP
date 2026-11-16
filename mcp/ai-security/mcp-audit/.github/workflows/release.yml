@@ -1,0 +1,435 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Two uses, one rule: nothing publishes unless the `gate` job says so.
+  #
+  # 1. Dry run (the default). Same `build` job (and therefore the same
+  #    composite) as a tag push, including `upload-artifact`. Never creates
+  #    a GitHub Release, publishes to PyPI, or moves @vN. Dispatch this after
+  #    changing the composite or the upload path; do not wait for the next
+  #    tag to be the first release-side execution.
+  # 2. Release. release-on-version-bump.yml dispatches this workflow on a
+  #    vX.Y.Z tag with publish=true after a version bump merges to main,
+  #    because a tag pushed with GITHUB_TOKEN cannot start a workflow.
+  #    `gate` applies the same checks to that run as to a tag push.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >
+          Kept so old dispatch commands still parse; it gates nothing.
+          Without publish=true a dispatch only builds the four binaries via
+          .github/actions/build-binary/ and keeps them as artifacts.
+        type: boolean
+        default: true
+      publish:
+        description: >
+          Publish this run. Honoured only when the run's ref is a vX.Y.Z tag
+          on main that matches pyproject.toml (scripts/release_gate.py).
+          Anything else fails the gate instead of publishing.
+        type: boolean
+        default: false
+
+# Least privilege by default (2026-11 hardening). Only `release` (creates
+# the GitHub Release) and `tag-major` (pushes @vN) get `contents: write`;
+# `build`, which runs PyInstaller and every locked dependency, gets a
+# read-only token. TanStack (CVE-2026-45321, 2026-05) and the Bitwarden CLI
+# compromise (2026-04) both turned build-time code into a write token.
+permissions:
+  contents: read
+
+# One run per ref at a time: a tag can never publish twice in parallel.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Decide whether this run publishes
+    # Every job that creates a Release, publishes to PyPI, or moves a tag
+    # needs this one. A PyPI version can never be reused, so a refusal
+    # fails the run with the reason instead of quietly skipping.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tag, the version, and main
+        id: decide
+        env:
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        # `if` form on purpose: under bash -e a bare `merge-base
+        # --is-ancestor` on a non-main ref would exit before the gate
+        # prints its reason.
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin main
+          if git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            ON_MAIN=true
+          else
+            ON_MAIN=false
+          fi
+          python3 scripts/release_gate.py publish \
+            --event "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --publish "${PUBLISH_INPUT:-false}" \
+            --on-main "$ON_MAIN" \
+            --tags "$(git tag -l 'v*.*.*')"
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 was retired by GitHub on 2025-12-08. ``macos-15-intel``
+          # is the replacement x86_64 runner label and is supported through
+          # 2027-08. After that, Actions drops x86_64 macOS entirely and this
+          # matrix leg will need to go (Apple Silicon Macs run our x86_64
+          # binary transparently via Rosetta in the meantime).
+          - os: macos-15-intel
+            target: darwin-x86_64
+            spec: mcp-audit-darwin-x86_64.spec
+            binary: mcp-audit-darwin-x86_64
+          - os: macos-latest
+            target: darwin-arm64
+            spec: mcp-audit-darwin-arm64.spec
+            binary: mcp-audit-darwin-arm64
+          - os: ubuntu-latest
+            target: linux-x86_64
+            spec: mcp-audit-linux-x86_64.spec
+            binary: mcp-audit-linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+            spec: mcp-audit-windows-x86_64.spec
+            binary: mcp-audit-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Interpreter, extras, spec, PyInstaller, PYZ inspect, smoke, size:
+      # one definition, shared with ci.yml binary-smoke. Do not inline a copy here.
+      - uses: ./.github/actions/build-binary
+        with:
+          spec: ${{ matrix.spec }}
+          binary: ${{ matrix.binary }}
+          target: ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/${{ matrix.binary }}
+            dist/mcp-audit-${{ matrix.target }}.cdx.json
+          if-no-files-found: error
+
+  attest:
+    name: Attest binary provenance
+    # 2026-11 hardening. Signs a SLSA build-provenance statement for each
+    # shipped binary and SBOM with GitHub's Sigstore instance, so anyone can
+    # run `gh attestation verify <file> --repo adudley78/mcp-audit` and
+    # setup-action checks it before it puts a binary on PATH. Its own job:
+    # no checkout and no project code run next to `id-token: write`.
+    needs: [build, gate]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{darwin,linux,windows}-*"
+          path: dist/
+
+      - name: Attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*/mcp-audit-*"
+
+  release:
+    name: Create GitHub Release
+    # `attest` first: no binary is published without its provenance.
+    needs: [build, gate, attest]
+    # Only when `gate` says this run publishes (a tag push, or a dispatch
+    # with publish=true on a vX.Y.Z tag). A plain dispatch is a dry run.
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # softprops/action-gh-release creates the Release with this token
+      # (its `token` input), not with git credentials.
+      contents: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          # Only the four binary artifacts (named by target). `python-dist`
+          # from `build-dist` goes to PyPI, not onto the GitHub Release.
+          pattern: "{darwin,linux,windows}-*"
+          path: dist/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          # No Actions cache in a release run: a cache entry is the one
+          # thing a less-trusted run can leave for this one (TanStack,
+          # CVE-2026-45321). Release builds start from nothing.
+          enable-cache: false
+
+      - name: Generate wheel CycloneDX SBOM
+        # Separate document from the per-binary PYZ SBOMs. Describes a default
+        # `pip install mcp-audit-scanner` (no extras). Pin must match the
+        # composite default; tests/test_ci_binary_smoke.py locks the copy.
+        run: |
+          set -euo pipefail
+          uv python install 3.12.14
+          export UV_PYTHON=3.12.14
+          uv build --wheel -o "${RUNNER_TEMP}/wheel"
+          chmod +x scripts/generate_wheel_sbom.sh
+          scripts/generate_wheel_sbom.sh \
+            "${RUNNER_TEMP}/wheel"/*.whl \
+            dist/mcp-audit-scanner-wheel.cdx.json
+
+      - name: Compose release notes from template
+        # Evergreen template + CHANGELOG.md ## [X.Y.Z] for this tag.
+        # Missing section or leftover {{TOKEN}} fails the job (exit 2).
+        # python3 is on the runner; do not inline sed for the changelog.
+        run: |
+          python3 scripts/compose_release_notes.py \
+            --tag "${GITHUB_REF_NAME}" \
+            --output "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Create release and upload binaries
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          files: dist/**/*
+          # Prefer the hand-curated template in .github/ over GitHub's
+          # auto-generated PR list — Marketplace visitors landing on the
+          # release page deserve install/usage instructions, not a diff of
+          # dependabot bumps.  The PR list is still accessible via the
+          # "Full Changelog" link appended by GitHub's comparison view.
+          body_path: ${{ runner.temp }}/release-notes.md
+
+  build-dist:
+    name: Build sdist + wheel for PyPI
+    # Split from `publish-pypi` (2026-11 hardening, PyPA's documented
+    # pattern). `uv build` runs the build backend (hatchling, unpinned on
+    # purpose, see pyproject.toml) and its plugins. That code must never run
+    # in a job that can mint a PyPI OIDC token: TanStack (CVE-2026-45321)
+    # and IronWorm (2026-06) read the token from runner memory and published
+    # with valid provenance. This job has no `id-token` and a read-only
+    # token; `publish-pypi` only downloads these files and uploads them.
+    needs: [build, gate]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        # uv is deliberately unpinned. Downstream (CPython 3.12.14, uv.lock,
+        # four-platform PYZ inspect) is pinned and checked; an incompatible
+        # uv fails the build immediately. latest-known was tried 2026-08-22
+        # and resolved uv 0.12.4, which cannot fetch 3.12.14. Do not pin a
+        # uv version — Dependabot does not bump action input strings.
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: false
+
+      - name: Set up Python
+        # Pin must match .github/actions/build-binary/ `python-version`
+        # default. This job cannot call the composite (PyInstaller). The
+        # copy is locked by tests/test_ci_binary_smoke.py.
+        run: uv python install 3.12.14
+
+      - name: Build sdist + wheel
+        # Pure-Python project (hatchling backend), so `uv build` produces a
+        # single platform-agnostic wheel plus an sdist.  No matrix needed.
+        run: |
+          rm -rf dist/
+          uv build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    # Runs independently of the `release` job — a transient PyPI outage must
+    # not withhold the GitHub Release binaries, and vice versa.  Both still
+    # depend on `build` so a broken build never publishes anywhere.
+    needs: [build, gate, build-dist]
+    # Only when `gate` says this run publishes. A plain dispatch is a dry run.
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+
+    # Bound to the `pypi` Environment so PyPI's Trusted Publisher OIDC claim
+    # can scope the issued token to *this specific environment*. This is
+    # enforced, not just intended: the `pypi` environment has a deployment
+    # branch/tag policy (Settings → Environments → pypi) restricting it to
+    # the `main` branch and `v*.*.*` tags — set 2026-08-23, see
+    # humans/decisions/2026-08-23-signing-key-custody-recommendation.md in
+    # the `marcus` repo. A workflow run on any other ref cannot obtain this
+    # environment's OIDC token, which is what actually stops a forked
+    # workflow from impersonating the release pipeline. No required
+    # reviewers — this job runs only on a vX.Y.Z tag ref (pushed, or
+    # dispatched by release-on-version-bump.yml) and is fully automated; a
+    # human approval gate here would only stall releases.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mcp-audit-scanner
+
+    permissions:
+      # `id-token: write` is required for PyPI Trusted Publishing (OIDC).
+      # We deliberately do NOT grant `contents: write` here — this job has
+      # no reason to touch repository content. It has no checkout and runs
+      # no project or build code: two pinned actions, nothing else.
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-dist
+          path: dist/
+
+      - name: Publish to PyPI
+        # Pinned to the v1.14.2 commit SHA (2026-07-29) for supply-chain
+        # hardening — `release/v1` is a floating branch that could be moved
+        # to a future malicious commit without our knowledge.  Bump the SHA
+        # deliberately when picking up a new upstream release and audit the
+        # diff at https://github.com/pypa/gh-action-pypi-publish/compare.
+        #
+        # Bumped from v1.14.0 after the v0.15.0 release run failed publish
+        # with `InvalidDistribution: '2.5' is not a valid metadata version`:
+        # hatchling >=1.32 (picked up unpinned via `build-system.requires =
+        # ["hatchling"]`) now emits Core-Metadata 2.5 by default, and v1.14.0
+        # bundles Twine 6, which rejects it outright. v1.14.2 ships Twine 7,
+        # which accepts 2.5. Diff audited: a setup-python bump, the Twine 7
+        # upgrade itself, and a sigstore/pypi-attestations bump — no other
+        # behavioural changes.
+        #
+        # `attestations: true` enables PEP 740 provenance attestations —
+        # sigstore-signed statements that bind *these specific artefacts*
+        # to *this specific workflow run*.  PyPI surfaces them on the
+        # project page.  For a security-scanner project this is a
+        # non-negotiable best practice.
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        # CI `wheel-check` fetches this SHA's requirements/runtime.txt and
+        # runs that Twine — no copy of the version in ci.yml.
+        with:
+          attestations: true
+
+  tag-major:
+    name: Update floating major-version tag
+    # All three of build / release / publish-pypi must succeed before we move
+    # the floating `@vN` tag.  A broken PyPI publish must NOT silently upgrade
+    # every `@v1` consumer to a release where `pip install mcp-audit-scanner`
+    # 404s, and a broken GitHub Release must not advertise missing binaries.
+    needs: [build, gate, attest, release, build-dist, publish-pypi]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Required to push the re-pointed tag back to origin.  Deliberately no
+      # other write scopes — this job touches nothing except refs/tags/vN.
+      contents: write
+
+    steps:
+      - name: Decide whether to move the floating major-version tag
+        id: decide
+        # SemVer §4: "0.y.z is for initial development. Anything MAY change at
+        # any time."  A floating `@v0` tag therefore has no stability guarantee
+        # and would silently cross breaking changes between 0.y and 0.(y+1).
+        # Skip it entirely; users on 0.x pin to specific `@v0.x.y` tags.
+        run: |
+          TAG="${GITHUB_REF_NAME}"   # e.g. v1.2.3
+          MAJOR="${TAG%%.*}"          # → v1
+          MAJOR_NUM="${MAJOR#v}"      # → 1
+          if [ "$MAJOR_NUM" -eq 0 ]; then
+            echo "Pre-1.0 release (${TAG}) — skipping @${MAJOR} move per SemVer 0.y.z semantics."
+            echo "move=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Moving @${MAJOR} → ${TAG}"
+            echo "move=true" >> "$GITHUB_OUTPUT"
+            echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.decide.outputs.move == 'true'
+
+      - name: Force-move @${{ steps.decide.outputs.major }} to ${{ github.ref_name }}
+        if: steps.decide.outputs.move == 'true'
+        env:
+          MAJOR: ${{ steps.decide.outputs.major }}
+          TAG: ${{ github.ref_name }}
+        # Known race: if two releases within the same major are tagged near-
+        # simultaneously, whichever workflow *finishes last* wins @${MAJOR},
+        # even if it carries the older version.  Accepted risk — mitigated by
+        # never overlapping release workflows in practice.  A future hardening
+        # step is to `git ls-remote` the current @${MAJOR} target, resolve its
+        # version via `git describe --tags`, and bail if we would regress.
+        #
+        # The force-push does NOT re-trigger this workflow: the `on.push.tags`
+        # filter is `v*.*.*` (three dot-segments) and @${MAJOR} is just `vN`.
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$MAJOR" HEAD
+          git push origin "$MAJOR" --force
+
+  report:
+    name: Release Summary
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist/
+
+      - name: Post binary size summary
+        run: |
+          echo "## Binary sizes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+          for f in dist/**/*; do
+            if [ -f "$f" ]; then
+              SIZE=$(du -sh "$f" | cut -f1)
+              NAME=$(basename "$f")
+              echo "| $NAME | $SIZE |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+        shell: bash

@@ -1,0 +1,1085 @@
+"""Scanner orchestrator: discovery → parsing → analysis → results."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from platformdirs import user_config_dir
+
+from mcp_audit import guardrails as _guardrails
+from mcp_audit.agent_files import drift as _drift
+from mcp_audit.agent_files import skill_package as _skill_package
+from mcp_audit.analyzers import git_exec as _git_exec
+from mcp_audit.analyzers import rule_secret_history as _rule_secret_history
+from mcp_audit.analyzers.attack_paths import summarize_attack_paths
+from mcp_audit.analyzers.auth import AuthAnalyzer
+from mcp_audit.analyzers.base import BaseAnalyzer
+from mcp_audit.analyzers.config_hygiene import ConfigHygieneAnalyzer
+from mcp_audit.analyzers.credentials import CredentialsAnalyzer
+from mcp_audit.analyzers.permissions import analyze_flagged_server_allows
+from mcp_audit.analyzers.poisoning import PoisoningAnalyzer
+from mcp_audit.analyzers.rug_pull import RugPullAnalyzer, derive_state_path
+from mcp_audit.analyzers.sandbox import analyze_sandbox_files
+from mcp_audit.analyzers.supply_chain import SupplyChainAnalyzer
+from mcp_audit.analyzers.toxic_flow import ToxicFlowAnalyzer
+from mcp_audit.analyzers.transport import TransportAnalyzer
+from mcp_audit.config_parser import parse_config
+from mcp_audit.discovery import (
+    DiscoveredConfig,
+    build_info_symlink_finding,
+    build_project_symlink_finding,
+    discover_configs,
+    discover_cwd_autoexec_files,
+)
+from mcp_audit.models import (
+    Finding,
+    RegistryStats,
+    ScanResult,
+    ServerConfig,
+    ServerEnumeration,
+    Severity,
+)
+from mcp_audit.scoring import calculate_score
+
+if TYPE_CHECKING:
+    from mcp_audit.governance.models import ScoringWeights
+
+_USER_RULES_DIR = Path(user_config_dir("mcp-audit")) / "rules"
+
+
+def _extract_registry(analyzers: list[BaseAnalyzer]):
+    """Return the :class:`KnownServerRegistry` owned by a SupplyChainAnalyzer.
+
+    The scanner uses this to avoid reloading the registry JSON a second
+    time when threading it into the toxic-flow analyzer.  Returns ``None``
+    when no :class:`SupplyChainAnalyzer` is present (e.g. a custom analyzer
+    list that excludes supply-chain checks).
+
+    Args:
+        analyzers: The list of analyzers used during the scan.
+
+    Returns:
+        The shared :class:`~mcp_audit.registry.loader.KnownServerRegistry`
+        instance, or ``None`` if unavailable.
+    """
+    for analyzer in analyzers:
+        if isinstance(analyzer, SupplyChainAnalyzer):
+            return analyzer.registry
+    return None
+
+
+def _extract_registry_stats(
+    analyzers: list[BaseAnalyzer],
+) -> RegistryStats | None:
+    """Extract registry metadata from the SupplyChainAnalyzer in *analyzers*.
+
+    Uses the live ``len(registry.entries)`` count rather than the stored
+    ``entry_count`` field, so the value stays accurate even if an entry was
+    added without updating the field.
+
+    Args:
+        analyzers: The list of analyzers used during the scan.
+
+    Returns:
+        :class:`~mcp_audit.models.RegistryStats` if a
+        :class:`~mcp_audit.analyzers.supply_chain.SupplyChainAnalyzer` is
+        present, otherwise ``None``.
+    """
+    for analyzer in analyzers:
+        if isinstance(analyzer, SupplyChainAnalyzer):
+            reg = analyzer.registry
+            return RegistryStats(
+                entry_count=len(reg.entries),
+                schema_version=reg.schema_version,
+                last_updated=reg.last_updated,
+            )
+    return None
+
+
+def _analyzer_crash_finding(
+    analyzer_name: str, server: ServerConfig, exc: Exception
+) -> Finding:
+    """Build a HIGH-severity finding when an analyzer throws an exception."""
+    return Finding(
+        id="SCAN-ERR",
+        severity=Severity.HIGH,
+        analyzer="scanner",
+        client=server.client,
+        server=server.name,
+        title=(
+            f"Analyzer '{analyzer_name}' crashed on server "
+            f"'{server.name}' — manual review required"
+        ),
+        description=(
+            f"The {analyzer_name} analyzer raised an unexpected exception. "
+            "Its findings for this server were not produced. A malicious "
+            "config may be crafted to trigger this failure."
+        ),
+        evidence=f"{type(exc).__name__}: {exc}",
+        remediation=(
+            "Manually inspect this server configuration. Report this error "
+            "to the mcp-audit maintainers if it persists."
+        ),
+        finding_path=str(server.config_path),
+    )
+
+
+def _run_rules_engine(
+    servers: list[ServerConfig],
+    extra_rules_dirs: list[Path] | None,
+    analyzers: list[BaseAnalyzer] | None = None,
+) -> list[Finding]:
+    """Load and run the policy-as-code rule engine against all servers.
+
+    Always loads bundled community rules.  When *extra_rules_dirs* is
+    provided (caller-supplied;) also loads rules from
+    those directories (user rules take precedence on ID conflicts).
+
+    When *analyzers* is supplied and contains a
+    :class:`~mcp_audit.analyzers.supply_chain.SupplyChainAnalyzer`, its
+    already-loaded registry is threaded into the engine so rules declaring
+    ``exempt_known_servers: true`` (e.g. COMM-004) can skip servers whose
+    command, any arg, or server name matches a registry entry.  Omitting
+    *analyzers* disables the exemption path entirely — the engine falls
+    back to its historical "match everything" behaviour.
+
+    Args:
+        servers: All discovered server configurations.
+        extra_rules_dirs: Additional directories to load rules from.
+        analyzers: The analyzer list used for this scan.  Used only to
+            extract the shared :class:`KnownServerRegistry` instance.
+
+    Returns:
+        List of Finding objects produced by matching rules.
+    """
+    from mcp_audit.rules.engine import (  # noqa: PLC0415
+        RuleEngine,
+        load_bundled_community_rules,
+        load_rules_from_dir,
+        merge_rules,
+    )
+
+    community_rules = load_bundled_community_rules()
+
+    if extra_rules_dirs:
+        user_rules: list = []
+        for d in extra_rules_dirs:
+            user_rules.extend(load_rules_from_dir(d))
+        all_rules = merge_rules(user_rules, community_rules)
+    else:
+        all_rules = community_rules
+
+    registry = _extract_registry(analyzers) if analyzers is not None else None
+    engine = RuleEngine(all_rules, registry=registry)
+    findings: list[Finding] = []
+    for server in servers:
+        findings.extend(engine.match_server(server))
+    return findings
+
+
+def get_default_analyzers() -> list[BaseAnalyzer]:
+    """Return the default set of per-server analyzers.
+
+    The :class:`SupplyChainAnalyzer` is constructed first and its already-
+    loaded :class:`KnownServerRegistry` is threaded into the
+    :class:`TransportAnalyzer` so TRANSPORT-003 can tier its severity by
+    registry membership without reading the registry JSON a second time.
+
+    Note: :class:`~mcp_audit.analyzers.rug_pull.RugPullAnalyzer` is intentionally
+    excluded here — it operates across all servers collectively and is invoked
+    separately via :func:`run_scan`.
+    """
+    supply_chain = SupplyChainAnalyzer()
+    return [
+        PoisoningAnalyzer(),
+        CredentialsAnalyzer(),
+        TransportAnalyzer(registry=supply_chain.registry),
+        supply_chain,
+        ConfigHygieneAnalyzer(),
+        AuthAnalyzer(),
+    ]
+
+
+def apply_exploit_signals(result: ScanResult, index: object | None = None) -> None:
+    """Attach KEV/EPSS/PoC to *result*'s CVE findings and record the data dates.
+
+    Uses the bundled data unless *index* (a ``SignalIndex``, e.g. from
+    ``--live``) is given. Does nothing when no finding carries a CVE.
+    """
+    from mcp_audit.exploit import signals  # noqa: PLC0415
+
+    if not any(f.cve for f in result.findings):
+        result.exploit_data = None
+        return
+    idx = index if index is not None else signals.load()
+    signals.annotate(result.findings, idx)  # type: ignore[arg-type]
+    result.exploit_data = {
+        "source": "live" if idx.live else "bundled",  # type: ignore[attr-defined]
+        "kev_date": idx.kev_date,  # type: ignore[attr-defined]
+        "epss_date": idx.epss_date,  # type: ignore[attr-defined]
+        "line": idx.date_line(),  # type: ignore[attr-defined]
+    }
+
+
+def _run_static_pipeline(
+    result: ScanResult,
+    all_servers: list[ServerConfig],
+    configs: list[DiscoveredConfig],
+    analyzers: list[BaseAnalyzer],
+    skip_rug_pull: bool = False,
+    state_path: Path | None = None,
+    extra_rules_dirs: list[Path] | None = None,
+    scoring_weights: ScoringWeights | None = None,
+    scoring_weights_source: str = "default",
+    instruction_files: list[_drift.InstructionFile] | None = None,
+    guardrail_files: list[_guardrails.GuardrailFile] | None = None,
+) -> ScanResult:
+    """Run the canonical static analysis pipeline against parsed servers.
+
+    Pipeline order (this is the single source of truth for the scanner flow —
+    both :func:`run_scan` and :func:`run_scan_async` delegate here):
+
+    0. Config-level checks via
+       :meth:`~mcp_audit.analyzers.base.BaseAnalyzer.analyze_config` —
+       calls every analyzer once per config file, independent of server count.
+       Analyzers that have nothing to check return ``[]`` (the default).
+    0b. SANDBOX-001..005 (STORY-0093):
+       :func:`~mcp_audit.analyzers.sandbox.analyze_sandbox_files` over the
+       Claude Code settings files in ``configs``: sandbox keys a repository's
+       settings loosen, keys a file can't set, a local settings file in a git
+       work tree that no ignore file covers, and home-directory paths in a
+       settings file headed for git.  It reads ignore files and the user's
+       ``~/.claude/settings.json`` (never runs git); each file is checked on
+       its own, and read failures and per-file crashes go to
+       ``result.errors``.  Runs only when a :class:`ConfigHygieneAnalyzer` is
+       in ``analyzers``.
+    1. Per-server analyzers (``analyzer.analyze(server)`` for each pair).
+    2. :meth:`~mcp_audit.analyzers.rug_pull.RugPullAnalyzer.analyze_all`
+       (skipped when ``skip_rug_pull`` is ``True``).
+    3. :meth:`~mcp_audit.analyzers.toxic_flow.ToxicFlowAnalyzer.analyze_all`,
+       with the registry extracted from the ``analyzers`` list so the
+       JSON registry is read from disk exactly once per scan.
+    4. :func:`~mcp_audit.analyzers.attack_paths.summarize_attack_paths`
+       over the toxic-flow findings produced above.
+    5. Policy-as-code rule engine (bundled community rules always;
+       ``extra_rules_dirs`` additionally when provided).
+    5b. PERM-007 (STORY-0092):
+       :func:`~mcp_audit.analyzers.permissions.analyze_flagged_server_allows`
+       over the Claude Code settings files in ``configs``, against every
+       finding from steps 1–5, so an ``mcp__<server>`` allow rule on a server
+       with HIGH or CRITICAL findings is reported and scored.  It runs only
+       when a :class:`ConfigHygieneAnalyzer` is in ``analyzers``, like the
+       PERM-001..006 and HARNESS-* checks it sits beside.
+    5c. Instruction-file drift (INSTR-001/002, STORY-0113):
+       :func:`~mcp_audit.agent_files.drift.instruction_drift_findings` over
+       *instruction_files* (a default scan's user-global and cwd-root
+       instruction files), against every finding above, so INSTR-002 can say
+       a change brought a MEDIUM+ finding.  Skipped with ``skip_rug_pull`` or
+       when *instruction_files* is ``None``; the record sits beside the
+       rug-pull state (:func:`~mcp_audit.agent_files.drift.state_path_for`).
+    5c2. Guardrail drift (GUARD-001/002, STORY-0143):
+       :func:`~mcp_audit.guardrails.guardrail_drift_findings` over
+       *guardrail_files* (a default scan's user-global and cwd-root agent
+       settings files plus managed settings hashes), right after 5c, with the
+       same skip rules; the record sits beside the rug-pull state
+       (:func:`~mcp_audit.guardrails.state_path_for`).
+    5d. Exploit signals (STORY-0124): :func:`apply_exploit_signals` adds KEV,
+       EPSS and public-PoC data to CVE findings before scoring.
+    6. :func:`~mcp_audit.scoring.calculate_score` over the final finding list.
+    7. ``result.registry_stats`` attached from the SupplyChainAnalyzer.
+
+    The function is intentionally synchronous — ``run_scan_async`` completes
+    any live MCP server enumeration before invoking this helper, so all
+    operations here are pure, blocking computations.
+
+    Args:
+        result: Pre-populated :class:`~mcp_audit.models.ScanResult`.  May
+            already contain runtime findings added by the caller (e.g. the
+            ``--connect`` path) and/or parse errors.  Mutated in place.
+        all_servers: All static :class:`~mcp_audit.models.ServerConfig`
+            objects parsed from ``configs``.
+        configs: Discovered client configurations (used by ``derive_state_path``
+            to scope the rug-pull state file to this config set).
+        analyzers: Per-server analyzer list.  A
+            :class:`~mcp_audit.analyzers.supply_chain.SupplyChainAnalyzer` in
+            this list owns the registry that is reused by toxic-flow and
+            registry-stats extraction.
+        skip_rug_pull: Skip rug-pull analysis entirely (used by ``pin``/``diff``).
+        state_path: Override the rug-pull state file location.
+        extra_rules_dirs: Additional rule directories to load
+            (optional; caller-supplied).
+        scoring_weights: Optional custom scoring weights from a governance policy.
+            When ``None``, the hardcoded defaults in :mod:`mcp_audit.scoring` are used.
+        scoring_weights_source: Audit label written to ``ScanScore.weights_source``.
+            Callers should pass ``"policy:<abs-path>"`` when custom weights are active.
+        instruction_files: Instruction files to check for drift (step 5c);
+            ``None`` skips the step.
+        guardrail_files: Agent settings files to check for guardrail drift
+            (step 5c2); ``None`` skips the step.
+
+    Returns:
+        The same :class:`~mcp_audit.models.ScanResult` passed in, now
+        populated with findings, ``attack_path_summary``, ``score``, and
+        ``registry_stats``.
+    """
+    # ── 0. Config-level checks (run once per file for all analyzers) ──────────
+    for config in configs:
+        for analyzer in analyzers:
+            try:
+                config_findings = analyzer.analyze_config(
+                    raw=config.raw,
+                    config_path=config.path,
+                    client=config.client_name,
+                )
+                for finding in config_findings:
+                    finding.finding_path = str(config.path)
+                result.findings.extend(config_findings)
+            except Exception:  # noqa: BLE001, S110
+                pass  # parse errors already captured by _discover_and_parse
+
+    # ── 0b. Sandbox settings (SANDBOX-001..005, STORY-0093) ───────────────────
+    # Reads ignore files and the user's settings (never runs git), so unlike
+    # step 0 its failures are reported in result.errors rather than swallowed.
+    # analyze_sandbox_files isolates each file; this try is the last guard.
+    if any(isinstance(a, ConfigHygieneAnalyzer) for a in analyzers):
+        try:
+            sandbox_findings, sandbox_errors = analyze_sandbox_files(configs)
+            result.findings.extend(sandbox_findings)
+            result.errors.extend(sandbox_errors)
+        except Exception as e:  # noqa: BLE001
+            result.errors.append(f"SANDBOX checks failed: {type(e).__name__}")
+
+    # ── 1. Per-server static analysis ─────────────────────────────────────────
+    for server in all_servers:
+        for analyzer in analyzers:
+            try:
+                findings = analyzer.analyze(server)
+                for finding in findings:
+                    finding.finding_path = str(server.config_path)
+                result.findings.extend(findings)
+            except Exception as e:  # noqa: BLE001
+                result.findings.append(
+                    _analyzer_crash_finding(analyzer.name, server, e)
+                )
+
+    # ── 2. Rug-pull analysis (cross-server, stateful) ─────────────────────────
+    if not skip_rug_pull:
+        # Scope the state file to the exact set of configs being scanned so
+        # that demo configs and real-machine configs never share a baseline.
+        effective_state = (
+            state_path if state_path is not None else derive_state_path(configs)
+        )
+        rug_pull = RugPullAnalyzer(state_path=effective_state)
+        try:
+            result.findings.extend(rug_pull.analyze_all(all_servers))
+        except Exception as e:  # noqa: BLE001
+            result.errors.append(f"rug_pull error: {e}")
+
+    # ── 3. Toxic flow analysis (cross-server, stateless) ──────────────────────
+    # Share the SupplyChainAnalyzer's registry so capability data is read
+    # from disk exactly once per scan.
+    try:
+        result.findings.extend(
+            ToxicFlowAnalyzer(registry=_extract_registry(analyzers)).analyze_all(
+                all_servers
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        result.errors.append(f"toxic_flow error: {e}")
+
+    # ── 4. Attack path summarization ──────────────────────────────────────────
+    try:
+        toxic_findings = [f for f in result.findings if f.analyzer == "toxic_flow"]
+        result.attack_path_summary = summarize_attack_paths(all_servers, toxic_findings)
+    except Exception as e:  # noqa: BLE001
+        result.errors.append(f"attack_paths error: {e}")
+
+    # ── 5. Policy-as-code rule engine ─────────────────────────────────────────
+    try:
+        result.findings.extend(
+            _run_rules_engine(all_servers, extra_rules_dirs, analyzers=analyzers)
+        )
+    except Exception as e:  # noqa: BLE001
+        result.errors.append(f"rules_engine error: {e}")
+
+    # ── 5b. Allow rules on servers with HIGH+ findings (PERM-007) ─────────────
+    # Needs every finding above, so it cannot run in step 0 with PERM-001..006.
+    if any(isinstance(a, ConfigHygieneAnalyzer) for a in analyzers):
+        try:
+            result.findings.extend(
+                analyze_flagged_server_allows(configs, all_servers, result.findings)
+            )
+        except Exception as e:  # noqa: BLE001
+            result.errors.append(f"permissions error: {e}")
+
+    # ── 5c. Instruction-file drift (INSTR-001/002, STORY-0113) ───────────────
+    # Needs every finding above (INSTR-002); never raises.
+    if instruction_files is not None and not skip_rug_pull:
+        result.findings.extend(
+            _drift.instruction_drift_findings(
+                instruction_files,
+                result.findings,
+                _drift.state_path_for(state_path),
+                result.errors,
+            )
+        )
+
+    # ── 5c2. Guardrail drift (GUARD-001/002, STORY-0143) ─────────────────────
+    # Same skip rules as 5c; never raises.
+    if guardrail_files is not None and not skip_rug_pull:
+        result.findings.extend(
+            _guardrails.guardrail_drift_findings(
+                guardrail_files,
+                _guardrails.state_path_for(state_path),
+                result.errors,
+            )
+        )
+
+    # ── 5d. Exploit signals (KEV / EPSS / public PoC) on CVE findings ─────────
+    apply_exploit_signals(result)
+
+    # ── 6. Scoring ────────────────────────────────────────────────────────────
+    result.score = calculate_score(
+        result.findings,
+        weights=scoring_weights,
+        weights_source=scoring_weights_source,
+    )
+
+    # ── 7. Registry metadata ──────────────────────────────────────────────────
+    result.registry_stats = _extract_registry_stats(analyzers)
+    # A known-malicious file that could not be read leaves SC-008 blind; say
+    # so instead of passing silently (STORY-0097).
+    for analyzer in analyzers:
+        if isinstance(analyzer, SupplyChainAnalyzer):
+            load_error = analyzer.malicious.load_error
+            if load_error:
+                result.errors.append(f"known-malicious data: {load_error}")
+            break
+
+    return result
+
+
+def _cwd_autoexec_findings() -> list[Finding]:
+    """TRUST-003 / TRUST-008 (and TRUST-002) for auto-run files at the cwd root.
+
+    A default scan (no explicit path) already reads ``.claude/settings.json``
+    at the working directory's root (STORY-0082); this reads the VS Code,
+    Gemini CLI, Codex and Claude Code auto-run files beside it, so ``scan``,
+    ``check`` and the GitHub Action see a commit that plants one.  Root only,
+    no walk: ``scan --project`` walks the tree.  Skipped when the cwd is the
+    home directory.  A symlinked candidate gets TRUST-002 instead, as under
+    ``--project``.
+    """
+    cwd = Path.cwd()
+    hygiene = ConfigHygieneAnalyzer()
+    findings: list[Finding] = []
+    for autoexec_file in discover_cwd_autoexec_files(cwd):
+        if autoexec_file.is_symlink and autoexec_file.symlink_root is not None:
+            findings.append(
+                build_project_symlink_finding(
+                    autoexec_file.path, autoexec_file.client, autoexec_file.symlink_root
+                )
+            )
+            continue
+        try:
+            findings.extend(
+                hygiene.analyze_autoexec_file(
+                    kind=autoexec_file.kind,
+                    config_path=autoexec_file.path,
+                    client=autoexec_file.client,
+                    project_root=cwd,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            findings.append(
+                _analyzer_crash_finding(
+                    "config_hygiene",
+                    ServerConfig(
+                        name=autoexec_file.path.name,
+                        client=autoexec_file.client,
+                        config_path=autoexec_file.path,
+                    ),
+                    exc,
+                )
+            )
+    return findings
+
+
+def _default_instruction_files(
+    extra_paths: list[Path] | None, skip_rug_pull: bool, errors: list[str]
+) -> list[_drift.InstructionFile] | None:
+    """Instruction files whose drift a default scan checks (STORY-0113).
+
+    ``None`` (no check) for an explicit path, which means "scan exactly
+    this", and when rug-pull state is skipped (``pin``/``diff``).
+    """
+    if extra_paths or skip_rug_pull:
+        return None
+    return _drift.instruction_files(Path.cwd(), errors)
+
+
+def _default_guardrail_files(
+    extra_paths: list[Path] | None,
+    skip_rug_pull: bool,
+    errors: list[str],
+    enabled: bool = True,
+) -> list[_guardrails.GuardrailFile] | None:
+    """Settings files whose guardrail drift a default scan checks (STORY-0143).
+
+    ``None`` (no check) for an explicit path and for ``pin``/``diff``, like
+    :func:`_default_instruction_files`.  Also ``None`` unless *enabled*: only
+    commands that show findings (``scan``, ``check``, ``watch``) run the step,
+    so a command that discards them never consumes a loosening.  Never raises.
+    """
+    if not enabled or extra_paths or skip_rug_pull:
+        return None
+    try:
+        return _guardrails.guardrail_files(Path.cwd(), errors)
+    except Exception as exc:  # noqa: BLE001 — a scan must never fail over this
+        errors.append(f"guardrail drift failed: {type(exc).__name__}")
+        return None
+
+
+def _cwd_instruction_reach_findings(errors: list[str]) -> list[Finding]:
+    """MEM-003 / MEM-004 for the working directory's instruction files.
+
+    A default scan (no explicit path) reads the files at the cwd root that
+    Claude Code expands ``@path`` imports in, follows those imports (MEM-003
+    for one that leaves the folder or is ``.gitignore``'d), and checks
+    ``HEARTBEAT.md`` there and in ``~/.openclaw/workspace`` (MEM-004).  Root
+    only; ``scan --project`` walks the tree.  Never raises: problems go to
+    *errors* (STORY-0098; see :mod:`mcp_audit.agent_files.reach`).
+    """
+    from mcp_audit.agent_files import reach as _reach  # noqa: PLC0415
+
+    return _reach.default_scan_findings(Path.cwd(), errors)
+
+
+def _discover_and_parse(
+    extra_paths: list[Path] | None,
+    result: ScanResult,
+    include_plugins: bool = True,
+) -> tuple[list[DiscoveredConfig], list[ServerConfig]]:
+    """Discover client configs and parse them into static ServerConfigs.
+
+    Shared preamble for both :func:`run_scan` and :func:`run_scan_async`.
+    Populates ``result.clients_scanned``, ``result.servers_found``,
+    ``result.servers``, and appends parse errors to ``result.errors``.
+
+    A discovered config that is itself a symlink (``is_symlink=True``) is
+    parsed exactly like any other — ``parse_config()`` reads through it via
+    normal OS-level symlink following, so scan coverage is unaffected — and
+    additionally gets a TRUST-002 (cwd-scoped) or TRUST-004 (user-global /
+    explicit ``--path``) finding appended to ``result.findings``.  See
+    ``humans/decisions/2026-09-08-trust-002-symlink-sites.md`` (marcus repo).
+
+    With *include_plugins* (the default) and no *extra_paths*, installed Claude
+    Code plugins are part of discovery: their MCP servers arrive as client
+    ``claude-code-plugin`` and the PLUGIN-001/002 pin checks, plus the
+    PLUGIN-003/004 pin-vs-checkout checks and TRUST-006/007 on plugin and
+    marketplace checkouts (STORY-0096), are appended to ``result.findings``
+    here, so every ``run_scan`` consumer (``scan``, ``check``, ``dashboard`` …)
+    sees them and the score counts them.
+
+    With no *extra_paths*, the VS Code, Gemini CLI, Codex and Claude Code
+    auto-run files at the working directory's root are checked too (TRUST-003,
+    TRUST-008; STORY-0090; see :func:`_cwd_autoexec_findings`), its
+    instruction files' imports and heartbeat files (MEM-003, MEM-004;
+    STORY-0098; see :func:`_cwd_instruction_reach_findings`), and the
+    repository git would use from the current directory, for git configuration
+    and hooks that run commands (TRUST-006/TRUST-007, STORY-0089; see
+    :func:`mcp_audit.analyzers.git_exec.scan_cwd_repository`).  All are scored
+    like the rest.
+    So are the skills under ``~/.claude/skills`` and ``<cwd>/.claude/skills``:
+    every file in each skill directory is read (SKILL-005..008, STORY-0095;
+    see :func:`mcp_audit.agent_files.skill_package.scan_default_skills`), and
+    filesystem problems there go to ``result.errors``.
+
+    Without *extra_paths*, Claude Code subagent definitions
+    (``~/.claude/agents/``, ``<cwd>/.claude/agents/``) are discovered too, as
+    client ``claude-code-agent`` (STORY-0094): their inline servers join
+    ``result.servers`` and their frontmatter is checked at pipeline step 0
+    (AGENT-001..004, HOOK-001/002). TRUST-002/004/005 for symlinks under the
+    agents directories and any partly-unreadable frontmatter (``errors``) are
+    recorded here.
+
+    With no *extra_paths*, the working directory's
+    ``.github/workflows/*.y{a,}ml`` files are read the same way and their
+    WORKFLOW-001..003 findings appended (STORY-0091).
+    """
+    discovery_findings: list[Finding] = []
+    configs = discover_configs(
+        extra_paths=extra_paths,
+        skip_auto_discovery=bool(extra_paths),
+        include_plugins=include_plugins,
+        skip_findings=discovery_findings,
+        errors=result.errors,
+    )
+    result.findings.extend(discovery_findings)
+    result.clients_scanned = len({c.client_name for c in configs})
+
+    if not extra_paths:
+        # Git can run code (STORY-0089, TRUST-006/007): the repository git
+        # would use from here — a repo checkout is the GitHub Action's default
+        # working directory.  Reads config files and lists hooks; never runs git.
+        # A failure here is reported, never fatal: the rest of the scan must run.
+        try:
+            result.findings.extend(_git_exec.scan_cwd_repository())
+        except Exception as e:  # noqa: BLE001
+            result.errors.append(f"git config check error: {type(e).__name__}: {e}")
+        # Secrets in permission rules that git history still holds (CRED-005,
+        # STORY-0153): reads git's object files, never runs git; never raises.
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            cwd = None
+        if cwd is not None:
+            result.findings.extend(
+                _rule_secret_history.scan_repository_history(cwd, result.errors)
+            )
+
+    if include_plugins and not extra_paths:
+        from mcp_audit.plugins import analyzer as _plugin_analyzer  # noqa: PLC0415
+        from mcp_audit.plugins import discovery as _plugin_discovery  # noqa: PLC0415
+        from mcp_audit.plugins import mods as _plugin_mods  # noqa: PLC0415
+
+        installed = _plugin_discovery.discover_installed_plugins()
+        result.findings.extend(_plugin_analyzer.analyze_plugin_integrity(installed))
+        # Plugin pin vs the actual checkout (STORY-0096, PLUGIN-003/004) and the
+        # checkouts' git config (TRUST-006/007).  Reads HEAD, refs and config as
+        # files; never runs git.  A failure is reported, never fatal.
+        try:
+            from mcp_audit.plugins import checkout as _plugin_checkout  # noqa: PLC0415
+
+            seen = {(f.id, f.finding_path, f.evidence) for f in result.findings}
+            result.findings.extend(
+                f
+                for f in _plugin_checkout.analyze_plugin_pins(
+                    installed, errors=result.errors
+                )
+                if (f.id, f.finding_path, f.evidence) not in seen
+            )
+        except Exception as e:  # noqa: BLE001
+            result.errors.append(
+                f"plugin checkout check error: {type(e).__name__}: {e}"
+            )
+        # Mods (STORY-0085): installed plugins, Claude-written dev mods and
+        # CLAUDE_CODE_PLUGIN_DIRS, read statically, never executed.
+        result.findings.extend(
+            _plugin_mods.analyze_mods(_plugin_mods.discover_mods(installed))
+        )
+        result.findings.extend(_plugin_mods.analyze_plugin_dirs_setting())
+
+    if not extra_paths:
+        # A repository ``.gemini``/``.codex`` that links into the user's own
+        # config directory was already reported (TRUST-002) by discovery, which
+        # analyses the file once as the user's; report the link once (STORY-0110).
+        linked = {
+            f.finding_path
+            for f in result.findings
+            if f.id in ("TRUST-002", "TRUST-004")
+        }
+        result.findings.extend(
+            f
+            for f in _cwd_autoexec_findings()
+            if not (f.id == "TRUST-002" and f.finding_path in linked)
+        )
+        # Skill packages (STORY-0095): every file in each user and cwd skill.
+        result.findings.extend(
+            _skill_package.scan_default_skills(result.errors, prior=result.findings)
+        )
+        result.findings.extend(_cwd_instruction_reach_findings(result.errors))
+
+        # GitHub Actions workflows of the repository the scan runs in
+        # (STORY-0091): the GitHub Action's default run is a scan from the
+        # checkout, so a workflow that hands an agent secrets on an issue or
+        # comment trigger fails CI.  Read-only YAML; an explicit path skips it.
+        from mcp_audit.ci_workflows import scan_workflows  # noqa: PLC0415
+
+        try:
+            result.findings.extend(scan_workflows(Path.cwd(), errors=result.errors))
+        except Exception as exc:  # noqa: BLE001 — never fail the scan over CI files
+            result.errors.append(f"ci_workflows: workflow scan failed: {exc}")
+
+        # Saved tool text (STORY-0136): ``lock --connect --save-tool-text`` keeps
+        # the tool definitions beside the lock; ANNOT-001 reads their
+        # annotations against their schemas.  Read-only; no server is started.
+        try:
+            from mcp_audit.analyzers.annotations import (  # noqa: PLC0415
+                findings_from_tool_text,
+            )
+            from mcp_audit.lock import tool_text as _tool_text  # noqa: PLC0415
+
+            _tt_path = Path.cwd() / _tool_text.TOOL_TEXT_FILENAME
+            _tt_doc, _tt_problem = _tool_text.load(_tt_path)
+            if _tt_problem:
+                result.errors.append(f"annotations: {_tt_problem}")
+            elif _tt_doc is not None:
+                result.findings.extend(findings_from_tool_text(_tt_doc, _tt_path))
+        except Exception as exc:  # noqa: BLE001 — never fail the scan over a companion file
+            result.errors.append(f"annotations: saved tool text scan failed: {exc}")
+
+    all_servers: list[ServerConfig] = []
+    # A file that is both an auto-run file and an MCP config (Codex's
+    # .codex/config.toml, Gemini CLI's .gemini/settings.json; STORY-0110) is
+    # reported as a symlink once, by whichever pass saw it first.
+    reported_links = {
+        f.finding_path for f in result.findings if f.id in ("TRUST-002", "TRUST-004")
+    }
+    for config in configs:
+        if config.is_symlink and str(config.path) in reported_links:
+            pass
+        elif config.is_symlink:
+            if config.symlink_root is not None:
+                result.findings.append(
+                    build_project_symlink_finding(
+                        config.path, config.client_name, config.symlink_root
+                    )
+                )
+            else:
+                result.findings.append(
+                    build_info_symlink_finding(config.path, config.client_name)
+                )
+        try:
+            servers = parse_config(config)
+            all_servers.extend(servers)
+        except ValueError as e:
+            result.errors.append(str(e))
+        result.errors.extend(config.parse_warnings)
+
+    if not extra_paths:
+        # Managed MCP policy (STORY-0112, MANAGED-001..005): what the
+        # organization's managed files allow or deny versus the Claude Code
+        # servers found above.  Read-only; failures go to result.errors.
+        from mcp_audit.analyzers import managed_policy as _managed  # noqa: PLC0415
+
+        result.findings.extend(
+            _managed.managed_policy_findings(
+                all_servers, configs, Path.cwd(), result.errors
+            )
+        )
+        # Guard hooks that will never run (STORY-0156): HOOK-004 in managed
+        # settings (MEDIUM), and Cursor hooks.json files (HOOK-001/002/004/005).
+        # Command strings only; never runs a hook.  Never raises.
+        from mcp_audit.analyzers import hook_runnable as _hook_runnable  # noqa: PLC0415
+
+        result.findings.extend(_hook_runnable.managed_hook_findings(result.errors))
+        result.findings.extend(_hook_runnable.cursor_hook_findings(result.errors))
+        # Credential files a Claude Code session can read without asking
+        # (STORY-0114, REACH-001..003): stat() and settings JSON only; no
+        # credential store is ever opened.  Never raises.
+        from mcp_audit.analyzers import secret_reach as _secret_reach  # noqa: PLC0415
+
+        result.findings.extend(_secret_reach.secret_reach_findings(result.errors))
+        # Editor extension allowlists (STORY-0144, EXTPOL-001..003): is the
+        # AllowedExtensions policy enforced, or only a user setting?  Reads the
+        # vendors' documented policy locations; read-only, never raises.
+        from mcp_audit.extensions import policy as _ext_policy  # noqa: PLC0415
+
+        result.findings.extend(_ext_policy.extension_policy_findings(result.errors))
+
+    result.servers_found = len(all_servers)
+    result.servers = all_servers
+    return configs, all_servers
+
+
+async def run_scan_async(
+    extra_paths: list[Path] | None = None,
+    analyzers: list[BaseAnalyzer] | None = None,
+    connect: bool = False,
+    state_path: Path | None = None,
+    skip_rug_pull: bool = False,
+    offline: bool = False,
+    extra_rules_dirs: list[Path] | None = None,
+    auth_token: str | None = None,
+    scoring_weights: ScoringWeights | None = None,
+    scoring_weights_source: str = "default",
+    include_plugins: bool = True,
+    guardrail_drift: bool = False,
+) -> ScanResult:
+    """Async scan entrypoint with optional live server enumeration.
+
+    Performs the same static analysis as :func:`run_scan` by delegating to
+    :func:`_run_static_pipeline`.  When *connect* is ``True``, additionally
+    attempts to connect to each discovered server via the MCP protocol,
+    enumerate its live tool/resource/prompt definitions, and run the
+    :class:`~mcp_audit.analyzers.poisoning.PoisoningAnalyzer` against the
+    runtime data *before* the pipeline runs.  This surfaces poisoned tool
+    descriptions that look clean in static config files.  Across the
+    enumerated servers it then runs COLLIDE-001 (tool-name collisions) and
+    DELEG-001..003 (descriptions that steer the agent to another server's
+    tools, :mod:`mcp_audit.analyzers.delegation`).
+
+    Requires the ``mcp`` optional dependency when *connect* is ``True``::
+
+        pip install 'mcp-audit-scanner[mcp]'
+
+    Args:
+        extra_paths: Additional config paths to scan.
+        include_plugins: Include installed Claude Code plugins (STORY-0080):
+            their MCP servers as client ``claude-code-plugin`` and the
+            PLUGIN-001/002 pin checks.  On by default; ignored when
+            *extra_paths* is given, because an explicit path means "scan
+            exactly this".
+        analyzers: Custom per-server analyzer list.  Uses defaults if ``None``.
+        connect: When ``True``, attempt live MCP protocol connections.
+        state_path: Override the rug-pull state file location (useful in tests).
+        skip_rug_pull: Skip rug-pull analysis entirely.  Used by ``pin``/``diff``.
+        offline: When ``True``, forbid all network calls.
+        extra_rules_dirs: Additional rule directories to load
+            (optional; caller-supplied).
+        auth_token: Bearer token forwarded to SSE/HTTP servers as
+            ``Authorization: Bearer <token>``.  Silently ignored for stdio
+            servers.  Never stored or logged.
+        scoring_weights: Optional custom scoring weights from a governance policy.
+        scoring_weights_source: Audit label for ``ScanScore.weights_source``.
+        guardrail_drift: Run pipeline step 5c2 (GUARD-001/002).  Off by default:
+            the step updates its record, so only a command that shows the
+            findings (``scan``, ``check``, ``watch``) may run it.
+
+    Returns:
+        :class:`~mcp_audit.models.ScanResult` with all findings.
+
+    Raises:
+        ValueError: If *connect* and *offline* are both ``True``.
+    """
+    if offline and connect:
+        raise ValueError("Cannot use --connect with --offline")
+
+    if analyzers is None:
+        analyzers = get_default_analyzers()
+
+    result = ScanResult()
+    configs, all_servers = _discover_and_parse(
+        extra_paths, result, include_plugins=include_plugins
+    )
+
+    # ── Live enumeration (opt-in, --connect) ──────────────────────────────────
+    # Runs before the static pipeline so the returned ScanResult's findings,
+    # scoring, attack paths, and rule-engine input all include the runtime
+    # poisoning signal for connected servers.
+    if connect:
+        from mcp_audit.mcp_client import (  # noqa: PLC0415
+            build_runtime_server_config,
+            connect_and_enumerate,
+        )
+
+        poisoning = PoisoningAnalyzer()
+        # Accumulate successful (server, enumeration) pairs for cross-server
+        # tool-name collision detection (COLLIDE-001) after the per-server loop.
+        connect_pairs: list[tuple[ServerConfig, ServerEnumeration]] = []
+
+        for server in all_servers:
+            enumeration = await connect_and_enumerate(server, auth_token=auth_token)
+
+            # Collect captured stderr for --verbose surfacing.
+            if enumeration.server_stderr:
+                result.server_logs.append(
+                    f"[{server.name}] {enumeration.server_stderr}"
+                )
+
+            if enumeration.error:
+                result.errors.append(f"[connect] {server.name}: {enumeration.error}")
+                continue
+            if enumeration.tools_error:
+                # The tool list may be partial; say so, then analyze what was read.
+                result.errors.append(
+                    f"[connect] {server.name}: tool list may be incomplete — "
+                    f"{enumeration.tools_error}"
+                )
+
+            # Record successful enumeration for collision detection.
+            connect_pairs.append((server, enumeration))
+
+            runtime_config = build_runtime_server_config(server, enumeration)
+            if runtime_config is None:
+                continue
+
+            try:
+                runtime_findings = poisoning.analyze(runtime_config)
+                for finding in runtime_findings:
+                    finding.finding_path = str(server.config_path)
+                    finding.description = f"[runtime] {finding.description}"
+                result.findings.extend(runtime_findings)
+            except Exception as e:  # noqa: BLE001
+                result.findings.append(
+                    _analyzer_crash_finding("poisoning (runtime)", server, e)
+                )
+
+        # ── Cross-server tool-name collision detection (COLLIDE-001) ──────────
+        # Requires at least two successfully connected servers to compare.
+        if len(connect_pairs) >= 2:
+            from mcp_audit.analyzers.collision import (  # noqa: PLC0415
+                detect_tool_collisions,
+            )
+
+            try:
+                result.findings.extend(
+                    detect_tool_collisions(
+                        connect_pairs, registry=_extract_registry(analyzers)
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                result.errors.append(f"collision error: {e}")
+
+        # ── Cross-tool delegation (DELEG-001..003, STORY-0100) ───────────────
+        # Reads the same enumerations: descriptions that steer the agent to
+        # another server's tools or rewrite their arguments.  Text only; the
+        # lock's `tools` section holds digests, so this needs --connect.
+        if connect_pairs:
+            from mcp_audit.analyzers.delegation import (  # noqa: PLC0415
+                detect_delegation,
+            )
+
+            try:
+                result.findings.extend(
+                    detect_delegation(connect_pairs, errors=result.errors)
+                )
+            except Exception as e:  # noqa: BLE001
+                result.errors.append(f"delegation error: {e}")
+
+        # ── Annotation contradictions (ANNOT-001, STORY-0136) ────────────────
+        # A tool annotated read-only whose input schema runs commands or writes.
+        # Reads the same enumerations; a hint from a server only ever raises.
+        if connect_pairs:
+            from mcp_audit.analyzers.annotations import (  # noqa: PLC0415
+                detect_annotation_contradictions,
+            )
+
+            try:
+                live = detect_annotation_contradictions(connect_pairs)
+                # The saved-tool-text pass may already have reported the same
+                # tool; the live enumeration is the fresher copy, so keep it.
+                seen = {(f.server, f.tool) for f in live}
+                result.findings = [
+                    f
+                    for f in result.findings
+                    if not (f.id == "ANNOT-001" and (f.server, f.tool) in seen)
+                ]
+                result.findings.extend(live)
+            except Exception as e:  # noqa: BLE001
+                result.errors.append(f"annotations error: {e}")
+
+    return _run_static_pipeline(
+        result=result,
+        all_servers=all_servers,
+        configs=configs,
+        analyzers=analyzers,
+        skip_rug_pull=skip_rug_pull,
+        state_path=state_path,
+        extra_rules_dirs=extra_rules_dirs,
+        scoring_weights=scoring_weights,
+        scoring_weights_source=scoring_weights_source,
+        instruction_files=_default_instruction_files(
+            extra_paths, skip_rug_pull, result.errors
+        ),
+        guardrail_files=_default_guardrail_files(
+            extra_paths, skip_rug_pull, result.errors, guardrail_drift
+        ),
+    )
+
+
+def run_scan(
+    extra_paths: list[Path] | None = None,
+    analyzers: list[BaseAnalyzer] | None = None,
+    connect: bool = False,
+    state_path: Path | None = None,
+    skip_rug_pull: bool = False,
+    offline: bool = False,
+    extra_rules_dirs: list[Path] | None = None,
+    auth_token: str | None = None,
+    scoring_weights: ScoringWeights | None = None,
+    scoring_weights_source: str = "default",
+    include_plugins: bool = True,
+    guardrail_drift: bool = False,
+) -> ScanResult:
+    """Run a complete scan: discover configs, parse them, analyze, return results.
+
+    When *connect* is ``False`` (the default), this is a pure static analysis —
+    no network calls, no subprocess spawning.  All configs are parsed first so
+    that the rug-pull analyzer receives the full server list in a single
+    :meth:`analyze_all` call, then the scan delegates to
+    :func:`_run_static_pipeline` — the canonical pipeline shared with
+    :func:`run_scan_async`.
+
+    When *connect* is ``True``, delegates to :func:`run_scan_async` via
+    :func:`asyncio.run` to perform live MCP protocol connections.
+
+    Args:
+        extra_paths: Additional config paths to scan.
+        include_plugins: Include installed Claude Code plugins (STORY-0080):
+            their MCP servers as client ``claude-code-plugin`` and the
+            PLUGIN-001/002 pin checks.  On by default; ignored when
+            *extra_paths* is given, because an explicit path means "scan
+            exactly this".
+        analyzers: Custom per-server analyzer list.  Uses defaults if ``None``.
+        connect: When ``True``, attempt live MCP protocol connections.
+        state_path: Override the rug-pull state file location.  Useful in tests.
+        skip_rug_pull: When ``True``, skip rug-pull analysis entirely.  Used by
+            the ``pin`` and ``diff`` CLI commands which manage state directly.
+        offline: When ``True``, forbid all network calls.
+        extra_rules_dirs: Additional rule directories to load
+            (optional; caller-supplied).
+        auth_token: Bearer token forwarded to SSE/HTTP servers as
+            ``Authorization: Bearer <token>``.  Silently ignored for stdio
+            servers.  Never stored or logged.
+        scoring_weights: Optional custom scoring weights from a governance policy.
+        scoring_weights_source: Audit label for ``ScanScore.weights_source``.
+        guardrail_drift: Run pipeline step 5c2 (GUARD-001/002).  Off by default:
+            the step updates its record, so only a command that shows the
+            findings (``scan``, ``check``, ``watch``) may run it.
+
+    Returns:
+        :class:`~mcp_audit.models.ScanResult` with all findings.
+
+    Raises:
+        ValueError: If *connect* and *offline* are both ``True``.
+    """
+    if offline and connect:
+        raise ValueError("Cannot use --connect with --offline")
+
+    if connect:
+        return asyncio.run(
+            run_scan_async(
+                extra_paths=extra_paths,
+                analyzers=analyzers,
+                connect=True,
+                state_path=state_path,
+                skip_rug_pull=skip_rug_pull,
+                offline=offline,
+                extra_rules_dirs=extra_rules_dirs,
+                auth_token=auth_token,
+                scoring_weights=scoring_weights,
+                scoring_weights_source=scoring_weights_source,
+                include_plugins=include_plugins,
+                guardrail_drift=guardrail_drift,
+            )
+        )
+
+    if analyzers is None:
+        analyzers = get_default_analyzers()
+
+    result = ScanResult()
+    configs, all_servers = _discover_and_parse(
+        extra_paths, result, include_plugins=include_plugins
+    )
+
+    return _run_static_pipeline(
+        result=result,
+        all_servers=all_servers,
+        configs=configs,
+        analyzers=analyzers,
+        skip_rug_pull=skip_rug_pull,
+        state_path=state_path,
+        extra_rules_dirs=extra_rules_dirs,
+        scoring_weights=scoring_weights,
+        scoring_weights_source=scoring_weights_source,
+        instruction_files=_default_instruction_files(
+            extra_paths, skip_rug_pull, result.errors
+        ),
+        guardrail_files=_default_guardrail_files(
+            extra_paths, skip_rug_pull, result.errors, guardrail_drift
+        ),
+    )

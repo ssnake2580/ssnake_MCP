@@ -1,0 +1,355 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Least privilege by default (2026-11 hardening): jobs that need more
+# declare it themselves.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    # Normal runs take 3-6 min on every OS. Without a limit a hang holds the
+    # runner for GitHub's 6-hour default (#274's Windows legs did exactly that).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv pip install -e ".[dev]" --system
+
+      - name: Install Playwright browsers
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: |
+          uv pip install playwright --system
+          python -m playwright install chromium firefox webkit
+          python -m playwright install-deps
+
+      - name: Run tests
+        run: pytest tests/ -x -q
+
+      - name: Ruff check
+        run: ruff check src/ tests/
+
+      - name: Ruff format check
+        run: ruff format --check src/ tests/
+
+  test-all-extras:
+    name: Test all optional extras (ubuntu, 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install all optional extras
+        # The default `test` matrix only installs `[dev]`, so anything gated
+        # on `cyclonedx-python-lib`, `sigstore`, `mcp`, or `httpx` would
+        # silently skip (nine SBOM tests plus the attestation / live-MCP
+        # paths).  This job wires the full optional stack so those code
+        # paths are actually exercised on every PR.
+        run: uv pip install -e ".[dev,sbom,attestation,mcp]" --system
+
+      - name: Install cosign
+        # No workflow installed cosign for the test suite before this line —
+        # TestCosignRoundTrip (tests/test_advisory_sign.py) skipped silently
+        # everywhere except a developer machine that happened to have it.
+        # Same pinned version R27 measured offline-verification behaviour
+        # against (docs/offline-verification-findings.md); re-pin together if
+        # that document is ever re-tested against a newer cosign.
+        # cosign-release is set explicitly: the installer's default moves with
+        # each installer release (v4.1.3 defaults to cosign v3.1.4), so an
+        # installer bump would otherwise silently re-version cosign (#276).
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.0.6
+
+      - name: Install minisign
+        # Pinned upstream release (jedisct1/minisign 0.12), checked by SHA-256,
+        # not apt: on 2026-11-11 the runner's Ubuntu mirror stopped resolving
+        # for over an hour and this step failed every run. The digest was taken
+        # from a tarball whose minisig verified against the author's published
+        # key (RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3).
+        # Closes the silent-skip gap for TestMinisignRoundTrip.
+        env:
+          MINISIGN_VERSION: "0.12"
+          MINISIGN_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+        run: |
+          curl -fsSL --retry 3 -o minisign.tar.gz \
+            "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz"
+          echo "${MINISIGN_SHA256}  minisign.tar.gz" | sha256sum -c -
+          tar xzf minisign.tar.gz minisign-linux/x86_64/minisign
+          sudo install -m 0755 minisign-linux/x86_64/minisign /usr/local/bin/minisign
+          rm -rf minisign.tar.gz minisign-linux
+          minisign -v
+
+      - name: Run tests
+        # This is also the only CI leg with cosign, minisign, AND (being
+        # ubuntu-latest with passwordless sudo) a usable `unshare --net` —
+        # so it is the one place TestFeedVerificationIsOfflineByConstruction
+        # (tests/test_advisory_sign.py) actually runs rather than skips.
+        run: pytest tests/ -x -q
+
+      - name: Run demo/lock/run.sh (README first-screen fixture)
+        # Resolves real npm package versions over the network, so it is
+        # gated on this env var (see tests/test_demo_lock.py, which runs the
+        # same script and asserts the same LOCK-001 count) rather than
+        # unconditional on every leg. This is also the ubuntu/py3.12 leg
+        # `update_test_count.py --check` below trusts to match the demo
+        # output the README shows.
+        env:
+          MCP_AUDIT_DEMO_NETWORK: "1"
+        run: bash demo/lock/run.sh
+
+      - name: Verify test-count docs in sync
+        # Runs in this job (all optional extras installed) so the collected
+        # count matches the full 1,391-test baseline written into the docs.
+        # The script uses sys.executable so it queries the same environment
+        # that just ran the tests, not a fresh uv venv.
+        run: python scripts/update_test_count.py --check
+
+      - name: Verify OWASP mapping completeness
+        # Ensures every finding ID in src/ has an entry in docs/owasp-mapping.json.
+        # A PR that adds a new finding ID without updating the mapping will fail here.
+        run: python scripts/validate_owasp_mapping.py
+
+  runtime:
+    name: Runtime harness (${{ matrix.os }})
+    # EPIC-0009 Story 1.1: launches real, credential-free MCP servers from npm
+    # through `mcp-audit run` and checks the handshake and tool list match a
+    # direct launch (tests/runtime/). Network-dependent, so opt-in via
+    # MCP_AUDIT_RUNTIME_TESTS like demo/lock/run.sh above. GitHub-hosted
+    # ubuntu and macOS images ship Node and npx, so no setup-node step.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install uv
+          uv pip install -e ".[dev]" --system
+
+      - name: Run runtime harness
+        env:
+          MCP_AUDIT_RUNTIME_TESTS: "1"
+        run: pytest tests/runtime/ -v
+
+      - name: Measure run cold-start overhead
+        run: python scripts/measure_run_overhead.py
+
+  wheel-check:
+    name: Wheel metadata
+    runs-on: ubuntu-latest
+    # The Core-Metadata invariant: hatchling's emitted Metadata-Version must
+    # be one the publish action's bundled Twine accepts. v0.15.0 failed at
+    # the tag because hatchling floated to 2.5 while the action still had
+    # Twine 6. Do not pin hatchling in lockstep with the action — this
+    # check is the invariant and runs on every PR.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        # uv is deliberately unpinned. Downstream (CPython 3.12.14, uv.lock,
+        # four-platform PYZ inspect) is pinned and checked; an incompatible
+        # uv fails the build immediately. latest-known was tried 2026-08-22
+        # and resolved uv 0.12.4, which cannot fetch 3.12.14. Do not pin a
+        # uv version — Dependabot does not bump action input strings.
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        # Same interpreter as publish-pypi. Pin owned by the binary composite
+        # default; pytest asserts this copy matches.
+        run: uv python install 3.12.14
+
+      - name: Build wheel and twine-check
+        # Resolve Twine from the publish action's runtime.txt at the pinned
+        # SHA — not a copy in this file. Dependabot bumping the action SHA
+        # then gets the matching Twine on the next PR, not a silent desync.
+        # Parse with sed, not awk -F=: a double-equals pin leaves an empty field.
+        run: |
+          set -euo pipefail
+          SHA=$(grep -oE 'pypa/gh-action-pypi-publish@[0-9a-f]{40}' \
+            .github/workflows/release.yml | head -n1 | cut -d@ -f2)
+          if ! echo "$SHA" | grep -qxE '[0-9a-f]{40}'; then
+            echo "ERROR: could not parse publish action SHA from release.yml" >&2
+            exit 1
+          fi
+          RUNTIME_URL="https://raw.githubusercontent.com/pypa/gh-action-pypi-publish/${SHA}/requirements/runtime.txt"
+          echo "Fetching $RUNTIME_URL"
+          RUNTIME=$(curl -fsSL "$RUNTIME_URL")
+          TWINE=$(printf '%s\n' "$RUNTIME" | sed -n 's/^twine==\([^ ]*\).*/\1/p' | head -n1)
+          if [ -z "$TWINE" ]; then
+            echo "ERROR: no twine== pin in runtime.txt at $SHA" >&2
+            printf '%s\n' "$RUNTIME" | head -n20 >&2
+            exit 1
+          fi
+          echo "Publish action $SHA bundles twine==$TWINE"
+          uv build --wheel
+          uvx "twine==${TWINE}" check --strict dist/*.whl
+          chmod +x scripts/generate_wheel_sbom.sh
+          export UV_PYTHON=3.12.14
+          scripts/generate_wheel_sbom.sh \
+            dist/*.whl \
+            dist/mcp-audit-scanner-wheel.cdx.json
+
+  action-input-contracts:
+    name: release.yml action input contracts
+    runs-on: ubuntu-latest
+    # release.yml only triggers on a v*.*.* tag push or workflow_dispatch —
+    # never pull_request — so a Dependabot bump to any action it pins
+    # (upload-artifact, download-artifact, action-gh-release,
+    # gh-action-pypi-publish, setup-uv, checkout) gets zero PR-time exercise
+    # of its actual input contract; see docs/release-ci-blind-spot.md for the
+    # full per-action execution table this job closes the gap in.
+    #
+    # This needs network (fetches each pinned action's action.yml from
+    # raw.githubusercontent.com at the exact pinned SHA) and runs
+    # unconditionally on every push/PR, same trade-off wheel-check (above)
+    # already accepts for its Twine-version bridge: a GitHub outage can fail
+    # an unrelated PR, but a check that only runs somewhere nobody looks
+    # would not have caught the gap #94 sits in.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install "pyyaml>=6.0,<7.0"
+
+      - name: Check release.yml action input contracts
+        run: python scripts/check_release_action_contracts.py
+
+  binary-smoke:
+    name: Binary smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # Only run on PRs and pushes to main — skip for every branch push.
+    # Four legs match release.yml so CI tests the artifact users download,
+    # not a linux-only subset. fail-fast is false: one platform must not
+    # hide a spec/exclude failure on another.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Keep in lockstep with .github/workflows/release.yml `build.matrix`.
+          # macos-13 was retired 2025-12-08; macos-15-intel is the x86_64
+          # replacement through 2027-08.
+          - os: macos-15-intel
+            target: darwin-x86_64
+            spec: mcp-audit-darwin-x86_64.spec
+            binary: mcp-audit-darwin-x86_64
+          - os: macos-latest
+            target: darwin-arm64
+            spec: mcp-audit-darwin-arm64.spec
+            binary: mcp-audit-darwin-arm64
+          - os: ubuntu-latest
+            target: linux-x86_64
+            spec: mcp-audit-linux-x86_64.spec
+            binary: mcp-audit-linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+            spec: mcp-audit-windows-x86_64.spec
+            binary: mcp-audit-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Interpreter, extras, spec, PyInstaller, PYZ inspect, smoke, size:
+      # one definition, shared with release.yml. Do not inline a copy here.
+      - uses: ./.github/actions/build-binary
+        with:
+          spec: ${{ matrix.spec }}
+          binary: ${{ matrix.binary }}
+          target: ${{ matrix.target }}
+
+  source-smoke:
+    name: Source smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Only run on PRs and pushes to main — skip for every branch push.
+    # Binary smoke now covers all four release targets. This job still adds
+    # watcher/rug-pull/canonical-path coverage on source installs without a
+    # second PyInstaller build.
+    # canonical-path coverage on both Ubuntu and Windows without the cost of a
+    # PyInstaller build.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv pip install -e ".[dev]" --system
+
+      - name: Run source smoke test
+        # Pass "uv run mcp-audit" as the multi-word binary invocation so the
+        # smoke test uses the installed source package rather than a built binary.
+        # On Windows the entry-point script may not be on PATH after --system
+        # install; "uv run" resolves the entry point reliably on all platforms.
+        run: python scripts/smoke_test.py uv run mcp-audit

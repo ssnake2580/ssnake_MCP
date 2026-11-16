@@ -1,0 +1,61 @@
+{
+  "name": "agent-security-scanner-mcp",
+  "version": "4.4.9",
+  "description": "npm audit for AI agents and OpenClaw skills: prompt injection firewall, package hallucination detection, MCP/security scanning, and auto-fix",
+  "author": "Sinewave AI",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": ["tools", "skills"],
+    "emoji": "shield",
+    "permissions": ["fs:read", "fs:write"]
+  },
+  "tools": [
+    {
+      "name": "scan_security",
+      "description": "Scan a file for security vulnerabilities"
+    },
+    {
+      "name": "scan_agent_prompt",
+      "description": "Scan a prompt for injection attacks"
+    },
+    {
+      "name": "check_package",
+      "description": "Verify a package is not hallucinated"
+    },
+    {
+      "name": "scan_agent_action",
+      "description": "Pre-execution safety check for agent actions"
+    },
+    {
+      "name": "scan_skill",
+      "description": "Scan an OpenClaw skill for security threats"
+    },
+    {
+      "name": "scanner_health",
+      "description": "Check plugin health status"
+    },
+    {
+      "name": "sbom_generate",
+      "description": "Generate CycloneDX SBOM for a project"
+    },
+    {
+      "name": "sbom_scan_vulnerabilities",
+      "description": "Scan SBOM against OSV.dev vulnerability database"
+    },
+    {
+      "name": "sbom_check_hallucinations",
+      "description": "Check SBOM packages against official registries"
+    },
+    {
+      "name": "sbom_diff",
+      "description": "Compare current SBOM against stored baseline"
+    },
+    {
+      "name": "sbom_export_report",
+      "description": "Generate HTML/JSON SBOM audit report"
+    }
+  ],
+  "skills": [
+    "skills/openclaw/SKILL.md"
+  ]
+}

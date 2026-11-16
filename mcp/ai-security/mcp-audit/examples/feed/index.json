@@ -1,0 +1,1148 @@
+{
+  "advisories": [
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "unpinned-dependency",
+            "mcp_audit_rule_id": "COMM-010",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP04"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "@modelcontextprotocol/server-filesytem",
+            "purl": "pkg:npm/@modelcontextprotocol/server-filesytem"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "3341e6680805e39a222529101600b922bed1a0c4e938d7ce55c5be24fb996a98",
+      "id": "x_MCPSA-20ce54c348dd",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP04"
+      ],
+      "path": "advisories/x_MCPSA-20ce54c348dd.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "npx used without pinned version"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "cwe_ids": [
+              "CWE-732"
+            ],
+            "finding_class": "config-hygiene",
+            "mcp_audit_rule_id": "CFHYG-001",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP01"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "3c69c8563ec4c49764a93ab1fd8de4af716fdfaa41412fb3781a801f9770d8c7",
+      "id": "x_MCPSA-2eafe2970798",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP01"
+      ],
+      "path": "advisories/x_MCPSA-2eafe2970798.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Config file is world-readable"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "finding-class-template",
+            "cwe_ids": [
+              "CWE-798"
+            ],
+            "finding_class": "hardcoded-secret",
+            "mcp_audit_rule_id": "CRED-001",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP01"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "b29b8590e8e2d73cf6a6d1bc3ee2041d18d87caaf5affa28a1e921704d27d0e1",
+      "id": "x_MCPSA-2fa2713d0891",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP01"
+      ],
+      "path": "advisories/x_MCPSA-2fa2713d0891.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "GitHub credential in environment"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "command-injection",
+            "mcp_audit_rule_id": "COMM-006",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP05"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "459c7fd1c0b2aa7286c086409a8a566055f1793356c1481e267e195d354134c1",
+      "id": "x_MCPSA-38aec9703e90",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP05"
+      ],
+      "path": "advisories/x_MCPSA-38aec9703e90.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Inline code execution via -c flag"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "cwe_ids": [
+              "CWE-829"
+            ],
+            "finding_class": "unpinned-dependency",
+            "mcp_audit_rule_id": "TRANSPORT-003",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP04"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "31f3c121caea2861008eeebda90febf2d3eaf690596dbe554eebd445a35ecc58",
+      "id": "x_MCPSA-3be0fde225cc",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP04"
+      ],
+      "path": "advisories/x_MCPSA-3be0fde225cc.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Runtime package fetching"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "cwe_ids": [
+              "CWE-829"
+            ],
+            "finding_class": "unpinned-dependency",
+            "mcp_audit_rule_id": "TRANSPORT-003",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP04"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "a545b274bc55604e9ce3f4cfad7caafbacea9e6593eea65098cba5e6e52c0efa",
+      "id": "x_MCPSA-4deda91e4e28",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP04"
+      ],
+      "path": "advisories/x_MCPSA-4deda91e4e28.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Runtime package fetching"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "excessive-scope",
+            "mcp_audit_rule_id": "COMM-034",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP06"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "554552c755f0a8b3082edd9274c5cced4010f87667d864b23c3087ef279966f2",
+      "id": "x_MCPSA-591f00712156",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP06"
+      ],
+      "path": "advisories/x_MCPSA-591f00712156.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Overprivileged MCP server credential (potential god key)"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "finding-class-template",
+            "cwe_ids": [
+              "CWE-312"
+            ],
+            "finding_class": "hardcoded-secret",
+            "mcp_audit_rule_id": "CFHYG-003",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP01"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "da559d03c0e45bf45abe2b5c3c673dc40b2fdc6a6e45deaadba3e49a074a4386",
+      "id": "x_MCPSA-6ddcf6699796",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP01"
+      ],
+      "path": "advisories/x_MCPSA-6ddcf6699796.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Config file stores a plaintext secret inline"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "finding-class-template",
+            "finding_class": "unpinned-dependency",
+            "mcp_audit_rule_id": "COMM-013",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP04",
+              "MCP05"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "@modelcontextprotocol/server-filesytem",
+            "purl": "pkg:npm/@modelcontextprotocol/server-filesytem"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "1758c301932844358224359ca0be77ad63ab5eea8aab15da8ec78f35e1e7d1b9",
+      "id": "x_MCPSA-6e008dc0208b",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP04",
+        "MCP05"
+      ],
+      "path": "advisories/x_MCPSA-6e008dc0208b.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:H/A:H",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "npx auto-confirm flag (silent execution)"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "command-injection",
+            "mcp_audit_rule_id": "COMM-004",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP05",
+              "MCP09"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "5e2d2303ecb2373e1550757dab8dec5b4fd5ca5920d976efa8238558ca5450c7",
+      "id": "x_MCPSA-82e9ae96b49c",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP05",
+        "MCP09"
+      ],
+      "path": "advisories/x_MCPSA-82e9ae96b49c.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Unrecognized stdio server binary"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "cwe_ids": [
+              "CWE-732"
+            ],
+            "finding_class": "config-hygiene",
+            "mcp_audit_rule_id": "CFHYG-001",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP01"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "76aa7a63c361046e0c741e9e07e5e95579311b6d4cbddac8a5c448ea45031007",
+      "id": "x_MCPSA-8502a2645df4",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP01"
+      ],
+      "path": "advisories/x_MCPSA-8502a2645df4.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Config file is world-readable"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "finding-class-template",
+            "finding_class": "unpinned-dependency",
+            "mcp_audit_rule_id": "COMM-013",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP04",
+              "MCP05"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "9ba71dc50261463ef88ff9614012f06a32a49bb94ec5819b6efc2cfd166a0c1a",
+      "id": "x_MCPSA-866c7040087d",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP04",
+        "MCP05"
+      ],
+      "path": "advisories/x_MCPSA-866c7040087d.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:H/A:H",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "npx auto-confirm flag (silent execution)"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "hardcoded-secret",
+            "mcp_audit_rule_id": "COMM-022",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP02"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "11ab66508e6ad64b4c7f839fc43c057120c83da2da7cb60d6a35c3a07352c6bc",
+      "id": "x_MCPSA-8b9f60e8b8f0",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP02"
+      ],
+      "path": "advisories/x_MCPSA-8b9f60e8b8f0.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Env key name suggests access token"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "command-injection",
+            "mcp_audit_rule_id": "COMM-004",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP05",
+              "MCP09"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "6679ccef7a0acac66eae1018522e8170afa1cac43a75703de6a9dee7f87f04d8",
+      "id": "x_MCPSA-8de3fc9126e5",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP05",
+        "MCP09"
+      ],
+      "path": "advisories/x_MCPSA-8de3fc9126e5.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Unrecognized stdio server binary"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "finding-class-template",
+            "finding_class": "command-injection",
+            "mcp_audit_rule_id": "COMM-015",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP05"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "dbeb1786f5b84b18683fc25915988726aa976ebc64ef68747ad90b5b8b1f9f73",
+      "id": "x_MCPSA-8e7a2699ca2f",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP05"
+      ],
+      "path": "advisories/x_MCPSA-8e7a2699ca2f.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Shell metacharacters in server args"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "command-injection",
+            "mcp_audit_rule_id": "COMM-007",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP05"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "74a4a5706dd10007070487145dc3f2dfdfb36c3e9aca7e66c74f229cd71157a2",
+      "id": "x_MCPSA-bc1986c4d7bb",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP05"
+      ],
+      "path": "advisories/x_MCPSA-bc1986c4d7bb.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "eval or exec passed in args"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "command-injection",
+            "mcp_audit_rule_id": "COMM-004",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP05",
+              "MCP09"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "@modelcontextprotocol/server-filesytem",
+            "purl": "pkg:npm/@modelcontextprotocol/server-filesytem"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "786056e2eae49691fe46b5a6cf8e7e6c40c187d64934470e9ccc2fb9d117668e",
+      "id": "x_MCPSA-c4d98262a4dc",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP05",
+        "MCP09"
+      ],
+      "path": "advisories/x_MCPSA-c4d98262a4dc.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Unrecognized stdio server binary"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "cwe_ids": [
+              "CWE-732"
+            ],
+            "finding_class": "config-hygiene",
+            "mcp_audit_rule_id": "CFHYG-001",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP01"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "@modelcontextprotocol/server-filesytem",
+            "purl": "pkg:npm/@modelcontextprotocol/server-filesytem"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "b07c664828a1840c813480fdfc8242c9f2136e1333d3d4f707a7453b948b4b59",
+      "id": "x_MCPSA-ca5a39c71bf3",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP01"
+      ],
+      "path": "advisories/x_MCPSA-ca5a39c71bf3.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Config file is world-readable"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "excessive-scope",
+            "mcp_audit_rule_id": "COMM-034",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP06"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "mcp-audit-fixture-github-server",
+            "purl": "pkg:npm/mcp-audit-fixture-github-server"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "1.0.0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "2a20a4aa2a5d9691c92b7d6bb2df5101291f87899face4acbaefe67b71b81d69",
+      "id": "x_MCPSA-d04e8112d65c",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP06"
+      ],
+      "path": "advisories/x_MCPSA-d04e8112d65c.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Overprivileged MCP server credential (potential god key)"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "finding-class-template",
+            "cwe_ids": [
+              "CWE-829"
+            ],
+            "finding_class": "typosquat",
+            "mcp_audit_rule_id": "SC-001",
+            "mcp_transport": "stdio",
+            "observation": "package-intrinsic",
+            "owasp_mcp": [
+              "MCP04"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "@modelcontextprotocol/server-filesytem",
+            "purl": "pkg:npm/@modelcontextprotocol/server-filesytem"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "a5aa75d4cdf7de143dff67c73c055d13419f69c40520bbd51df1bf9487e0aaf7",
+      "id": "x_MCPSA-d7cf72bbe399",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP04"
+      ],
+      "path": "advisories/x_MCPSA-d7cf72bbe399.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Possible typosquatting: '@modelcontextprotocol/server-filesytem'"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "cwe_ids": [
+              "CWE-829"
+            ],
+            "finding_class": "unpinned-dependency",
+            "mcp_audit_rule_id": "TRANSPORT-003",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP04"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "npm",
+            "name": "@modelcontextprotocol/server-filesytem",
+            "purl": "pkg:npm/@modelcontextprotocol/server-filesytem"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "4a670e19f2f1efd5b597b58d25a5f17ae636c856d27a2b9d43b58ca838935e57",
+      "id": "x_MCPSA-fdf85e30ecea",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP04"
+      ],
+      "path": "advisories/x_MCPSA-fdf85e30ecea.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Runtime package fetching"
+    },
+    {
+      "affected": [
+        {
+          "database_specific": {
+            "cvss_basis": "severity-band",
+            "finding_class": "excessive-scope",
+            "mcp_audit_rule_id": "COMM-011",
+            "mcp_transport": "stdio",
+            "observation": "deployment",
+            "owasp_mcp": [
+              "MCP02"
+            ],
+            "verified_patch": {
+              "cosign_bundle": null,
+              "fixed_version": null,
+              "pr_url": null
+            }
+          },
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "mcp-audit-fixture-shell-runner",
+            "purl": "pkg:pypi/mcp-audit-fixture-shell-runner"
+          },
+          "ranges": [
+            {
+              "events": [
+                {
+                  "introduced": "0.3.1"
+                }
+              ],
+              "type": "SEMVER"
+            }
+          ]
+        }
+      ],
+      "canonical_sha256": "40784a72f3fcbc1afb1a815becba396c891118bdf2f3c14a81a55b6726032b00",
+      "id": "x_MCPSA-ffd17914efb0",
+      "modified": "2026-01-31T00:00:00Z",
+      "owasp_mcp": [
+        "MCP02"
+      ],
+      "path": "advisories/x_MCPSA-ffd17914efb0.json",
+      "severity": [
+        {
+          "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+          "type": "CVSS_V3"
+        }
+      ],
+      "summary": "Broad Deno permission flags in use"
+    }
+  ],
+  "count": 22,
+  "expires": "2099-01-01T00:00:00Z",
+  "feed_version": "1.1",
+  "generator": "mcp-audit/0.30.0",
+  "published_at": "2026-01-31T00:00:00Z",
+  "snapshot_version": 1,
+  "updated": "2026-01-31T00:00:00Z"
+}

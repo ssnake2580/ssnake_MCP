@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feature/*, hotfix/*]
+  pull_request:
+    branches: [main, feature/*]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+        python-version: ['3.12']
+        python-mode: [regex-only]
+        include:
+          - node-version: 22
+            python-version: '3.12'
+            python-mode: ast
+          - node-version: 22
+            python-version: '3.10'
+            python-mode: regex-only
+          - node-version: 22
+            python-version: '3.11'
+            python-mode: regex-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Python dependencies (regex-only)
+        if: matrix.python-mode == 'regex-only'
+        run: pip install pyyaml
+      - name: Install Python dependencies (AST)
+        if: matrix.python-mode == 'ast'
+        run: pip install -r requirements.txt
+      - name: Install Node dependencies
+        run: npm ci
+      - name: Run Node tests
+        run: npm test
+      - name: Run AST engine tests
+        if: matrix.python-mode == 'ast'
+        run: python -m pytest tests/test_ast_engine.py -v

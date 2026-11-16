@@ -1,0 +1,498 @@
+"""Tests for scripts/audit_registry.py (provenance check + opt-in stamp)."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import audit_registry as mod  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "_sleep", lambda *_a, **_k: None)
+
+
+def _entry(
+    name: str,
+    *,
+    repo: str | None = "https://github.com/example/repo",
+    attestation_expected: bool = False,
+    last_verified: str = "2026-04-15",
+    source: str = "npm",
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "source": source,
+        "repo": repo,
+        "maintainer": "Example",
+        "verified": True,
+        "last_verified": last_verified,
+        "attestation_expected": attestation_expected,
+    }
+
+
+def _registry(tmp_path: Path, entries: list[dict]) -> Path:
+    path = tmp_path / "known-servers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "last_updated": "2026-04-15",
+                "entry_count": len(entries),
+                "entries": entries,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestNpmProvenance:
+    def test_has_provenance_from_dist_attestations(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_get(_url: str, timeout: int = 15) -> tuple[int, Any]:
+            raise AssertionError("attestations API must not be called")
+
+        monkeypatch.setattr(mod, "_get_json", fail_get)
+        status, detail = mod.check_npm_provenance(
+            "pkg",
+            "1.0.0",
+            {"provenance": {"predicateType": "https://slsa.dev/provenance/v1"}},
+        )
+        assert status == "HAS_PROVENANCE"
+        assert "dist.attestations" in detail
+
+    def test_no_provenance_on_api_404(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mod, "_get_json", lambda *_a, **_k: (404, None))
+        status, detail = mod.check_npm_provenance("pkg", "1.0.0", None)
+        assert status == "NO_PROVENANCE"
+        assert "404" in detail
+
+    def test_publish_only_attestation_is_no_provenance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """npm publish attestation without SLSA is not enough to keep the flag."""
+        monkeypatch.setattr(
+            mod,
+            "_get_json",
+            lambda *_a, **_k: (
+                200,
+                {
+                    "attestations": [
+                        {
+                            "predicateType": (
+                                "https://github.com/npm/attestation/publish/v0.1"
+                            )
+                        }
+                    ]
+                },
+            ),
+        )
+        status, _detail = mod.check_npm_provenance("pkg", "1.0.0", None)
+        assert status == "NO_PROVENANCE"
+
+    def test_api_slsa_is_has_provenance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            mod,
+            "_get_json",
+            lambda *_a, **_k: (
+                200,
+                {"attestations": [{"predicateType": "https://slsa.dev/provenance/v1"}]},
+            ),
+        )
+        status, _detail = mod.check_npm_provenance("pkg", "1.0.0", None)
+        assert status == "HAS_PROVENANCE"
+
+
+class TestPypiProvenance:
+    def test_has_from_integrity_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            mod,
+            "_get_json",
+            lambda *_a, **_k: (
+                200,
+                {"attestation_bundles": [{"attestations": [{"dsse": {}}]}]},
+            ),
+        )
+        status, detail = mod.check_pypi_provenance(
+            "mcp", "2.0.0", ["mcp-2.0.0.tar.gz", "mcp-2.0.0-py3-none-any.whl"]
+        )
+        assert status == "HAS_PROVENANCE"
+        assert "whl" in detail
+
+    def test_unchecked_on_network_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mod, "_get_json", lambda *_a, **_k: (-1, None))
+        status, detail = mod.check_pypi_provenance(
+            "mcp", "2.0.0", ["mcp-2.0.0-py3-none-any.whl"]
+        )
+        assert status == "UNCHECKED"
+        assert "http_-1" in detail
+
+    def test_json_api_absence_is_not_used(self) -> None:
+        """The JSON project API is never the provenance predicate."""
+        src = Path(mod.__file__).read_text(encoding="utf-8")
+        assert "pypi.org/integrity/" in src
+        # Bias: we query integrity even though urls[].provenance is always null.
+        assert "does not expose a ``provenance`` field" in src
+
+
+class TestApplyStamp:
+    def test_stamps_only_ok_dates(self, tmp_path: Path) -> None:
+        path = _registry(
+            tmp_path,
+            [
+                _entry("ok-pkg", last_verified="2026-04-15"),
+                _entry("thin-pkg", last_verified="2026-04-15"),
+            ],
+        )
+        results = [
+            {"name": "ok-pkg", "bucket": "OK", "provenance": "NOT_CHECKED"},
+            {"name": "thin-pkg", "bucket": "THIN", "provenance": "NOT_CHECKED"},
+        ]
+        stats = mod.apply_stamp(path, results, "2026-08-22")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        by_name = {e["name"]: e for e in data["entries"]}
+        assert by_name["ok-pkg"]["last_verified"] == "2026-08-22"
+        assert by_name["thin-pkg"]["last_verified"] == "2026-04-15"
+        assert stats["stamped"] == ["ok-pkg"]
+        assert stats["skipped_non_ok"] == ["thin-pkg"]
+        assert data["last_updated"] == "2026-08-22"
+
+    def test_clears_no_provenance(self, tmp_path: Path) -> None:
+        path = _registry(
+            tmp_path,
+            [_entry("no-prov", attestation_expected=True)],
+        )
+        results = [
+            {
+                "name": "no-prov",
+                "bucket": "OK",
+                "provenance": "NO_PROVENANCE",
+            }
+        ]
+        stats = mod.apply_stamp(path, results, "2026-08-22")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["entries"][0]["attestation_expected"] is False
+        assert stats["cleared"] == ["no-prov"]
+
+    def test_keeps_has_provenance(self, tmp_path: Path) -> None:
+        path = _registry(
+            tmp_path,
+            [_entry("has-prov", attestation_expected=True)],
+        )
+        results = [
+            {
+                "name": "has-prov",
+                "bucket": "OK",
+                "provenance": "HAS_PROVENANCE",
+            }
+        ]
+        stats = mod.apply_stamp(path, results, "2026-08-22")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["entries"][0]["attestation_expected"] is True
+        assert stats["kept"] == ["has-prov"]
+
+    def test_leaves_unchecked(self, tmp_path: Path) -> None:
+        path = _registry(
+            tmp_path,
+            [_entry("maybe", attestation_expected=True)],
+        )
+        results = [{"name": "maybe", "bucket": "OK", "provenance": "UNCHECKED"}]
+        stats = mod.apply_stamp(path, results, "2026-08-22")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["entries"][0]["attestation_expected"] is True
+        assert stats["unchecked"] == ["maybe"]
+
+    def test_never_sets_attestation_expected_true(self, tmp_path: Path) -> None:
+        path = _registry(
+            tmp_path,
+            [_entry("plain", attestation_expected=False)],
+        )
+        results = [
+            {
+                "name": "plain",
+                "bucket": "OK",
+                "provenance": "HAS_PROVENANCE",
+            }
+        ]
+        mod.apply_stamp(path, results, "2026-08-22")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["entries"][0]["attestation_expected"] is False
+
+    def test_does_not_stamp_unverified_bucket(self, tmp_path: Path) -> None:
+        path = _registry(tmp_path, [_entry("gone")])
+        results = [{"name": "gone", "bucket": "MISSING", "provenance": "NOT_CHECKED"}]
+        mod.apply_stamp(path, results, "2026-08-22")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["entries"][0]["last_verified"] == "2026-04-15"
+
+
+class TestUnknownCapabilities:
+    """find_unknown_capabilities: capability strings not in the Capability enum."""
+
+    def test_flags_unknown_string(self) -> None:
+        entries = [{**_entry("flowise"), "capabilities": ["network_out", "subprocess"]}]
+        hits = mod.find_unknown_capabilities(entries)
+        assert hits == [{"name": "flowise", "unknown": ["subprocess"]}]
+
+    def test_all_known_strings_produce_no_hit(self) -> None:
+        entries = [
+            {**_entry("clean-pkg"), "capabilities": ["network_out", "file_write"]}
+        ]
+        assert mod.find_unknown_capabilities(entries) == []
+
+    def test_null_capabilities_skipped(self) -> None:
+        entries = [{**_entry("no-data"), "capabilities": None}]
+        assert mod.find_unknown_capabilities(entries) == []
+
+    def test_empty_capabilities_skipped(self) -> None:
+        entries = [{**_entry("empty"), "capabilities": []}]
+        assert mod.find_unknown_capabilities(entries) == []
+
+
+class TestUndeclaredCapabilities:
+    """find_undeclared_capabilities: R35 general predicate — any inferred
+    capability the entry does not declare, classified "subset" (declared ⊆
+    inferred) or "disjoint" (entry also declares something not inferred).
+    R34 shipped a strict-subset-only version; R35 measured the gap and
+    generalised after finding the strict form misses the partial-overlap
+    (disjoint) case entirely.
+    """
+
+    def test_under_declared_entry_is_flagged_as_subset(self) -> None:
+        # "postgres" -> DATABASE, "fetch" -> NETWORK_OUT: heuristics infer both.
+        # The entry only declares network_out, silently dropping the registry
+        # override's ability to ever surface the database capability for this
+        # verified package (the docpull near-miss, reproduced as a fixture).
+        entries = [
+            {
+                **_entry("acme-postgres-fetch-tool"),
+                "capabilities": ["network_out"],
+            }
+        ]
+        hits = mod.find_undeclared_capabilities(entries)
+        assert len(hits) == 1
+        assert hits[0]["name"] == "acme-postgres-fetch-tool"
+        assert hits[0]["declared"] == ["network_out"]
+        assert hits[0]["inferred"] == ["database", "network_out"]
+        assert hits[0]["missing"] == ["database"]
+        assert hits[0]["extra"] == []
+        assert hits[0]["kind"] == "subset"
+
+    def test_disjoint_entry_is_flagged_and_labeled_disjoint(self) -> None:
+        # R35's generalisation target: the entry declares something the
+        # heuristics don't infer (network_out) AND omits something they do
+        # (cloud, via the "azure" keyword) — declared and inferred are
+        # incomparable, so the R34 strict-subset predicate (declared <
+        # inferred) is False and this entry passed unnoticed. Reproduces the
+        # real @azure/mcp shape found when re-measuring for this task.
+        entries = [{**_entry("acme-azure-tool"), "capabilities": ["network_out"]}]
+        hits = mod.find_undeclared_capabilities(entries)
+        assert len(hits) == 1
+        assert hits[0]["declared"] == ["network_out"]
+        assert hits[0]["inferred"] == ["cloud"]
+        assert hits[0]["missing"] == ["cloud"]
+        assert hits[0]["extra"] == ["network_out"]
+        assert hits[0]["kind"] == "disjoint"
+
+    def test_fully_declared_entry_is_not_flagged(self) -> None:
+        # Same heuristic inference, but the entry declares the full set —
+        # equal sets have no missing capability, so this must not be a hit.
+        entries = [
+            {
+                **_entry("acme-postgres-fetch-tool-2"),
+                "capabilities": ["network_out", "database"],
+            }
+        ]
+        assert mod.find_undeclared_capabilities(entries) == []
+
+    def test_deliberately_narrowed_entry_is_not_flagged(self) -> None:
+        # A name with no keyword hits at all: heuristics infer nothing, so
+        # nothing can ever be "missing" regardless of what is declared.
+        entries = [{**_entry("widgetco-thing"), "capabilities": ["shell_exec"]}]
+        assert mod.find_undeclared_capabilities(entries) == []
+
+    def test_null_capabilities_skipped(self) -> None:
+        entries = [{**_entry("no-data"), "capabilities": None}]
+        assert mod.find_undeclared_capabilities(entries) == []
+
+    def test_comms_platform_entry_missing_comms_out_is_flagged(self) -> None:
+        # STORY-0101: the reference Slack server declared only network_out.
+        # The comms keyword rule now infers comms_out from "slack", so the
+        # pre-change entry is exactly what this check must catch.
+        entries = [{**_entry("@acme/slack-mcp"), "capabilities": ["network_out"]}]
+        hits = mod.find_undeclared_capabilities(entries)
+        assert len(hits) == 1
+        assert hits[0]["missing"] == ["comms_out"]
+
+    def test_live_registry_has_no_capability_findings(self) -> None:
+        # STORY-0101 ran all four offline checks against the shipped file and
+        # fixed what they reported (server-github, server-slack and
+        # mcp-atlassian were under-declared once comms_out existed).
+        entries = json.loads(
+            (ROOT / "registry" / "known-servers.json").read_text(encoding="utf-8")
+        )["entries"]
+        assert mod.find_unknown_capabilities(entries) == []
+        assert mod.find_undeclared_capabilities(entries) == []
+        assert mod.find_entirely_tag_only_entries(entries) == []
+        assert mod.find_dead_capabilities()["unexpected_tag_only"] == []
+
+
+class TestDeadCapabilities:
+    """find_dead_capabilities(): tag-only capabilities vs the allowlist."""
+
+    def test_no_unexpected_tag_only_capabilities_today(self) -> None:
+        report = mod.find_dead_capabilities()
+        assert report["unexpected_tag_only"] == []
+
+    def test_cloud_is_known_tag_only(self) -> None:
+        # FILE_WRITE was removed from the allowlist in R37 — it now
+        # participates in INTEG-001 (FILE_WRITE + SHELL_EXEC) and is no
+        # longer tag-only. Only CLOUD's deliberate deferral remains.
+        report = mod.find_dead_capabilities()
+        names = {e["capability"] for e in report["known_tag_only"]}
+        assert names == {"cloud"}
+
+    def test_known_tag_only_entries_carry_kind_and_reason(self) -> None:
+        report = mod.find_dead_capabilities()
+        by_name = {e["capability"]: e for e in report["known_tag_only"]}
+        assert by_name["cloud"]["kind"] == "deliberate_deferral"
+        assert by_name["cloud"]["reason"].strip()
+
+    def test_unexpected_tag_only_detected_when_allowlist_is_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the allowlist were missing an entry, the check must say so."""
+        from mcp_audit.analyzers import toxic_flow as tf
+
+        monkeypatch.setattr(tf, "KNOWN_TAG_ONLY_CAPABILITIES", ())
+        report = mod.find_dead_capabilities()
+        assert "cloud" in set(report["unexpected_tag_only"])
+        assert report["known_tag_only"] == []
+
+
+class TestEntirelyTagOnlyEntries:
+    """find_entirely_tag_only_entries(): every declared capability is dead."""
+
+    def test_no_hits_today(self) -> None:
+        entries = json.loads(
+            (ROOT / "registry" / "known-servers.json").read_text(encoding="utf-8")
+        )["entries"]
+        assert mod.find_entirely_tag_only_entries(entries) == []
+
+    def test_cloud_only_entry_is_flagged(self) -> None:
+        entries = [{**_entry("acme-cloud-only"), "capabilities": ["cloud"]}]
+        hits = mod.find_entirely_tag_only_entries(entries)
+        assert hits == [{"name": "acme-cloud-only", "declared": ["cloud"]}]
+
+    def test_mixed_real_and_tag_only_is_not_flagged(self) -> None:
+        # A real, wired-in capability alongside a tag-only one still
+        # contributes to detection — only ENTIRELY tag-only entries hit.
+        entries = [
+            {**_entry("acme-cloud-and-shell"), "capabilities": ["cloud", "shell_exec"]}
+        ]
+        assert mod.find_entirely_tag_only_entries(entries) == []
+
+    def test_unknown_string_alone_is_not_flagged_here(self) -> None:
+        # Already reported by find_unknown_capabilities — not double-counted.
+        entries = [{**_entry("acme-typo"), "capabilities": ["subprocess"]}]
+        assert mod.find_entirely_tag_only_entries(entries) == []
+
+    def test_null_capabilities_skipped(self) -> None:
+        entries = [{**_entry("no-data"), "capabilities": None}]
+        assert mod.find_entirely_tag_only_entries(entries) == []
+
+    def test_empty_capabilities_skipped(self) -> None:
+        entries = [{**_entry("empty"), "capabilities": []}]
+        assert mod.find_entirely_tag_only_entries(entries) == []
+
+
+class TestAssertMcpAuditIsRepoLocal:
+    """audit_registry.py's use of the shared dev_build_guard check.
+
+    R45 moved this check out of a private copy in this module and into
+    ``scripts/dev_build_guard.py`` (shared with
+    ``docs/manual-test-matrix.md``'s Setup Guard — see that module's
+    docstring). These tests confirm ``audit_registry.py`` still calls it with
+    identical behaviour (same message shape, same ``sys.exit(2)``); full
+    coverage of the check itself lives in ``tests/test_dev_build_guard.py``.
+    """
+
+    def test_passes_for_the_real_dev_install(self) -> None:
+        # Under `uv run pytest`, mcp_audit resolves to this repo's src tree —
+        # must not raise/exit.
+        mod.assert_mcp_audit_is_repo_local(mod.REPO_ROOT)
+
+    def test_exits_loudly_for_a_foreign_install(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        import types
+
+        foreign = tmp_path / "somewhere-else" / "site-packages" / "mcp_audit"
+        foreign.mkdir(parents=True)
+        foreign_init = foreign / "__init__.py"
+        foreign_init.write_text("", encoding="utf-8")
+
+        fake = types.ModuleType("mcp_audit")
+        fake.__file__ = str(foreign_init)
+        monkeypatch.setitem(sys.modules, "mcp_audit", fake)
+        with pytest.raises(SystemExit) as exc_info:
+            mod.assert_mcp_audit_is_repo_local(mod.REPO_ROOT)
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "FATAL" in err
+        # Path formatting is platform-native (backslashes on Windows) — compare
+        # against str(Path(...).resolve()), not a hardcoded POSIX string.
+        assert str(foreign_init.resolve()) in err
+
+
+class TestDefaultIsReadOnly:
+    def test_main_without_stamp_does_not_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _registry(tmp_path, [_entry("ok-pkg")])
+        original = path.read_text(encoding="utf-8")
+        out = tmp_path / "out.json"
+        cache = tmp_path / "cache.json"
+        monkeypatch.setattr(
+            mod,
+            "audit_registry",
+            lambda *_a, **_k: [
+                {
+                    "name": "ok-pkg",
+                    "bucket": "OK",
+                    "provenance": "NOT_CHECKED",
+                    "declared_attestation_expected": False,
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "audit_registry.py",
+                "--registry",
+                str(path),
+                "--out",
+                str(out),
+                "--cache",
+                str(cache),
+            ],
+        )
+        mod.main()
+        assert path.read_text(encoding="utf-8") == original
+        assert out.is_file()

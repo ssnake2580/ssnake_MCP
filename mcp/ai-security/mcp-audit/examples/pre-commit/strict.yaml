@@ -1,0 +1,12 @@
+# Strict mcp-audit pre-commit integration.
+# Fails the commit if any MEDIUM, HIGH, or CRITICAL findings are detected
+# in your MCP server configurations.
+#
+# `rev` is pinned to the current release and updated by each release PR.
+# Later releases: https://github.com/adudley78/mcp-audit/releases
+repos:
+  - repo: https://github.com/adudley78/mcp-audit
+    rev: v0.30.0  # current release; `pre-commit autoupdate` moves it forward
+    hooks:
+      - id: mcp-audit
+        args: [scan, --severity-threshold, medium]

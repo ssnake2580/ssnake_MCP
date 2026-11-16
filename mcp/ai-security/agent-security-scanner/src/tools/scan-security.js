@@ -1,0 +1,228 @@
+// src/tools/scan-security.js
+import { z } from "zod";
+import { existsSync, readFileSync, statSync } from "fs";
+import { dirname } from "path";
+import { detectLanguage, runAnalyzerAsync, generateFix, toSarif, getEngineMode, extractImports, isTestFile } from '../utils.js';
+import { deduplicateFindings } from '../dedup.js';
+import { applyContextFilter, detectFrameworks, applyFrameworkAdjustments } from '../context.js';
+import { loadConfig, shouldExcludeFile, applyConfig } from '../config.js';
+import { discoverProjectContext } from './project-context.js';
+import { runSemanticAnalysis, isSemanticAnalysisAvailable } from '../semantic-integration.js';
+
+const MAX_FILE_SIZE = 1024 * 1024;  // 1MB - skip files larger than this to avoid timeouts
+
+export const scanSecuritySchema = {
+  file_path: z.string().describe("Path to the file to scan"),
+  output_format: z.enum(['json', 'sarif']).optional().describe("Output format: 'json' (default) or 'sarif' for GitHub/GitLab integration"),
+  verbosity: z.enum(['minimal', 'compact', 'full']).optional().describe("Response detail level: 'minimal' (counts only), 'compact' (default, actionable info), 'full' (complete metadata)"),
+  engine: z.enum(['auto', 'ast', 'regex', 'semantic', 'all']).optional().describe("Analysis engine: 'auto' (default, AST+semantic with regex fallback), 'ast' (tree-sitter only), 'regex' (regex only), 'semantic' (semantic/CPG only), 'all' (all engines)"),
+  project_context: z.boolean().optional().describe("Include project context (framework, security middleware, dependencies)"),
+  include_context: z.boolean().optional().describe("Include surrounding code context for each issue"),
+  enable_semantic: z.boolean().optional().describe("Enable semantic/CPG analysis (default: true if available)")
+};
+
+// Verbosity formatters
+function formatMinimal(file_path, language, issues) {
+  const bySeverity = { error: 0, warning: 0, info: 0 };
+  issues.forEach(i => bySeverity[i.severity] = (bySeverity[i.severity] || 0) + 1);
+  return {
+    file: file_path,
+    language,
+    engine_mode: getEngineMode(),
+    total: issues.length,
+    critical: bySeverity.error,
+    warning: bySeverity.warning,
+    info: bySeverity.info,
+    message: issues.length > 0
+      ? `Found ${issues.length} issue(s). Use verbosity='compact' for details.`
+      : "No security issues found."
+  };
+}
+
+function formatCompact(file_path, language, issues) {
+  return {
+    file: file_path,
+    language,
+    engine_mode: getEngineMode(),
+    issues_count: issues.length,
+    issues: issues.map(i => ({
+      line: i.line + 1,
+      ruleId: i.ruleId,
+      severity: i.severity,
+      confidence: i.confidence || 'MEDIUM',
+      message: i.message,
+      fix: i.suggested_fix?.fixed ? i.suggested_fix.fixed.trim() : null
+    }))
+  };
+}
+
+function formatFull(file_path, language, issues) {
+  return {
+    file: file_path,
+    language,
+    engine_mode: getEngineMode(),
+    issues_count: issues.length,
+    issues: issues
+  };
+}
+
+export async function scanSecurity({ file_path, output_format, verbosity, engine, project_context, include_context, enable_semantic, signal, use_daemon }) {
+  if (!existsSync(file_path)) {
+    return {
+      content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }]
+    };
+  }
+
+  // Check file size to avoid timeouts on very large files
+  try {
+    const stats = statSync(file_path);
+    if (stats.size > MAX_FILE_SIZE) {
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            file: file_path,
+            message: `File too large (${(stats.size / 1024).toFixed(0)}KB). Skipping to avoid timeout. Max size: ${MAX_FILE_SIZE / 1024}KB.`,
+            issues_count: 0,
+            skipped: true
+          })
+        }]
+      };
+    }
+  } catch (err) {
+    // If stat fails, continue anyway
+  }
+
+  // Load project configuration
+  const config = loadConfig(file_path);
+
+  // Check file exclusion
+  if (shouldExcludeFile(file_path, config)) {
+    return {
+      content: [{ type: "text", text: JSON.stringify({ file: file_path, message: "File excluded by configuration", issues_count: 0 }) }]
+    };
+  }
+
+  // Determine which engines to run
+  const engineMode = engine || 'auto';
+  const shouldRunSemantic = (enable_semantic !== false) &&
+    (engineMode === 'auto' || engineMode === 'semantic' || engineMode === 'all') &&
+    isSemanticAnalysisAvailable();
+
+  // Run primary analysis (AST/regex)
+  let rawIssues = [];
+  if (engineMode !== 'semantic') {
+    rawIssues = await runAnalyzerAsync(file_path, engineMode === 'all' ? 'auto' : engineMode, signal, {
+      useDaemon: use_daemon !== false
+    });
+    if (rawIssues.error) {
+      return {
+        content: [{ type: "text", text: JSON.stringify(rawIssues) }]
+      };
+    }
+  }
+
+  // Run semantic analysis if enabled
+  if (shouldRunSemantic) {
+    try {
+      const semanticFindings = await runSemanticAnalysis(file_path);
+      if (semanticFindings && semanticFindings.length > 0) {
+        rawIssues = rawIssues.concat(semanticFindings);
+      }
+    } catch (error) {
+      console.error('[SEMANTIC] Analysis failed, continuing without semantic findings:', error.message);
+    }
+  }
+
+  if (rawIssues.error) {
+    return {
+      content: [{ type: "text", text: JSON.stringify(rawIssues) }]
+    };
+  }
+
+  // Cross-engine deduplication
+  const dedupedIssues = deduplicateFindings(rawIssues);
+
+  // Read file content for fix suggestions
+  const content = readFileSync(file_path, 'utf-8');
+  const lines = content.split('\n');
+  const language = detectLanguage(file_path);
+
+  // Context-aware filtering (suppress known module imports)
+  const contextFiltered = applyContextFilter(dedupedIssues, file_path, language);
+
+  // Framework-aware severity adjustment
+  const frameworks = detectFrameworks(file_path, language);
+  const frameworkAdjusted = applyFrameworkAdjustments(contextFiltered, frameworks);
+
+  // Apply .scannerrc configuration (rule suppression, severity/confidence thresholds)
+  const issues = applyConfig(frameworkAdjusted, file_path, config);
+
+  // Enhance issues with fix suggestions and optional surrounding context
+  const enhancedIssues = issues.map(issue => {
+    const line = lines[issue.line] || '';
+    const fix = generateFix(issue, line, language);
+    const enhanced = {
+      ...issue,
+      line_content: line.trim(),
+      suggested_fix: fix
+    };
+
+    if (include_context) {
+      const lineIdx = issue.line;
+      const contextLines = 3;
+      enhanced.context_before = [];
+      enhanced.context_after = [];
+      for (let i = Math.max(0, lineIdx - contextLines); i < lineIdx; i++) {
+        enhanced.context_before.push({ line: i + 1, content: lines[i] || '' });
+      }
+      for (let i = lineIdx + 1; i <= Math.min(lines.length - 1, lineIdx + contextLines); i++) {
+        enhanced.context_after.push({ line: i + 1, content: lines[i] || '' });
+      }
+    }
+
+    return enhanced;
+  });
+
+  // Determine verbosity (default: compact)
+  const level = verbosity || 'compact';
+
+  // Return SARIF format if requested (always full detail)
+  if (output_format === 'sarif') {
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify(toSarif(file_path, language, enhancedIssues), null, 2)
+      }]
+    };
+  }
+
+  // Format based on verbosity
+  let result;
+  switch (level) {
+    case 'minimal':
+      result = formatMinimal(file_path, language, enhancedIssues);
+      break;
+    case 'full':
+      result = formatFull(file_path, language, enhancedIssues);
+      break;
+    case 'compact':
+    default:
+      result = formatCompact(file_path, language, enhancedIssues);
+  }
+
+  // Attach project context if requested
+  if (project_context) {
+    const projectDir = dirname(file_path);
+    result.project = discoverProjectContext(projectDir);
+    result.is_test_file = isTestFile(file_path);
+    result.file_imports = extractImports(content, language);
+  }
+
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify(result, null, 2)
+    }]
+  };
+}

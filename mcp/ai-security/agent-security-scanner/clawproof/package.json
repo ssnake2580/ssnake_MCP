@@ -1,0 +1,48 @@
+{
+  "name": "clawproof",
+  "version": "1.0.0",
+  "description": "Security scanner for AI agent skills and prompts - detects prompt injection, jailbreaks, and data exfiltration",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "clawproof": "./bin/clawproof.js"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "build": "echo 'No build step required for ES modules'",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "security",
+    "prompt-injection",
+    "ai-security",
+    "clawhub",
+    "openclaw",
+    "agent-security",
+    "jailbreak-detection",
+    "llm-security",
+    "prompt-safety"
+  ],
+  "author": "Sinewave AI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sinewaveai/agent-security-scanner-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sinewaveai/agent-security-scanner-mcp/issues"
+  },
+  "homepage": "https://github.com/sinewaveai/agent-security-scanner-mcp#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "dist/",
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "vitest": "^1.0.0"
+  }
+}

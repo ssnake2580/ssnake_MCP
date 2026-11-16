@@ -1,0 +1,298 @@
+# Weekly signed advisory-feed publish.
+#
+# A TTL is a machine-enforced SLA. Fourteen days commits us to publishing at
+# least that often, or every client's `feed verify` degrades. On 2026-08-22
+# we declined to make registry freshness a public promise because a solo
+# maintainer cannot hold an SLA — and that one only made a webpage stale.
+# This one reaches into other people's tooling.
+#
+# R32: Amendment 7's gate is satisfied — this job signs with a static
+# minisign project key. The private half lives only in the
+# `MCP_AUDIT_FEED_SIGNING_KEY` secret, scoped to the `feed-signing` GitHub
+# environment (restricted to the `main` branch), and never leaves this job:
+# `publish`, below, has `contents: write` and no access to the secret at
+# all, exactly per the split R30 built ahead of signing for this moment. The
+# public half is committed at `keys/mcp-audit-feed.pub` and bundled into the
+# installed package (see `docs/advisory-feed.md`, "Key custody and
+# rotation").
+#
+# R30: this job was not always a publisher — it used to build an unsigned
+# feed and upload it to a 30-day GitHub Actions artifact that only
+# repository collaborators could reach. See
+# humans/decisions/2026-08-23-feed-signing-and-publishing.md (marcus repo)
+# for that history. It now commits the signed feed to a dedicated orphan
+# `feed` branch, served over a stable raw URL any user can fetch:
+#
+#   https://raw.githubusercontent.com/adudley78/mcp-audit/feed/index.json
+#
+# Two jobs stay split even now that signing is live, for the same reason
+# R30 split them ahead of it: once a key exists, the signing step belongs
+# in `build` (no repository write) and publishing stays in a job that has
+# write and no key. Neither job alone can both forge a signature and place
+# it where users fetch it.
+#
+#   build:   contents: read. `environment: feed-signing` (the only place the
+#            signing secret is reachable). Writes and signs the candidate
+#            feed, verifies its own output before anything is uploaded,
+#            diffs it against the currently-published feed
+#            (scripts/feed_diff.py, which ignores the published/modified
+#            timestamps every build stamps fresh — see that script's
+#            docstring), and uploads it as a job artifact.
+#   publish: contents: write. ALWAYS runs (see R31 below). Downloads the
+#            artifact, commits it to `feed`, pushes. Cannot read the
+#            signing secret — it does not declare `environment:
+#            feed-signing` and never will.
+#
+# R31: publish is UNCONDITIONAL — it no longer skips when build found no
+# substantive advisory change. R30 made it skip, on the theory that a
+# no-op commit was noise. That was wrong: `expires` is content too. A feed
+# that says "trust me until the 6th" is a different statement every week
+# even when the advisory list is identical, and skipping the commit froze
+# that statement — the published feed was on track to hard-fail its own
+# `feed verify` on 2026-09-06 with nobody having touched anything. See
+# humans/decisions/2026-08-22-feed-freshness-design.md (marcus repo,
+# Amendment 7 / the TTL section) for why the TTL requires this cadence to
+# be unconditional rather than attention-triggered.
+#
+# scripts/feed_diff.py still runs every build, but only to shape the commit
+# message (steps.diff.outputs.commit_message), not to gate anything:
+#   feed: refresh expiry (snapshot 4, 23 advisories, no content change)
+#   feed: 2 advisories changed (snapshot 5, 25 advisories)
+# Scrolling the branch history still shows at a glance which weeks changed
+# advisory content vs. which weeks only pushed the expiry forward.
+#
+# Q-058 / Q-055: the feed branch is also an air-gapped bundle (STORY-0129,
+# docs/air-gapped.md). The signing step adds `data/` (the registry, the
+# known-malicious mirror, research records and KEV/EPSS signals from this
+# checkout) and a manifest `bundle.json` signed with the same key, so
+# `git clone --branch feed` gives `scan --bundle` / `affected --bundle` a
+# directory they verify offline. KEV/EPSS are fetched fresh for the bundle
+# each week (best effort: an outage or a thinner result falls back to the
+# committed copy, so a source outage never stops the publish or the TTL).
+# Nothing here writes the repository: the committed data still changes only
+# by reviewed PR.
+#
+# The freshness canary in advisory-feed-freshness-canary.yml — a separate,
+# independently-scheduled, read-only workflow — is what detects "the
+# publisher stopped running" instead of "expires froze" being the first
+# sign anyone gets.
+
+name: Advisory feed publish
+
+on:
+  schedule:
+    # Sunday 14:00 UTC — weekly. TTL is 14 days (2× this interval).
+    - cron: "0 14 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisory-feed-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and sign the candidate feed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Restricted to the `main` branch (confirmed via the environment's
+    # deployment-branch-policy, not just the UI setting) — a workflow_dispatch
+    # from any other ref cannot read MCP_AUDIT_FEED_SIGNING_KEY.
+    environment: feed-signing
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      changed_count: ${{ steps.diff.outputs.changed_count }}
+      snapshot_version: ${{ steps.diff.outputs.snapshot_version }}
+      count: ${{ steps.diff.outputs.count }}
+      commit_message: ${{ steps.diff.outputs.commit_message }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install mcp-audit
+        run: uv pip install -e ".[dev]" --system
+
+      - name: Install minisign
+        # Pinned upstream release (jedisct1/minisign 0.12), checked by SHA-256,
+        # not apt: on 2026-11-11 the runner's Ubuntu mirror stopped resolving
+        # for over an hour and this step failed every run. The digest was taken
+        # from a tarball whose minisig verified against the author's published
+        # key (RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3).
+        # Same binary ci.yml installs for tests/test_advisory_sign.py; this is the signing side.
+        env:
+          MINISIGN_VERSION: "0.12"
+          MINISIGN_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+        run: |
+          curl -fsSL --retry 3 -o minisign.tar.gz \
+            "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz"
+          echo "${MINISIGN_SHA256}  minisign.tar.gz" | sha256sum -c -
+          tar xzf minisign.tar.gz minisign-linux/x86_64/minisign
+          sudo install -m 0755 minisign-linux/x86_64/minisign /usr/local/bin/minisign
+          rm -rf minisign.tar.gz minisign-linux
+          minisign -v
+
+      - name: Fetch the currently-published feed (read-only)
+        # Reads the CURRENT feed branch on origin, fetched fresh this run —
+        # never a locally cached copy — so snapshot_version stays monotonic
+        # across runs instead of restarting. A missing branch (only possible
+        # before the very first publish) is not an error: previous_feed/
+        # stays empty and the build below omits --previous-index.
+        run: |
+          mkdir -p previous_feed
+          if git ls-remote --exit-code --heads origin feed >/dev/null 2>&1; then
+            git fetch --depth 1 origin feed
+            git archive FETCH_HEAD | tar -x -C previous_feed
+          else
+            echo "No feed branch on origin yet; this will be the first publish."
+          fi
+
+      - name: Fetch current exploit signals for the bundle (best effort)
+        # Network, read-only; writes under RUNNER_TEMP only. A failure is not
+        # fatal: build_bundle.py falls back to the committed file.
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          python scripts/sync_exploit_signals.py --out "${RUNNER_TEMP}/exploit-signals.json"
+
+      - name: Write and sign the candidate feed
+        env:
+          MCP_AUDIT_FEED_SIGNING_KEY: ${{ secrets.MCP_AUDIT_FEED_SIGNING_KEY }}
+        run: |
+          # The secret's name (MCP_AUDIT_FEED_SIGNING_KEY) is deliberately not
+          # the env var mcp-audit's own CLI reads (MCP_AUDIT_SIGNING_KEY) — the
+          # key is written to a runner-temp file instead and passed explicitly
+          # via --key, so it never needs to collide with that name, never sits
+          # in a shell-history-visible argument, and is never picked up by
+          # `git add` in the publish job (this file lives under $RUNNER_TEMP,
+          # not the checkout).
+          KEYFILE="${RUNNER_TEMP}/feed-signing.key"
+          trap 'rm -f "$KEYFILE"' EXIT
+          umask 077
+          printf '%s' "$MCP_AUDIT_FEED_SIGNING_KEY" > "$KEYFILE"
+          chmod 600 "$KEYFILE"
+
+          mkdir -p "${RUNNER_TEMP}/feed"
+          ARGS=(fixtures/vulnerable-servers
+                --out "${RUNNER_TEMP}/feed"
+                --sign --key-alt minisign --key "$KEYFILE"
+                --severity-threshold info)
+          if [ -f previous_feed/index.json ]; then
+            ARGS+=(--previous-index previous_feed/index.json)
+          else
+            ARGS+=(--snapshot-version 1)
+          fi
+          mcp-audit advise "${ARGS[@]}"
+
+          # The air-gapped bundle (Q-058): data/ and a signed bundle.json
+          # added to the feed directory itself, signed with the same keyfile
+          # in this same step (the only step that can read the secret).
+          BUNDLE_ARGS=(--feed "${RUNNER_TEMP}/feed" --in-place
+                       --private-key "$KEYFILE" --public-key keys/mcp-audit-feed.pub)
+          if [ -f "${RUNNER_TEMP}/exploit-signals.json" ]; then
+            BUNDLE_ARGS+=(--exploit-signals "${RUNNER_TEMP}/exploit-signals.json")
+          fi
+          python scripts/build_bundle.py "${BUNDLE_ARGS[@]}"
+
+      - name: Verify the candidate feed before it is ever uploaded
+        # A feed that fails its own verification must fail this workflow
+        # before `publish` ever sees it — no bad signature reaches the
+        # branch users fetch from. Verifies against the public key committed
+        # in this checkout, not a copy staged anywhere else.
+        run: |
+          mcp-audit feed verify "${RUNNER_TEMP}/feed" \
+            --key-alt minisign --public-key keys/mcp-audit-feed.pub
+          python scripts/build_bundle.py --verify "${RUNNER_TEMP}/feed" \
+            --public-key keys/mcp-audit-feed.pub
+
+      - name: Classify this publish against the currently-published feed
+        # Informational only (R31) — feeds the commit message, never a gate.
+        id: diff
+        run: |
+          python scripts/feed_diff.py \
+            --old previous_feed \
+            --new "${RUNNER_TEMP}/feed" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload candidate feed
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: advisory-feed-candidate
+          path: ${{ runner.temp }}/feed
+          retention-days: 7
+
+  publish:
+    name: Publish to the feed branch
+    needs: build
+    # R31: unconditional. See the header comment — a TTL-backed feed must
+    # refresh its expiry on every scheduled run, even weeks where no
+    # advisory content changed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Scoped to exactly what pushing a commit to `feed` requires. This job
+      # does not declare `environment: feed-signing` and cannot read the
+      # signing secret — see the header comment on why that split matters.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: feed
+
+      - name: Download candidate feed
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: advisory-feed-candidate
+          path: new_feed
+
+      - name: Replace the published feed content
+        # README.md on the feed branch is deliberately left alone — only the
+        # feed's own files are managed here. index.json.sig sits next to
+        # index.json in the candidate artifact (sign_feed() writes it there,
+        # not inside advisories/) — it must be copied explicitly or the
+        # published index ships with a "signing" block but no signature to
+        # back it, which fails closed on any client's `feed verify` even
+        # though every individual advisory verifies fine. R32 shipped without
+        # this line for one publish (2026-09-07T19:40:39Z, snapshot_version
+        # 4); caught by the offline-proof workflow before any user consumed
+        # it — see docs/advisory-feed.md.
+        run: |
+          rm -rf advisories osv index.json index.json.sig
+          rm -rf data bundle.json bundle.json.sig
+          cp -r new_feed/advisories advisories
+          cp -r new_feed/osv osv
+          cp new_feed/index.json index.json
+          cp new_feed/index.json.sig index.json.sig
+          cp -r new_feed/data data
+          cp new_feed/bundle.json bundle.json
+          cp new_feed/bundle.json.sig bundle.json.sig
+          rm -rf new_feed
+
+      - name: Commit and push
+        env:
+          COMMIT_MESSAGE: ${{ needs.build.outputs.commit_message }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            # Defence-in-depth only: with snapshot_version and expires
+            # incrementing/advancing on every run (R31), index.json always
+            # differs, so this should never actually trigger.
+            echo "No staged changes after sync; nothing to publish."
+            exit 0
+          fi
+          git commit -m "${COMMIT_MESSAGE}"
+          git push origin feed

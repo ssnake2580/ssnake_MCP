@@ -1,0 +1,357 @@
+"""The ``fix`` command — apply safe remediations back to MCP config files.
+
+Dry-run by default: prints a unified diff showing what would change.
+Pass ``--apply`` to write changes atomically with a ``.bak`` backup.
+
+Supported finding types (MVP):
+    credentials  CRED-001, CRED-002      — redact plaintext secrets with ${ENV_KEY}
+    transport    TRANSPORT-001           — upgrade http:// URLs to https://
+    pinning      SC-001, SC-002          — replace typosquatted pkg, pin version
+                 VULN-UNPINNED, LOCK-004 — pin a floating spec to an exact version
+                                            (prefers mcp-lock.json's
+                                            resolved_version when a lock exists
+                                            — STORY-0070)
+
+Exit codes:
+    0  No fixable findings, or dry-run / apply completed successfully.
+    2  Error (file not found, unreadable JSON, write failure, etc.).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.rule import Rule
+
+from mcp_audit.cli import app
+from mcp_audit.fixer.fixer import FixType, run_fix
+from mcp_audit.gateways import (
+    GATEWAY_UPSTREAM_CLIENTS,
+    PROJECT_GATEWAY_FILES,
+    user_gateway_config_paths,
+)
+from mcp_audit.lock.discovery import find_lock_for
+from mcp_audit.lock.writer import load_existing as load_existing_lock
+from mcp_audit.models import Finding, ScanResult
+from mcp_audit.scanner import run_scan
+
+logger = logging.getLogger(__name__)
+
+console = Console()
+err_console = Console(stderr=True)
+
+_FIX_TYPE_CHOICES = ["credentials", "transport", "pinning"]
+_FIX_TYPE_CHOICES_STR = ", ".join(_FIX_TYPE_CHOICES)
+
+
+@app.command("fix")
+def fix(
+    path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--path",
+        "-p",
+        help=(
+            "Path to the MCP config file to fix. "
+            "Defaults to auto-discovering all configs when neither "
+            "--path nor --input is given."
+        ),
+    ),
+    input_file: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--input",
+        "-i",
+        help=(
+            "Path to an existing scan JSON file produced by "
+            "'mcp-audit scan --output json'. "
+            "Reads findings and config_path from the JSON "
+            "instead of running a fresh scan."
+        ),
+    ),
+    apply: bool = typer.Option(  # noqa: B008
+        False,
+        "--apply",
+        help=(
+            "Write the changes to disk (atomic rename). "
+            "Without this flag, only a diff is shown."
+        ),
+    ),
+    fix_type: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        "--fix-type",
+        help=(
+            "Restrict to a specific fix type. Can be repeated. "
+            f"Choices: {_FIX_TYPE_CHOICES_STR}."
+        ),
+    ),
+    offline: bool = typer.Option(  # noqa: B008
+        False,
+        "--offline",
+        help=(
+            "Suppress all network calls (version resolution for SC-001/002 is skipped)."
+        ),
+    ),
+) -> None:
+    """Apply safe remediations directly to MCP config files.
+
+    Without ``--apply``, prints a unified diff to stdout (dry run).
+    With ``--apply``, writes changes atomically and creates a ``.bak`` backup.
+
+    Three fix types are supported:
+
+    \b
+    credentials  CRED-001/002/003 — redact plaintext secrets with ${ENV_KEY}
+    transport    TRANSPORT-001 — upgrade http:// URLs to https://
+    pinning      SC-001/002 — replace typosquatted package with verified@version
+                 VULN-UNPINNED/LOCK-004 — pin a floating spec to an exact version
+                 (prefers mcp-lock.json's resolved_version when a lock exists)
+    """
+    # ── Validate --fix-type values ────────────────────────────────────────────
+    validated_types: list[FixType] | None = None
+    if fix_type:
+        invalid = [t for t in fix_type if t not in _FIX_TYPE_CHOICES]
+        if invalid:
+            err_console.print(
+                f"[red]Error:[/red] Invalid --fix-type value(s): "
+                f"{', '.join(invalid)}. "
+                f"Choices: {_FIX_TYPE_CHOICES_STR}"
+            )
+            raise typer.Exit(2)
+        validated_types = list(fix_type)  # type: ignore[assignment]
+
+    # ── Validate mutually exclusive flags ─────────────────────────────────────
+    if path and input_file:
+        err_console.print(
+            "[red]Error:[/red] --path and --input are mutually exclusive."
+        )
+        raise typer.Exit(2)
+
+    # ── Resolve findings and config path ──────────────────────────────────────
+    try:
+        config_path, findings = _resolve_findings(path, input_file)
+    except (FileNotFoundError, PermissionError, ValueError) as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    # ── MCP gateway configs are never edited (STORY-0111) ────────────────────
+    # A gateway's upstream servers (client ``<gateway>-upstream``) live in the
+    # gateway's own file and format (mcptoon argv lists, TOML, 1MCP env
+    # lists), which the fix strategies do not write.  Their findings are
+    # dropped so one can never be applied to a same-name server elsewhere.
+    if _is_gateway_config(config_path, findings):
+        err_console.print(
+            f"[red]Error:[/red] {config_path} is an MCP gateway config;"
+            " mcp-audit fix does not edit gateway configs. Fix it by hand."
+        )
+        raise typer.Exit(2)
+    findings = [f for f in findings if f.client not in GATEWAY_UPSTREAM_CLIENTS]
+    # OpenCode's JSONC `mcp` files are never edited (STORY-0142): their
+    # findings are dropped so none is applied to a same-name server elsewhere.
+    findings = [f for f in findings if f.client not in ("opencode", "opencode-project")]
+
+    # ── Load registry for pinning strategy ───────────────────────────────────
+    registry = None
+    if not offline:
+        try:
+            from mcp_audit.registry.loader import load_registry  # noqa: PLC0415
+
+            registry = load_registry()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Registry unavailable for pinning strategy: %s", exc)
+
+    # ── Load the nearest ancestor mcp-lock.json for the pinning strategy ──────
+    # (STORY-0070). A missing or unreadable lock is not an error here — the
+    # strategy falls back to live resolution exactly as it did before this
+    # feature existed. `load_existing` itself never raises (returns None for
+    # both "absent" and "unreadable").
+    lock_path = find_lock_for(config_path)
+    lock_doc = load_existing_lock(lock_path) if lock_path is not None else None
+
+    # ── Run fixer ─────────────────────────────────────────────────────────────
+    try:
+        result = run_fix(
+            findings=findings,
+            config_path=config_path,
+            apply=apply,
+            fix_types=validated_types,
+            offline=offline,
+            registry=registry,
+            lock_doc=lock_doc,
+        )
+    except FileNotFoundError as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    except PermissionError as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    except ValueError as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    # ── Render output ─────────────────────────────────────────────────────────
+    _print_result(result, apply=apply)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _is_gateway_config(config_path: Path, findings: list[Finding]) -> bool:
+    """True when *config_path* is an MCP gateway config (STORY-0111).
+
+    Decided by the gateway project file names and by any finding of a
+    ``<gateway>-upstream`` client that points at this file.
+    """
+    for rel, _client in PROJECT_GATEWAY_FILES:
+        if config_path.parts[-len(Path(rel).parts) :] == Path(rel).parts:
+            return True
+    for _client, user_path in user_gateway_config_paths():
+        if _resolved(user_path) == _resolved(config_path):
+            return True
+    target = _resolved(config_path)
+    return any(
+        finding.client in GATEWAY_UPSTREAM_CLIENTS
+        and finding.finding_path
+        and _resolved(Path(finding.finding_path)) == target
+        for finding in findings
+    )
+
+
+def _resolved(path: Path) -> str:
+    """``str(path.resolve())``, or ``str(path)`` when it cannot be resolved."""
+    try:
+        return str(path.resolve())
+    except (OSError, RuntimeError):
+        return str(path)
+
+
+def _resolve_findings(
+    path: Path | None, input_file: Path | None
+) -> tuple[Path, list[Finding]]:
+    """Return ``(config_path, findings)`` from a scan or an existing JSON file.
+
+    Args:
+        path: Optional explicit config path (triggers a fresh scan if given).
+        input_file: Optional path to a saved scan JSON file.
+
+    Returns:
+        Tuple of ``(config_path, findings)`` ready for :func:`run_fix`.
+
+    Raises:
+        FileNotFoundError: When *path* or *input_file* does not exist.
+        ValueError: When *input_file* is not valid JSON or is missing required
+            fields.
+    """
+    if input_file is not None:
+        input_file = input_file.resolve()
+        if not input_file.exists():
+            raise FileNotFoundError(f"Input file not found: {input_file}")
+
+        raw = input_file.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Input file is not valid JSON: {input_file}: {exc}"
+            ) from exc
+
+        scan_result = ScanResult.model_validate(data)
+        if not scan_result.servers:
+            raise ValueError(
+                "Scan result has no servers; cannot determine config_path. "
+                "Re-run 'mcp-audit scan --output json' and pass the output here."
+            )
+        # Use the config path from the first server found (a gateway's
+        # upstreams only when nothing else was found; fix then refuses).
+        config_path = _first_config_path(scan_result).resolve()
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Config path from scan result not found: {config_path}"
+            )
+        return config_path, scan_result.findings
+
+    # Fresh scan path.
+    extra_paths: list[Path] | None = None
+    if path is not None:
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+        extra_paths = [path]
+
+    scan_result = run_scan(extra_paths=extra_paths)
+
+    if extra_paths:
+        config_path = extra_paths[0]
+    elif scan_result.servers:
+        config_path = _first_config_path(scan_result).resolve()
+    else:
+        raise ValueError("No config files found. Use --path to specify one explicitly.")
+
+    return config_path, scan_result.findings
+
+
+def _first_config_path(scan_result: ScanResult) -> Path:
+    """The first server's config file, preferring one that is not a gateway's."""
+    for server in scan_result.servers:
+        if server.client not in GATEWAY_UPSTREAM_CLIENTS:
+            return server.config_path
+    return scan_result.servers[0].config_path
+
+
+def _print_result(result, *, apply: bool) -> None:  # type: ignore[no-untyped-def]
+    """Render the fix result to the console.
+
+    Args:
+        result: :class:`~mcp_audit.fixer.fixer.FixResult` instance.
+        apply: Whether the fix was applied to disk.
+    """
+    console.print(Rule("[bold]mcp-audit fix[/bold]"))
+
+    if result.no_fixable:
+        console.print("[green]No fixable findings in this scan.[/green]")
+        return
+
+    # Print skipped / warning messages first so they appear before the diff.
+    for warning in result.skipped:
+        console.print(f"[yellow]⚠[/yellow]  {warning}")
+
+    if result.fixes_applied:
+        verb = "Applied" if apply else "Would apply"
+        console.print(f"\n[bold]{verb} {len(result.fixes_applied)} fix(es):[/bold]")
+        for description in result.fixes_applied:
+            icon = "✓" if apply else "~"
+            console.print(f"  [green]{icon}[/green]  {description}")
+
+    if result.diff:
+        console.print()
+        console.print(Rule("diff"))
+        for line in result.diff.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                console.print(f"[bold]{line}[/bold]")
+            elif line.startswith("+"):
+                console.print(f"[green]{line}[/green]")
+            elif line.startswith("-"):
+                console.print(f"[red]{line}[/red]")
+            elif line.startswith("@@"):
+                console.print(f"[cyan]{line}[/cyan]")
+            else:
+                console.print(line)
+    else:
+        if result.fixes_applied:
+            console.print(
+                "[dim]No changes needed — all findings already remediated.[/dim]"
+            )
+
+    if apply and result.backup_path:
+        console.print()
+        console.print(f"[dim]Backup written to: {result.backup_path}[/dim]")
+        console.print(f"[dim]Config updated:    {result.config_path}[/dim]")
+    elif not apply and result.diff:
+        console.print()
+        console.print(
+            "[dim]Dry run — no files modified. Pass --apply to write changes.[/dim]"
+        )
+
+    console.print(Rule())

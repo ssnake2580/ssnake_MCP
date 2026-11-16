@@ -1,0 +1,1698 @@
+"""Tests for the known-server registry loader and supply-chain integration."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from mcp_audit.analyzers.supply_chain import SupplyChainAnalyzer
+from mcp_audit.models import ServerConfig, TransportType
+from mcp_audit.registry.loader import (
+    BUNDLED_REGISTRY_PATH,
+    KnownServerRegistry,
+    RegistryEntry,
+    levenshtein,
+    load_registry,
+    normalize_pypi_name,
+)
+from tests.conftest import unwrapped
+
+# Windows does not support POSIX file permissions; stat() reports 0o666 for
+# everything regardless of the os.open() mode argument used to create the
+# file. Same convention as tests/test_baselines.py — tests that
+# equality-check a mode bitmask must skip on win32.
+_windows_skip = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows does not support POSIX file permissions",
+)
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _make_server(
+    name: str = "test",
+    command: str = "npx",
+    args: list[str] | None = None,
+) -> ServerConfig:
+    return ServerConfig(
+        name=name,
+        client="claude",
+        config_path=Path("/tmp/mcp.json"),  # noqa: S108
+        transport=TransportType.STDIO,
+        command=command,
+        args=args or [],
+    )
+
+
+# ── Fixtures ───────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def minimal_registry_json(tmp_path: Path) -> Path:
+    """Write a minimal three-entry registry JSON and return its path."""
+    data = {
+        "schema_version": "1.0",
+        "last_updated": "2026-04-15",
+        "entry_count": 3,
+        "entries": [
+            {
+                "name": "@modelcontextprotocol/server-filesystem",
+                "source": "npm",
+                "repo": "https://github.com/modelcontextprotocol/servers",
+                "maintainer": "Anthropic",
+                "verified": True,
+                "last_verified": "2026-04-15",
+                "known_versions": [],
+                "tags": ["official", "filesystem", "local"],
+            },
+            {
+                "name": "@modelcontextprotocol/server-github",
+                "source": "npm",
+                "repo": "https://github.com/modelcontextprotocol/servers",
+                "maintainer": "Anthropic",
+                "verified": True,
+                "last_verified": "2026-04-15",
+                "known_versions": [],
+                "tags": ["official", "github", "remote"],
+            },
+            {
+                "name": "mcp",
+                "source": "pip",
+                "repo": "https://github.com/modelcontextprotocol/python-sdk",
+                "maintainer": "Anthropic",
+                "verified": True,
+                "last_verified": "2026-04-15",
+                "known_versions": [],
+                "tags": ["official", "sdk"],
+            },
+        ],
+    }
+    p = tmp_path / "registry.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return p
+
+
+@pytest.fixture()
+def minimal_registry(minimal_registry_json: Path) -> KnownServerRegistry:
+    """Return a loaded KnownServerRegistry from the minimal fixture."""
+    return KnownServerRegistry(path=minimal_registry_json)
+
+
+# ── Registry loads from bundled path ──────────────────────────────────────────
+
+
+class TestBundledRegistryLoad:
+    def test_bundled_path_exists(self) -> None:
+        assert BUNDLED_REGISTRY_PATH.exists(), (
+            f"Bundled registry not found at {BUNDLED_REGISTRY_PATH}. "
+            "Run in editable mode or check the dev environment."
+        )
+
+    def test_bundled_registry_loads_without_error(self) -> None:
+        reg = load_registry()
+        assert len(reg.entries) > 0
+
+    def test_schema_version_present(self) -> None:
+        reg = load_registry()
+        assert reg.schema_version == "1.0"
+
+    def test_last_updated_present(self) -> None:
+        reg = load_registry()
+        assert reg.last_updated != "unknown"
+
+    def test_entry_count_matches_field(self) -> None:
+        """entry_count field must equal the actual entries list length."""
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        reg = load_registry()
+        assert len(reg.entries) == data["entry_count"]
+
+    def test_no_duplicate_names_across_ecosystems(self) -> None:
+        """No two entries may share a case-insensitive name.
+
+        get()/is_known() are ecosystem-agnostic lookups consulted by
+        toxic_flow, the rule engine, governance, attestation, and shadow-risk
+        with no way to disambiguate a same-named npm vs. pip entry — a
+        collision here previously let an unrelated, unverified npm entry for
+        "mcp-server-git" silently shadow the real, verified PyPI entry
+        depending on JSON array order. This test is a regression guard for
+        that class of bug; ``load_registry()`` itself now also raises
+        ``ValueError`` at load time if it ever recurs (see
+        ``TestNameCollisionDetection``).
+        """
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        names = [e["name"].lower() for e in data["entries"]]
+        seen: set[str] = set()
+        dupes = {n for n in names if n in seen or seen.add(n)}  # type: ignore[func-returns-value]
+        assert not dupes, f"Duplicate registry entry name(s): {sorted(dupes)}"
+
+
+# ── repo=null grandfathering guard ──────────────────────────────────────────────
+
+
+class TestRepoNullRequiresDeliberateAcknowledgement:
+    """Guard against silently re-growing the unverified ``repo: null`` batch.
+
+    Context (see ``registry-audit-2026-08-18.md`` for the full investigation): a
+    batch of 26 ``maintainer: "community"``, ``repo: null`` entries was added to
+    ``registry/known-servers.json`` without ever being checked against the real
+    npm/PyPI registries. Three turned out to be a single security researcher's
+    canary package published under three different vendor names
+    (``mcp-server-notion``/``redis``/``supabase``), seven were v0.0.1 stub
+    packages from one unrelated npm account squatting on major vendor names
+    (``mcp-server-aws``/``gcp``/``azure``/``heroku``/``vercel``/``stripe``,
+    ``mcp-perplexity``), and several more simply do not exist at all and are
+    free for anyone — including an attacker — to register today.
+
+    Grandfathering (original state, 2026-08-18 audit): 26 of 85 entries (31%)
+    had ``repo: null``. The 2026-08-20 remediation pass (see
+    ``CHANGELOG.md`` and the registry audit corrections PR) deleted the
+    entries that turned out not to exist at all or to be an unrelated
+    squat-farm/security-canary account, and repaired the ones that were real
+    packages with stale/wrong metadata by attaching a verified real ``repo``.
+    That shrank the ``repo: null`` set from 26 down to exactly the 3 entries
+    below, each of which legitimately still has no confirmable repo:
+
+    - ``mcp-server-mysql`` / ``mcp-server-terraform`` — real, existing
+      packages (OK bucket) whose own npm metadata declares no repository
+      field at all; there is nothing to attach.
+    - ``mcp-server-postgres`` (PyPI) — previously `verified: true`,
+      `maintainer: "Anthropic"`, `repo` pointing at Anthropic's real
+      ``modelcontextprotocol/servers`` monorepo. The audit found the real
+      PyPI author is an unrelated personal account with a placeholder
+      ("Add your description here") package description — i.e. the old repo
+      pointer was a false attribution, not a legitimate-but-stale one. The
+      repo field was deliberately nulled out (rather than left pointing at
+      Anthropic's repo) alongside demoting ``verified`` to ``false``, since
+      keeping the old repo value would still misleadingly imply an Anthropic
+      connection this package doesn't have.
+
+    This test freezes the *current* set of ``repo: null`` names in an
+    explicit, reviewable allowlist below. Any *new* entry added with
+    ``repo: null`` must also be added here — a one-line addition to a list
+    named exactly for what it is, which a reviewer sees in the diff and can
+    push back on, unlike a silent JSON-only addition that passed CI without
+    comment the first time around.
+
+    A stronger long-term fix — an explicit, deliberately-set schema field like
+    ``repo_unavailable_confirmed: true`` that a submitter must affirmatively
+    set (instead of ``repo: null`` silently defaulting to "we didn't check") —
+    remains a recommendation for a future schema change, not implemented here.
+    """
+
+    # Exactly the entries with repo=null as of the 2026-08-20 remediation.
+    # Do not add new names here without discussing in code review — see the
+    # class docstring, registry-audit-2026-08-18.md, and CHANGELOG.md.
+    # Removing a name (because the entry was given a real repo, or removed
+    # entirely) is always safe and expected as entries get remediated.
+    _LEGACY_REPO_NULL_ALLOWLIST: frozenset[str] = frozenset(
+        {
+            "mcp-server-mysql",
+            "mcp-server-postgres",
+            "mcp-server-terraform",
+        }
+    )
+
+    def test_new_repo_null_entries_must_join_the_allowlist(self) -> None:
+        """A new ``repo: null`` entry not in the allowlist fails the build.
+
+        This is the part that would have caught the original batch at review
+        time: adding 26 names to a hardcoded allowlist in a test file is a
+        conspicuous, must-explain diff, unlike a silent JSON-only addition.
+        """
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        repo_null_names = {e["name"] for e in data["entries"] if e.get("repo") is None}
+        unexpected = repo_null_names - self._LEGACY_REPO_NULL_ALLOWLIST
+        assert not unexpected, (
+            "New registry entr(y/ies) added with repo=null, not checked against "
+            f"the real package registry: {sorted(unexpected)}. Run "
+            "`python scripts/audit_registry.py` and either add a real, "
+            "verified `repo` URL, or add the name to "
+            "_LEGACY_REPO_NULL_ALLOWLIST in this test *only* after confirming "
+            "in code review that the gap is deliberate and acknowledged "
+            "(see registry-audit-2026-08-18.md for the kind of findings a "
+            "null repo can hide)."
+        )
+
+    def test_allowlist_does_not_contain_stale_names(self) -> None:
+        """Names should be removed from the allowlist once remediated.
+
+        Keeps the allowlist from silently rotting into "already-fixed names"
+        that no longer do any protective work.
+        """
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        repo_null_names = {e["name"] for e in data["entries"] if e.get("repo") is None}
+        stale = self._LEGACY_REPO_NULL_ALLOWLIST - repo_null_names
+        assert not stale, (
+            f"Allowlist entr(y/ies) no longer have repo=null: {sorted(stale)}. "
+            "Remove them from _LEGACY_REPO_NULL_ALLOWLIST — they were fixed "
+            "(or removed), so keeping them here just weakens the guard."
+        )
+
+
+# ── Demoted entries must not keep verified-only signals ────────────────────────
+
+
+class TestDemotedEntriesDoNotCarryVerifiedSignals:
+    """A ``verified: false`` entry must not still look verified to a reader.
+
+    Context: the 2026-08-20 audit correction demoted ``mcp-server-postgres``
+    to ``verified: false`` (its ``maintainer``/``repo`` were false Anthropic
+    attribution) but initially left three verified-only signals in place:
+    ``tags: ["official", ...]`` (the public verdict page would render
+    "official" right next to a maintainer field saying the attribution is
+    false), ``attestation_expected: true`` (per the field's own docstring in
+    ``registry/loader.py``, this guarantees a false MEDIUM finding for a
+    package with no established Sigstore-provenance pipeline), and a
+    ``publisher_history`` still pointing at Anthropic's real accounts (an
+    account-takeover baseline that would misfire the moment the real
+    publisher appears). This is the general-case guard: it would have caught
+    that regression on its own, without a human re-reading every field.
+    """
+
+    def _entries(self) -> list[dict]:
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        return json.loads(raw)["entries"]
+
+    def test_unverified_entries_do_not_carry_official_tag(self) -> None:
+        offenders = [
+            e["name"]
+            for e in self._entries()
+            if not e.get("verified", False) and "official" in e.get("tags", [])
+        ]
+        assert not offenders, (
+            f"verified: false entr(y/ies) still tagged 'official': "
+            f"{sorted(offenders)}. The 'official' tag renders on the public "
+            "mcp-audit.dev verdict page — it must not coexist with a "
+            "false-attribution demotion."
+        )
+
+    def test_unverified_entries_do_not_expect_attestation(self) -> None:
+        offenders = [
+            e["name"]
+            for e in self._entries()
+            if not e.get("verified", False) and e.get("attestation_expected", False)
+        ]
+        assert not offenders, (
+            f"verified: false entr(y/ies) still have attestation_expected=true: "
+            f"{sorted(offenders)}. Per its docstring in registry/loader.py, this "
+            "guarantees a false MEDIUM finding on a package we no longer trust "
+            "enough to verify."
+        )
+
+
+# ── Name collision detection ──────────────────────────────────────────────────
+
+
+class TestNameCollisionDetection:
+    """KnownServerRegistry must refuse to load data with duplicate names."""
+
+    def test_duplicate_name_raises_value_error(self, tmp_path: Path) -> None:
+        """Two entries sharing a case-insensitive name raise ValueError."""
+        data = {
+            "schema_version": "1.0",
+            "last_updated": "2026-08-18",
+            "entry_count": 2,
+            "entries": [
+                {
+                    "name": "mcp-server-git",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-15",
+                    "known_versions": [],
+                    "tags": ["vcs", "local"],
+                },
+                {
+                    "name": "mcp-server-git",
+                    "source": "pip",
+                    "package_ecosystem": "pypi",
+                    "repo": "https://github.com/modelcontextprotocol/servers",
+                    "maintainer": "Anthropic",
+                    "verified": True,
+                    "last_verified": "2026-05-17",
+                    "known_versions": [],
+                    "tags": ["official", "git", "local"],
+                },
+            ],
+        }
+        p = tmp_path / "dup-registry.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Duplicate registry entry name"):
+            KnownServerRegistry(path=p)
+
+    def test_duplicate_name_is_case_insensitive(self, tmp_path: Path) -> None:
+        """Names differing only by case still collide."""
+        data = {
+            "schema_version": "1.0",
+            "last_updated": "2026-08-18",
+            "entry_count": 2,
+            "entries": [
+                {
+                    "name": "Some-Package",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-15",
+                    "known_versions": [],
+                    "tags": ["local"],
+                },
+                {
+                    "name": "some-package",
+                    "source": "pip",
+                    "package_ecosystem": "pypi",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-15",
+                    "known_versions": [],
+                    "tags": ["local"],
+                },
+            ],
+        }
+        p = tmp_path / "dup-case-registry.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Duplicate registry entry name"):
+            KnownServerRegistry(path=p)
+
+
+# ── npm-scoped lookups (is_known_npm / get_npm / find_closest_npm) ────────────
+
+
+class TestNpmEcosystemScoping:
+    """Regression coverage for the ecosystem-blind npm lookup bug.
+
+    Before ``is_known_npm``/``get_npm``/``find_closest_npm`` existed, an
+    npx-launched server named after a package published ONLY to PyPI would be
+    silently treated as a known/verified npm package by the ecosystem-blind
+    ``get()``/``is_known()`` pair. The bundled registry's "mcp-server-git"
+    entry is exactly such a case: it is ``package_ecosystem: "pypi"`` and has
+    no npm counterpart (the previous, unrelated npm "mcp-server-git" entry —
+    a security-research canary, not a real MCP server — was removed as part
+    of this fix).
+    """
+
+    def test_pypi_only_entry_not_known_on_npm_path(self) -> None:
+        reg = load_registry()
+        assert reg.is_known_npm("mcp-server-git") is False
+        assert reg.get_npm("mcp-server-git") is None
+
+    def test_pypi_only_entry_still_resolves_generically(self) -> None:
+        """get()/is_known() remain the intentional ecosystem-agnostic fallback.
+
+        toxic_flow, the rule engine, governance, attestation, and shadow-risk
+        have no ecosystem context and legitimately want name-only lookup —
+        that behaviour is unchanged by this fix.
+        """
+        reg = load_registry()
+        assert reg.is_known("mcp-server-git") is True
+        entry = reg.get("mcp-server-git")
+        assert entry is not None
+        assert entry.package_ecosystem == "pypi"
+
+    def test_pypi_only_entry_resolves_on_pypi_path(self) -> None:
+        reg = load_registry()
+        assert reg.is_known_pypi("mcp-server-git") is True
+        entry = reg.get_pypi("mcp-server-git")
+        assert entry is not None
+        assert entry.verified is True
+
+
+class TestNpmPypiSameNameDisambiguation:
+    """Same package name legitimately present in both ecosystems.
+
+    ``KnownServerRegistry``'s global duplicate-name guard
+    (``_build_name_index``, see ``TestNameCollisionDetection`` above) rejects
+    two entries sharing a name regardless of ecosystem, so this scenario can
+    never reach ``KnownServerRegistry(path=...)`` through the public
+    constructor today — that guard is a deliberate, separate invariant from
+    this fix and is out of scope to change here. This test instead builds the
+    ecosystem-scoped sub-indices directly (bypassing ``__init__``) to prove
+    the disambiguation logic in ``is_known_npm``/``get_npm``/``is_known_pypi``/
+    ``get_pypi`` is correct in isolation.
+    """
+
+    def setup_method(self) -> None:
+        npm_entry = RegistryEntry(
+            name="shared-name-mcp",
+            source="npm",
+            package_ecosystem="npm",
+            repo=None,
+            maintainer="npm-org",
+            verified=False,
+            last_verified="2026-08-18",
+            known_versions=[],
+            tags=["community"],
+        )
+        pypi_entry = RegistryEntry(
+            name="shared-name-mcp",
+            source="pip",
+            package_ecosystem="pypi",
+            repo=None,
+            maintainer="pypi-org",
+            verified=True,
+            last_verified="2026-08-18",
+            known_versions=[],
+            tags=["community"],
+        )
+        reg = KnownServerRegistry.__new__(KnownServerRegistry)
+        reg.entries = [npm_entry, pypi_entry]
+        reg._npm_entries = [npm_entry]
+        reg._npm_name_index = {npm_entry.name.lower(): npm_entry}
+        reg._pypi_entries = [pypi_entry]
+        reg._pypi_norm_index = {normalize_pypi_name(pypi_entry.name): pypi_entry}
+        self.registry = reg
+
+    def test_is_known_npm_returns_npm_row(self) -> None:
+        assert self.registry.is_known_npm("shared-name-mcp") is True
+
+    def test_get_npm_returns_npm_row(self) -> None:
+        entry = self.registry.get_npm("shared-name-mcp")
+        assert entry is not None
+        assert entry.package_ecosystem == "npm"
+        assert entry.verified is False
+
+    def test_is_known_pypi_returns_pypi_row(self) -> None:
+        assert self.registry.is_known_pypi("shared-name-mcp") is True
+
+    def test_get_pypi_returns_pypi_row(self) -> None:
+        entry = self.registry.get_pypi("shared-name-mcp")
+        assert entry is not None
+        assert entry.package_ecosystem == "pypi"
+        assert entry.verified is True
+
+    def test_find_closest_npm_excludes_pypi_only_entries(self) -> None:
+        """A pypi-only entry must never be an npm typosquat comparison target.
+
+        Uses an isolated registry with an empty npm pool and a single
+        pypi-only entry one edit away from the query — a pre-fix,
+        ecosystem-blind ``find_closest()`` would have matched it.
+        """
+        only_pypi_entry = RegistryEntry(
+            name="close-typo-target",
+            source="pip",
+            package_ecosystem="pypi",
+            repo=None,
+            maintainer="pypi-org",
+            verified=True,
+            last_verified="2026-08-18",
+            known_versions=[],
+            tags=["community"],
+        )
+        reg = KnownServerRegistry.__new__(KnownServerRegistry)
+        reg.entries = [only_pypi_entry]
+        reg._npm_entries = []
+        reg._npm_name_index = {}
+        reg._pypi_entries = [only_pypi_entry]
+        reg._pypi_norm_index = {
+            normalize_pypi_name(only_pypi_entry.name): only_pypi_entry
+        }
+
+        result = reg.find_closest_npm("close-typo-targe", threshold=3)
+        assert result is None
+
+
+# ── is_known ──────────────────────────────────────────────────────────────────
+
+
+class TestIsKnown:
+    def test_official_entry_returns_true(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        assert (
+            minimal_registry.is_known("@modelcontextprotocol/server-filesystem") is True
+        )
+
+    def test_unknown_name_returns_false(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        assert minimal_registry.is_known("@evil/fake-filesystem") is False
+
+    def test_case_insensitive(self, minimal_registry: KnownServerRegistry) -> None:
+        assert (
+            minimal_registry.is_known("@ModelContextProtocol/Server-FileSystem") is True
+        )
+
+    def test_partial_name_returns_false(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        assert minimal_registry.is_known("server-filesystem") is False
+
+    def test_pip_entry_is_known(self, minimal_registry: KnownServerRegistry) -> None:
+        assert minimal_registry.is_known("mcp") is True
+
+
+# ── find_closest ──────────────────────────────────────────────────────────────
+
+
+class TestFindClosest:
+    def test_typosquat_within_threshold(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        # one char deleted (distance 1)
+        result = minimal_registry.find_closest(
+            "@modelcontextprotocol/server-filesyste", threshold=3
+        )
+        assert result is not None
+        assert result.name == "@modelcontextprotocol/server-filesystem"
+
+    def test_returns_none_for_exact_match(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        result = minimal_registry.find_closest(
+            "@modelcontextprotocol/server-filesystem", threshold=3
+        )
+        assert result is None
+
+    def test_returns_none_outside_threshold(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        result = minimal_registry.find_closest(
+            "totally-unrelated-xyz-tool", threshold=3
+        )
+        assert result is None
+
+    def test_default_threshold_2(self, minimal_registry: KnownServerRegistry) -> None:
+        # Distance 1 must be found with default threshold=2.
+        result = minimal_registry.find_closest("@modelcontextprotocol/server-filesyste")
+        assert result is not None
+
+    def test_threshold_too_tight(self, minimal_registry: KnownServerRegistry) -> None:
+        # 2-char deletion should NOT be found with threshold=1.
+        result = minimal_registry.find_closest(
+            "@modelcontextprotocol/server-filesyst",
+            threshold=1,
+        )
+        assert result is None
+
+    def test_returns_maintainer_info(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        # one extra char → distance 1
+        result = minimal_registry.find_closest(
+            "@modelcontextprotocol/server-githubs", threshold=3
+        )
+        assert result is not None
+        assert result.maintainer == "Anthropic"
+        assert result.verified is True
+
+
+# ── names ─────────────────────────────────────────────────────────────────────
+
+
+class TestNames:
+    def test_names_returns_all(self, minimal_registry: KnownServerRegistry) -> None:
+        names = minimal_registry.names()
+        assert "@modelcontextprotocol/server-filesystem" in names
+        assert "@modelcontextprotocol/server-github" in names
+        assert "mcp" in names
+
+    def test_names_count_matches_entries(
+        self, minimal_registry: KnownServerRegistry
+    ) -> None:
+        assert len(minimal_registry.names()) == len(minimal_registry.entries)
+
+
+# ── load_registry ─────────────────────────────────────────────────────────────
+
+
+class TestLoadRegistry:
+    def test_explicit_path(self, minimal_registry_json: Path) -> None:
+        reg = load_registry(minimal_registry_json)
+        assert len(reg.entries) == 3
+
+    def test_missing_explicit_path_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            load_registry(tmp_path / "nonexistent.json")
+
+    def test_malformed_json_raises(self, tmp_path: Path) -> None:
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not valid json", encoding="utf-8")
+        with pytest.raises(ValueError, match="Malformed registry JSON"):
+            load_registry(bad)
+
+    def test_user_cache_preferred_over_bundled(
+        self,
+        minimal_registry_json: Path,
+    ) -> None:
+        """User-cache path must be preferred over the bundled registry."""
+        import mcp_audit.registry.loader as loader_mod  # noqa: PLC0415
+
+        with patch.object(loader_mod, "_USER_CACHE_PATH", minimal_registry_json):
+            reg = load_registry()
+        # minimal fixture has 3 entries; bundled registry has 57
+        assert len(reg.entries) == 3
+
+
+# ── RegistryEntry model ───────────────────────────────────────────────────────
+
+
+class TestRegistryEntry:
+    def test_all_fields_populated(self, minimal_registry: KnownServerRegistry) -> None:
+        entry = minimal_registry.entries[0]
+        assert entry.name == "@modelcontextprotocol/server-filesystem"
+        assert entry.source == "npm"
+        assert entry.maintainer == "Anthropic"
+        assert entry.verified is True
+        assert "official" in entry.tags
+
+    def test_pip_source_accepted(self, minimal_registry: KnownServerRegistry) -> None:
+        pip_entry = next(e for e in minimal_registry.entries if e.source == "pip")
+        assert pip_entry.name == "mcp"
+
+    def test_null_repo_allowed(self, tmp_path: Path) -> None:
+        data = {
+            "schema_version": "1.0",
+            "last_updated": "2026-04-15",
+            "entry_count": 1,
+            "entries": [
+                {
+                    "name": "mcp-server-community",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-15",
+                    "known_versions": [],
+                    "tags": ["community"],
+                }
+            ],
+        }
+        p = tmp_path / "r.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+        reg = KnownServerRegistry(path=p)
+        assert reg.entries[0].repo is None
+
+
+# ── Supply chain analyzer uses registry ───────────────────────────────────────
+
+
+class TestSupplyChainAnalyzerUsesRegistry:
+    """Confirm SupplyChainAnalyzer calls the registry instead of the old YAML."""
+
+    def test_analyzer_calls_is_known(self) -> None:
+        # The npm branch (npx args) is scoped via is_known_npm/get_npm since
+        # the ecosystem-blind lookup fix — see TestNpmEcosystemScoping.
+        mock_reg = MagicMock(spec=KnownServerRegistry)
+        mock_reg.is_known_npm.return_value = True
+
+        analyzer = SupplyChainAnalyzer(registry=mock_reg)
+        server = _make_server(args=["-y", "@modelcontextprotocol/server-filesystem"])
+        analyzer.analyze(server)
+
+        mock_reg.is_known_npm.assert_called_once_with(
+            "@modelcontextprotocol/server-filesystem"
+        )
+
+    def test_analyzer_calls_find_closest_when_unknown(self) -> None:
+        mock_reg = MagicMock(spec=KnownServerRegistry)
+        mock_reg.entries = []  # read by the SC-007 twin index (STORY-0097)
+        mock_reg.is_known_npm.return_value = False
+        mock_reg.find_closest_npm.return_value = None
+
+        analyzer = SupplyChainAnalyzer(registry=mock_reg)
+        server = _make_server(args=["-y", "unknown-package"])
+        analyzer.analyze(server)
+
+        mock_reg.find_closest_npm.assert_called_once()
+
+    def test_analyzer_emits_finding_with_maintainer(self) -> None:
+        """Finding description and evidence must include maintainer and verified."""
+        mock_entry = RegistryEntry(
+            name="@modelcontextprotocol/server-filesystem",
+            source="npm",
+            repo="https://github.com/modelcontextprotocol/servers",
+            maintainer="Anthropic",
+            verified=True,
+            last_verified="2026-04-15",
+            known_versions=[],
+            tags=["official"],
+        )
+        mock_reg = MagicMock(spec=KnownServerRegistry)
+        mock_reg.entries = []  # read by the SC-007 twin index (STORY-0097)
+        mock_reg.is_known_npm.return_value = False
+        mock_reg.find_closest_npm.return_value = mock_entry
+
+        analyzer = SupplyChainAnalyzer(registry=mock_reg)
+        server = _make_server(args=["-y", "@modelcontextprotocol/server-filesyste"])
+        findings = analyzer.analyze(server)
+
+        assert len(findings) == 1
+        assert "Anthropic" in findings[0].description
+        assert "Anthropic" in findings[0].evidence
+        assert "verified" in findings[0].evidence
+
+    def test_custom_registry_path_used(self, minimal_registry_json: Path) -> None:
+        """SupplyChainAnalyzer loads a custom registry when registry_path is given."""
+        analyzer = SupplyChainAnalyzer(registry_path=minimal_registry_json)
+        server = _make_server(args=["-y", "@modelcontextprotocol/server-filesystem"])
+        assert analyzer.analyze(server) == []
+
+
+# ── update-registry command ───────────────────────────────────────────────────
+
+
+class TestUpdateRegistry:
+    """update-registry fetches and writes the registry cache for all users."""
+
+    def test_update_registry_writes_cache(self, tmp_path: Path) -> None:
+        """update-registry fetches the remote registry and writes the cache file."""
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        fake_registry = json.dumps(
+            {
+                "schema_version": "1.0",
+                "last_updated": "2026-04-15",
+                "entry_count": 1,
+                "entries": [
+                    {
+                        "name": "test-pkg",
+                        "source": "npm",
+                        "repo": None,
+                        "maintainer": "community",
+                        "verified": False,
+                        "last_verified": "2026-04-15",
+                        "known_versions": [],
+                        "tags": [],
+                    }
+                ],
+            }
+        ).encode()
+
+        cache_path = tmp_path / "registry" / "known-servers.json"
+
+        runner = CliRunner()
+        with (
+            patch("mcp_audit.cli._REGISTRY_CACHE_PATH", cache_path),
+            patch("urllib.request.urlopen") as mock_urlopen,
+        ):
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = fake_registry
+            mock_urlopen.return_value = mock_resp
+
+            result = runner.invoke(app, ["update-registry"])
+
+        assert result.exit_code == 0
+        assert "Registry updated" in unwrapped(result.output)
+        assert cache_path.exists()
+
+
+# ── levenshtein (registry module) ─────────────────────────────────────────────
+
+
+class TestLevenshteinInLoader:
+    """Sanity-check the levenshtein implementation in the registry module."""
+
+    def test_identical(self) -> None:
+        assert levenshtein("abc", "abc") == 0
+
+    def test_single_deletion(self) -> None:
+        assert levenshtein("server-filesystem", "server-filesyste") == 1
+
+    def test_single_insertion(self) -> None:
+        assert levenshtein("server-slack", "server-slacks") == 1
+
+    def test_symmetric(self) -> None:
+        assert levenshtein("abc", "xyz") == levenshtein("xyz", "abc")
+
+
+# ── --offline-registry / offline parameter ────────────────────────────────────
+
+
+class TestOfflineRegistry:
+    """load_registry(offline=True) must skip the user cache."""
+
+    def test_offline_skips_user_cache(
+        self,
+        minimal_registry_json: Path,
+    ) -> None:
+        """With offline=True, the user-cache path is ignored even when it exists."""
+        import mcp_audit.registry.loader as loader_mod  # noqa: PLC0415
+
+        with patch.object(loader_mod, "_USER_CACHE_PATH", minimal_registry_json):
+            # minimal fixture has 3 entries; bundled registry has 57
+            reg = load_registry(offline=True)
+        assert len(reg.entries) != 3, "offline=True should bypass the user cache"
+
+    def test_offline_still_loads_bundled(self) -> None:
+        """offline=True must load the bundled registry, not raise FileNotFoundError."""
+        reg = load_registry(offline=True)
+        assert len(reg.entries) > 0
+
+    def test_offline_explicit_path_not_overridden(
+        self,
+        minimal_registry_json: Path,
+    ) -> None:
+        """An explicit path argument must win even when offline=True."""
+        reg = load_registry(path=minimal_registry_json, offline=True)
+        assert len(reg.entries) == 3
+
+    def test_known_server_registry_offline_kwarg(
+        self,
+        minimal_registry_json: Path,
+    ) -> None:
+        """KnownServerRegistry(offline=True) passes offline flag to _locate."""
+        import mcp_audit.registry.loader as loader_mod  # noqa: PLC0415
+
+        with patch.object(loader_mod, "_USER_CACHE_PATH", minimal_registry_json):
+            reg = KnownServerRegistry(offline=True)
+        assert len(reg.entries) != 3
+
+
+# ── PyInstaller _MEIPASS resolution ───────────────────────────────────────────
+
+
+class TestMeipassResolution:
+    """Verify _resolve_bundled_path() and _locate() behave correctly under
+    PyInstaller."""
+
+    def test_resolve_bundled_path_returns_meipass_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With sys.frozen=True, _resolve_bundled_path() must return the _MEIPASS
+        path."""
+        import sys  # noqa: PLC0415
+
+        from mcp_audit.registry.loader import _resolve_bundled_path  # noqa: PLC0415
+
+        # Create a realistic _MEIPASS layout so the existence check passes.
+        registry_dir = tmp_path / "registry"
+        registry_dir.mkdir()
+        (registry_dir / "known-servers.json").write_text("{}")
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+
+        result = _resolve_bundled_path()
+        assert result == tmp_path / "registry" / "known-servers.json"
+
+    def test_resolve_bundled_path_not_frozen_returns_non_meipass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With sys.frozen=False, _resolve_bundled_path() must not use _MEIPASS."""
+        import sys  # noqa: PLC0415
+
+        from mcp_audit.registry.loader import _resolve_bundled_path  # noqa: PLC0415
+
+        monkeypatch.setattr(sys, "frozen", False, raising=False)
+        # Plant a decoy _MEIPASS — must be ignored when not frozen.
+        monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+
+        result = _resolve_bundled_path()
+        assert str(tmp_path) not in str(result)
+
+    def test_frozen_registry_loads_via_patched_bundled_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """KnownServerRegistry loads correctly when BUNDLED_REGISTRY_PATH mimics a
+        frozen _MEIPASS layout (offline=True so user-cache is skipped)."""
+        import mcp_audit.registry.loader as loader_mod  # noqa: PLC0415
+
+        fake_dir = tmp_path / "registry"
+        fake_dir.mkdir()
+        fake_registry = fake_dir / "known-servers.json"
+        fake_registry.write_text(
+            '{"schema_version":"1.0","last_updated":"2026-04-17",'
+            '"entry_count":1,"entries":[{"name":"frozen-test-pkg",'
+            '"source":"npm","repo":null,"maintainer":"test","verified":false,'
+            '"last_verified":"2026-04-17","known_versions":[],"tags":[]}]}',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(loader_mod, "BUNDLED_REGISTRY_PATH", fake_registry)
+
+        reg = KnownServerRegistry(offline=True)
+        assert len(reg.entries) == 1
+        assert reg.entries[0].name == "frozen-test-pkg"
+
+    def test_locate_raises_when_bundled_path_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_locate() must raise FileNotFoundError when both the user cache and
+        BUNDLED_REGISTRY_PATH are absent — simulates a corrupt PyInstaller bundle."""
+        import mcp_audit.registry.loader as loader_mod  # noqa: PLC0415
+
+        missing = tmp_path / "no-such-file.json"
+        monkeypatch.setattr(loader_mod, "BUNDLED_REGISTRY_PATH", missing)
+        monkeypatch.setattr(loader_mod, "_USER_CACHE_PATH", missing)
+
+        with pytest.raises(FileNotFoundError, match="No registry file found"):
+            KnownServerRegistry()
+
+    def test_meipass_path_shape_matches_spec_datas(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The _MEIPASS sub-path registry/known-servers.json must match the
+        'datas' entry in all four PyInstaller spec files."""
+        import sys  # noqa: PLC0415
+
+        from mcp_audit.registry.loader import _resolve_bundled_path  # noqa: PLC0415
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+
+        result = _resolve_bundled_path()
+        # The spec files place the registry at <_MEIPASS>/registry/known-servers.json
+        assert result.parts[-2] == "registry"
+        assert result.name == "known-servers.json"
+
+
+class TestOfflineRegistrySupplyChain:
+    """SupplyChainAnalyzer(offline_registry=True) must use bundled registry."""
+
+    def test_offline_registry_flag_propagates(
+        self,
+        minimal_registry_json: Path,
+    ) -> None:
+        import mcp_audit.registry.loader as loader_mod  # noqa: PLC0415
+        from mcp_audit.analyzers.supply_chain import (
+            SupplyChainAnalyzer,  # noqa: PLC0415
+        )
+
+        with patch.object(loader_mod, "_USER_CACHE_PATH", minimal_registry_json):
+            analyzer = SupplyChainAnalyzer(offline_registry=True)
+        # bundled registry has 64 entries; minimal fixture has 3
+        assert len(analyzer.registry.entries) != 3
+
+    def test_registry_property_returns_loaded_registry(self) -> None:
+        from mcp_audit.analyzers.supply_chain import (
+            SupplyChainAnalyzer,  # noqa: PLC0415
+        )
+
+        analyzer = SupplyChainAnalyzer()
+        assert isinstance(analyzer.registry, KnownServerRegistry)
+
+
+class TestRegistryEntryMetadataFields:
+    """RegistryEntry correctly deserialises and exposes optional metadata fields."""
+
+    def test_entry_with_all_metadata_fields(self) -> None:
+        """All three metadata fields deserialise correctly when present."""
+        entry = RegistryEntry(
+            name="some-package",
+            source="npm",
+            repo=None,
+            maintainer="test",
+            verified=True,
+            last_verified="2026-04-23",
+            known_versions=[],
+            tags=[],
+            first_published="2024-11-14",
+            weekly_downloads=42800,
+            publisher_history=["anthropic-bot", "modelcontextprotocol"],
+        )
+        assert entry.first_published == "2024-11-14"
+        assert entry.weekly_downloads == 42800
+        assert entry.publisher_history == ["anthropic-bot", "modelcontextprotocol"]
+
+    def test_entry_without_metadata_fields_defaults_to_none(self) -> None:
+        """All three metadata fields default to None when absent."""
+        entry = RegistryEntry(
+            name="some-package",
+            source="npm",
+            repo=None,
+            maintainer="test",
+            verified=True,
+            last_verified="2026-04-23",
+            known_versions=[],
+            tags=[],
+        )
+        assert entry.first_published is None
+        assert entry.weekly_downloads is None
+        assert entry.publisher_history is None
+
+    def test_bundled_registry_loads_without_error(self) -> None:
+        """Bundled registry loads cleanly with the new optional fields present.
+
+        The lower bound here is a loose sanity check, not a growth target —
+        the 2026-08-20 audit correction (see registry-audit-2026-08-18.md and
+        CHANGELOG.md) legitimately shrank the registry from 85 to 50 entries
+        by removing entries for packages that do not exist or were
+        misattributed. A registry entry count going down is not itself a
+        regression; this assertion just guards against the file failing to
+        load at all or losing the bulk of its content.
+        """
+        registry = KnownServerRegistry()
+        assert len(registry.entries) >= 40
+        # Entries with metadata should deserialise correctly.
+        enriched = [e for e in registry.entries if e.first_published is not None]
+        for e in enriched:
+            assert len(e.first_published) == 10  # YYYY-MM-DD
+
+    def test_known_vulnerabilities_field_populated_when_present(
+        self, tmp_path: Path
+    ) -> None:
+        """known_vulnerabilities deserialises correctly when present in JSON."""
+        registry_json = {
+            "schema_version": "1.0",
+            "last_updated": "2026-05-16",
+            "entries": [
+                {
+                    "name": "vuln-package",
+                    "source": "pip",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-05-16",
+                    "known_versions": [],
+                    "tags": [],
+                    "known_vulnerabilities": ["CVE-2026-27826", "GHSA-xxxx-yyyy-zzzz"],
+                }
+            ],
+        }
+        reg_path = tmp_path / "registry.json"
+        reg_path.write_text(__import__("json").dumps(registry_json))
+        registry = KnownServerRegistry(path=reg_path)
+
+        assert len(registry.entries) == 1
+        entry = registry.entries[0]
+        assert entry.known_vulnerabilities == ["CVE-2026-27826", "GHSA-xxxx-yyyy-zzzz"]
+
+    def test_known_vulnerabilities_defaults_to_none_when_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """known_vulnerabilities is None (not an error) when the field is absent."""
+        registry_json = {
+            "schema_version": "1.0",
+            "last_updated": "2026-05-16",
+            "entries": [
+                {
+                    "name": "legacy-package",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": True,
+                    "last_verified": "2026-05-16",
+                    "known_versions": [],
+                    "tags": [],
+                }
+            ],
+        }
+        reg_path = tmp_path / "registry.json"
+        reg_path.write_text(__import__("json").dumps(registry_json))
+        registry = KnownServerRegistry(path=reg_path)
+
+        assert len(registry.entries) == 1
+        assert registry.entries[0].known_vulnerabilities is None
+
+
+class TestUpdateRegistryURL:
+    """Verify _UPDATE_REGISTRY_URL uses a version tag, not /main/."""
+
+    def test_update_registry_url_uses_version_tag(self) -> None:
+        """_UPDATE_REGISTRY_URL must contain the current __version__ string."""
+        from mcp_audit import __version__  # noqa: PLC0415
+        from mcp_audit.cli import _UPDATE_REGISTRY_URL  # noqa: PLC0415
+
+        assert f"v{__version__}" in _UPDATE_REGISTRY_URL, (
+            f"_UPDATE_REGISTRY_URL should reference v{__version__}, "
+            f"got: {_UPDATE_REGISTRY_URL}"
+        )
+
+    def test_update_registry_url_does_not_use_main_branch(self) -> None:
+        """_UPDATE_REGISTRY_URL must not point at /main/ (breaks older binaries)."""
+        from mcp_audit.cli import _UPDATE_REGISTRY_URL  # noqa: PLC0415
+
+        assert "/main/" not in _UPDATE_REGISTRY_URL, (
+            "_UPDATE_REGISTRY_URL must not use /main/ — use a version tag instead. "
+            f"Current value: {_UPDATE_REGISTRY_URL}"
+        )
+
+
+# ── verify — config file path support ─────────────────────────────────────────
+
+
+class TestVerifyConfigPath:
+    """verify SERVER_NAME accepts a config file path in addition to package names."""
+
+    def _minimal_registry_json(self, tmp_path: Path, name: str = "test-pkg") -> Path:
+        reg = {
+            "schema_version": "1.0",
+            "last_updated": "2026-04-20",
+            "entry_count": 1,
+            "entries": [
+                {
+                    "name": name,
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-20",
+                    "known_versions": [],
+                    "tags": [],
+                }
+            ],
+        }
+        p = tmp_path / "registry.json"
+        p.write_text(json.dumps(reg))
+        return p
+
+    def test_verify_accepts_config_path(self, tmp_path: Path) -> None:
+        """verify PATH produces a table output, not a 'not found' message (F12)."""
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        config = tmp_path / "mcp.json"
+        config.write_text(
+            '{"mcpServers": {"my-server": {"command": "node", "args": []}}}'
+        )
+        reg_path = self._minimal_registry_json(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["verify", str(config), "--registry", str(reg_path)],
+        )
+
+        assert result.exit_code == 0, result.output
+        # Must produce table output (not the package-name "not found" message)
+        assert "Verification" in result.output or "Server" in result.output
+
+    def test_verify_config_path_shows_all_servers(self, tmp_path: Path) -> None:
+        """All servers in the config appear in the verification table."""
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        config = tmp_path / "mcp.json"
+        config.write_text(
+            '{"mcpServers": {"alpha": {"command": "npx", "args": []}, '
+            '"beta": {"command": "node", "args": []}}}'
+        )
+        reg_path = self._minimal_registry_json(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["verify", str(config), "--registry", str(reg_path)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "alpha" in result.output
+        assert "beta" in result.output
+
+    def test_verify_nonexistent_config_exits_2(self, tmp_path: Path) -> None:
+        """verify /no/such/file.json must exit 2 with a clear error."""
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["verify", str(tmp_path / "no-such-file.json")])
+
+        assert result.exit_code == 2
+        assert "not found" in unwrapped(result.output.lower()) or (
+            "Error" in result.output
+        )
+
+    def test_verify_package_name_still_works(self, tmp_path: Path) -> None:
+        """Package-name form (no path separator, no .json) still works."""
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        reg_path = self._minimal_registry_json(tmp_path, name="test-pkg")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["verify", "test-pkg", "--registry", str(reg_path)],
+        )
+
+        # test-pkg has no known_hashes → "No hashes pinned" message, exit 0
+        assert result.exit_code == 0
+        assert "test-pkg" in result.output
+
+
+# ── R45: RegistryLoadError — a corrupt registry cache must never traceback ────
+
+
+def _duplicate_name_registry_payload() -> dict:
+    """A registry payload with two entries sharing a case-insensitive name.
+
+    Same shape as the real-world collision R43 hit once and could not
+    reproduce on four clean re-runs — different ecosystems (npm vs. pip),
+    same lowercased name, which is exactly what
+    ``KnownServerRegistry._build_name_index`` refuses to index.
+    """
+    return {
+        "schema_version": "1.0",
+        "last_updated": "2026-09-08",
+        "entry_count": 2,
+        "entries": [
+            {
+                "name": "dup-server",
+                "source": "npm",
+                "repo": None,
+                "maintainer": "test",
+                "verified": False,
+                "last_verified": "2026-09-08",
+                "known_versions": ["1.0.0"],
+                "tags": [],
+                "package_ecosystem": "npm",
+            },
+            {
+                "name": "dup-server",
+                "source": "pip",
+                "repo": None,
+                "maintainer": "test",
+                "verified": True,
+                "last_verified": "2026-09-08",
+                "known_versions": ["1.0.0"],
+                "tags": [],
+                "package_ecosystem": "pypi",
+            },
+        ],
+    }
+
+
+class TestRegistryLoadError:
+    """RegistryLoadError names the file and says how to recover, for both
+    ways a registry file can fail to load: malformed JSON (an interrupted
+    write) and a duplicate entry name (bad data)."""
+
+    def test_malformed_json_raises_registry_load_error(self, tmp_path: Path) -> None:
+        from mcp_audit.registry.loader import RegistryLoadError  # noqa: PLC0415
+
+        bad = tmp_path / "truncated.json"
+        # Simulates an interrupted write: a valid path, syntactically invalid
+        # JSON, cut off mid-object — exactly what a truncated write leaves.
+        bad.write_text('{"schema_version": "1.0", "entries": [', encoding="utf-8")
+
+        with pytest.raises(RegistryLoadError) as excinfo:
+            KnownServerRegistry(path=bad)
+
+        # Still a ValueError — existing `except ValueError` call sites
+        # (cli/fix.py) must keep working unchanged.
+        assert isinstance(excinfo.value, ValueError)
+        message = str(excinfo.value)
+        assert str(bad) in message
+        assert "update-registry" in message
+        assert excinfo.value.path == bad
+
+    def test_duplicate_name_raises_registry_load_error(self, tmp_path: Path) -> None:
+        from mcp_audit.registry.loader import RegistryLoadError  # noqa: PLC0415
+
+        p = tmp_path / "dup-cache.json"
+        p.write_text(json.dumps(_duplicate_name_registry_payload()), encoding="utf-8")
+
+        with pytest.raises(RegistryLoadError) as excinfo:
+            KnownServerRegistry(path=p)
+
+        message = str(excinfo.value)
+        assert str(p) in message, "message must name the cache file, not just the entry"
+        assert "dup-server" in message
+        assert "update-registry" in message
+
+    def test_invalid_entry_data_raises_registry_load_error(
+        self, tmp_path: Path
+    ) -> None:
+        """A schema-invalid entry (missing a required field) is also caught."""
+        from mcp_audit.registry.loader import RegistryLoadError  # noqa: PLC0415
+
+        p = tmp_path / "invalid-entry.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "last_updated": "2026-09-08",
+                    "entry_count": 1,
+                    # Missing every required field (name, source, ...).
+                    "entries": [{"tags": ["local"]}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RegistryLoadError) as excinfo:
+            KnownServerRegistry(path=p)
+
+        assert str(p) in str(excinfo.value)
+
+
+# ── R45: update-registry validates before caching (STEP 3) ────────────────────
+
+
+class TestUpdateRegistryRefusesBadDataAtCacheTime:
+    """update-registry must refuse to write a registry the loader would later
+    reject — reusing KnownServerRegistry._build_name_index and RegistryEntry
+    directly (not a second copy of either rule)."""
+
+    def _invoke_update_registry(self, tmp_path: Path, payload: dict):  # noqa: ANN201
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        cache_path = tmp_path / "registry" / "known-servers.json"
+        fake_bytes = json.dumps(payload).encode()
+
+        runner = CliRunner()
+        with (
+            patch("mcp_audit.cli._REGISTRY_CACHE_PATH", cache_path),
+            patch("urllib.request.urlopen") as mock_urlopen,
+        ):
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = fake_bytes
+            mock_urlopen.return_value = mock_resp
+
+            result = runner.invoke(app, ["update-registry"])
+        return result, cache_path
+
+    def test_duplicate_name_payload_refused_before_write(self, tmp_path: Path) -> None:
+        result, cache_path = self._invoke_update_registry(
+            tmp_path, _duplicate_name_registry_payload()
+        )
+
+        assert result.exit_code == 2, result.output
+        assert "dup-server" in result.output
+        assert not cache_path.exists(), (
+            "a registry that cannot be loaded must never reach the cache — "
+            f"but {cache_path} was written anyway"
+        )
+
+    def test_invalid_entry_payload_refused_before_write(self, tmp_path: Path) -> None:
+        payload = {
+            "schema_version": "1.0",
+            "last_updated": "2026-09-08",
+            "entry_count": 1,
+            "entries": [{"tags": ["local"]}],  # missing every required field
+        }
+        result, cache_path = self._invoke_update_registry(tmp_path, payload)
+
+        assert result.exit_code == 2, result.output
+        assert not cache_path.exists()
+
+    def test_valid_payload_still_writes_cache(self, tmp_path: Path) -> None:
+        """Sanity check: a clean payload is unaffected by the new validation."""
+        payload = {
+            "schema_version": "1.0",
+            "last_updated": "2026-09-08",
+            "entry_count": 1,
+            "entries": [
+                {
+                    "name": "clean-server",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "test",
+                    "verified": False,
+                    "last_verified": "2026-09-08",
+                    "known_versions": ["1.0.0"],
+                    "tags": [],
+                }
+            ],
+        }
+        result, cache_path = self._invoke_update_registry(tmp_path, payload)
+
+        assert result.exit_code == 0, result.output
+        assert cache_path.exists()
+        assert "Registry updated" in unwrapped(result.output)
+        # Cached bytes are the fetched JSON verbatim.
+        assert json.loads(cache_path.read_text(encoding="utf-8")) == payload
+
+
+# ── R45: update-registry writes the cache atomically (STEP 2) ─────────────────
+
+
+class TestWriteRegistryCacheAtomic:
+    """_write_registry_cache_atomic must never leave a half-written file at
+    the destination path, and must set 0o600 on the temp file itself (never
+    via a chmod after the rename, which would briefly leave it more
+    permissive)."""
+
+    def test_writes_full_content(self, tmp_path: Path) -> None:
+        from mcp_audit.cli.registry import _write_registry_cache_atomic  # noqa: PLC0415
+
+        dest = tmp_path / "registry" / "known-servers.json"
+        content = json.dumps({"schema_version": "1.0", "entries": []})
+
+        _write_registry_cache_atomic(dest, content)
+
+        assert dest.read_text(encoding="utf-8") == content
+        # No leftover temp file.
+        assert not dest.with_name(dest.name + ".tmp").exists()
+
+    @_windows_skip
+    def test_writes_mode_0600(self, tmp_path: Path) -> None:
+        from mcp_audit.cli.registry import _write_registry_cache_atomic  # noqa: PLC0415
+
+        dest = tmp_path / "registry" / "known-servers.json"
+        _write_registry_cache_atomic(dest, "{}")
+
+        assert (dest.stat().st_mode & 0o777) == 0o600
+
+    def test_no_chmod_after_rename(self, tmp_path: Path) -> None:
+        """Mode must come from os.open's own mode argument, not a later chmod."""
+        from mcp_audit.cli.registry import _write_registry_cache_atomic  # noqa: PLC0415
+
+        dest = tmp_path / "registry" / "known-servers.json"
+        with patch("os.chmod") as mock_chmod:
+            _write_registry_cache_atomic(dest, "{}")
+        mock_chmod.assert_not_called()
+
+    def test_interrupted_write_leaves_old_cache_untouched(self, tmp_path: Path) -> None:
+        """An interrupt after the temp file is created but before the atomic
+        replace must leave the ORIGINAL destination file completely
+        unchanged — never a half-written destination.
+
+        This is the exact failure this PR fixes: the previous implementation
+        opened the destination directly with O_TRUNC and wrote into it in
+        place, so an interrupt here used to leave a truncated file at
+        ``dest`` itself.
+        """
+        from mcp_audit.cli.registry import _write_registry_cache_atomic  # noqa: PLC0415
+
+        dest = tmp_path / "registry" / "known-servers.json"
+        dest.parent.mkdir(parents=True)
+        original_content = '{"schema_version": "1.0", "entries": ["ORIGINAL"]}'
+        dest.write_text(original_content, encoding="utf-8")
+
+        # Simulate an interrupt (e.g. Ctrl-C, disk full) that fires after the
+        # temp file has been written to but before the atomic replace.
+        with (
+            patch("os.fsync", side_effect=OSError("simulated interrupt")),
+            pytest.raises(OSError, match="simulated interrupt"),
+        ):
+            _write_registry_cache_atomic(
+                dest, '{"schema_version": "1.0", "entries": ["NEW"]}'
+            )
+
+        # The destination must be either fully the old content or fully the
+        # new content — here, since the replace never ran, it must be the
+        # untouched original. It must never be empty, truncated, or a mix.
+        assert dest.read_text(encoding="utf-8") == original_content, (
+            "an interrupted write must never mutate the destination file — "
+            "the old cache must survive intact"
+        )
+        # The temp file is cleaned up rather than left behind.
+        assert not dest.with_name(dest.name + ".tmp").exists()
+
+    def test_interrupted_write_when_no_old_cache_leaves_no_partial_file(
+        self, tmp_path: Path
+    ) -> None:
+        """Same interrupt, but for a first-ever `update-registry` run (no
+        pre-existing cache) — must leave no file at all, never a partial one.
+        """
+        from mcp_audit.cli.registry import _write_registry_cache_atomic  # noqa: PLC0415
+
+        dest = tmp_path / "registry" / "known-servers.json"
+
+        with (
+            patch("os.fsync", side_effect=OSError("simulated interrupt")),
+            pytest.raises(OSError, match="simulated interrupt"),
+        ):
+            _write_registry_cache_atomic(
+                dest, '{"schema_version": "1.0", "entries": []}'
+            )
+
+        assert not dest.exists(), "no partial file may appear at the destination"
+        assert not dest.with_name(dest.name + ".tmp").exists()
+
+    def test_update_registry_reports_clean_error_on_write_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A write failure (e.g. disk full) surfaces as a clean exit 2, not a
+        traceback, from the update-registry command itself."""
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        cache_path = tmp_path / "registry" / "known-servers.json"
+        payload = {
+            "schema_version": "1.0",
+            "last_updated": "2026-09-08",
+            "entry_count": 1,
+            "entries": [
+                {
+                    "name": "clean-server",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "test",
+                    "verified": False,
+                    "last_verified": "2026-09-08",
+                    "known_versions": ["1.0.0"],
+                    "tags": [],
+                }
+            ],
+        }
+
+        runner = CliRunner()
+        with (
+            patch("mcp_audit.cli._REGISTRY_CACHE_PATH", cache_path),
+            patch("urllib.request.urlopen") as mock_urlopen,
+            patch("os.fsync", side_effect=OSError("disk full")),
+        ):
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = json.dumps(payload).encode()
+            mock_urlopen.return_value = mock_resp
+
+            result = runner.invoke(app, ["update-registry"])
+
+        assert result.exit_code == 2, result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "disk full" in unwrapped(result.output)
+
+
+# ── R45: scan/vet/shadow/fix/check never traceback on a corrupt cache ─────────
+
+
+def _write_corrupt_registry_fixtures(tmp_path: Path) -> dict[str, Path]:
+    """Write both corruption shapes STEP 1 reproduced by hand and return their
+    paths keyed by a short label."""
+    dup = tmp_path / "dup-cache.json"
+    dup.write_text(json.dumps(_duplicate_name_registry_payload()), encoding="utf-8")
+
+    truncated = tmp_path / "truncated-cache.json"
+    # A truncated write: valid path, syntactically invalid JSON, cut off
+    # mid-object — simulates an interrupted write of a real registry file.
+    truncated.write_text(
+        json.dumps(_duplicate_name_registry_payload())[:80], encoding="utf-8"
+    )
+    return {"duplicate_name": dup, "truncated": truncated}
+
+
+class TestCorruptRegistryCacheGivesCleanExit:
+    """R45: scan, vet, shadow, fix, and check must never traceback on a
+    corrupt registry cache.
+
+    Before this PR: scan, vet, and shadow had no try/except at all around
+    registry construction. Reproduced by hand against a real
+    ``~/.config/mcp-audit`` cache (see the R45 PR description for the full
+    before/after matrices): both a duplicate-name cache and a truncated
+    (invalid-JSON) cache made all three exit 1 with the raw ``ValueError``
+    propagating uncaught — confirmed in-process below too, by running this
+    exact assertion against the pre-fix source (``result.exception`` was the
+    bare ``ValueError``, not a clean ``SystemExit(2)``).
+
+    fix and check already caught the exception broadly (an accident of an
+    existing ``except ValueError`` / ``except Exception``, not a deliberate
+    design for this case), so they already exited 2 — but the duplicate-name
+    message never named the cache file, only the conflicting entry names.
+    All five now get the identical, path-naming, recovery-hinting message
+    via ``RegistryLoadError``.
+    """
+
+    @pytest.fixture()
+    def minimal_config(self, tmp_path: Path) -> Path:
+        config = tmp_path / "claude_desktop_config.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "filesystem": {
+                            "command": "npx",
+                            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config
+
+    @pytest.fixture()
+    def corrupt_caches(self, tmp_path: Path) -> dict[str, Path]:
+        return _write_corrupt_registry_fixtures(tmp_path)
+
+    @pytest.mark.parametrize("cache_label", ["duplicate_name", "truncated"])
+    @pytest.mark.parametrize(
+        ("command_name", "args_builder"),
+        [
+            ("scan", lambda cfg: ["scan", "--path", str(cfg)]),
+            (
+                "vet",
+                lambda cfg: ["vet", "@modelcontextprotocol/server-filesystem"],
+            ),
+            ("shadow", lambda cfg: ["shadow", "--path", str(cfg)]),
+            ("fix", lambda cfg: ["fix", "--path", str(cfg)]),
+            ("check", lambda cfg: ["check", "--path", str(cfg)]),
+        ],
+    )
+    def test_command_exits_clean_not_traceback(
+        self,
+        command_name: str,
+        args_builder,
+        cache_label: str,
+        corrupt_caches: dict[str, Path],
+        minimal_config: Path,
+    ) -> None:
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        import mcp_audit.registry.loader as loader_mod  # noqa: PLC0415
+        from mcp_audit.cli import app  # noqa: PLC0415
+
+        cache_path = corrupt_caches[cache_label]
+        args = args_builder(minimal_config)
+
+        runner = CliRunner()
+        with (
+            patch.object(loader_mod, "_USER_CACHE_PATH", cache_path),
+            patch("mcp_audit.discovery._get_client_specs", return_value=[]),
+        ):
+            result = runner.invoke(app, args)
+
+        assert result.exit_code == 2, (
+            f"`mcp-audit {command_name}` should exit 2 on a {cache_label} "
+            f"registry cache, got {result.exit_code}. Output:\n{result.output}"
+        )
+        assert not isinstance(result.exception, ValueError), (
+            f"`mcp-audit {command_name}` let a raw {type(result.exception).__name__} "
+            "escape instead of converting it to a clean exit — this is the "
+            "traceback this PR fixes."
+        )
+        # Compare against the output with newlines stripped: Rich soft-wraps
+        # long lines (the full tmp_path is long in a pytest tmp dir), which
+        # can split the path itself across a line break with no inserted
+        # characters — stripping "\n" reconstructs the original text exactly.
+        flat_output = result.output.replace("\n", "")
+        assert cache_path.name in flat_output, (
+            f"`mcp-audit {command_name}`'s error message must name the "
+            f"corrupt cache file. Output:\n{result.output}"
+        )
+        assert str(cache_path.parent) in flat_output, (
+            f"`mcp-audit {command_name}`'s error message must name the full "
+            f"corrupt cache path. Output:\n{result.output}"
+        )
+        assert "update-registry" in flat_output, (
+            f"`mcp-audit {command_name}`'s error message must say how to "
+            f"recover. Output:\n{result.output}"
+        )

@@ -1,0 +1,127 @@
+"""The smoke-test watcher step must not leak a long-running watch process.
+
+R15's local smoke run was killed after Check 9/10 and attributed to a watcher
+hang. Reproduction showed ``step_watcher_round_trip`` returning OK while
+``uv run`` / PyInstaller-parent ``Popen.kill()`` left ``mcp-audit watch``
+children alive. Those orphans keep watching CWD and can stall later steps.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+SMOKE_PATH = ROOT / "scripts" / "smoke_test.py"
+
+
+def _load_smoke() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("mcp_audit_smoke_test", SMOKE_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _watch_pids() -> set[int]:
+    ps = shutil.which("ps")
+    if ps is None:
+        return set()
+    result = subprocess.run(  # noqa: S603
+        [ps, "-ax", "-o", "pid=,command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pids: set[int] = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if "mcp-audit watch --path" not in line:
+            continue
+        pid_s, _, _rest = line.partition(" ")
+        if pid_s.isdigit():
+            pids.add(int(pid_s))
+    return pids
+
+
+def test_kill_process_tree_reaps_grandchild() -> None:
+    """A child-of-child must die with the process group, not only the parent."""
+    if shutil.which("pgrep") is None:
+        pytest.skip("pgrep not available to assert grandchild pid")
+    smoke = _load_smoke()
+    proc = smoke._grouped_popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "time.sleep(60)\n",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        pgrep = shutil.which("pgrep")
+        assert pgrep is not None
+        # Poll rather than sleep a fixed 0.4 s: on a loaded macOS runner the
+        # child interpreter can take longer than that to start and spawn the
+        # grandchild (seen on PR #155's CI, 2026-10-13).
+        grand_pids: list[int] = []
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            assert proc.poll() is None, "precondition: parent still running"
+            kids = subprocess.run(  # noqa: S603
+                [pgrep, "-P", str(proc.pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            grand_pids = [int(x) for x in kids.stdout.split() if x.strip().isdigit()]
+            if grand_pids:
+                break
+            time.sleep(0.1)
+        assert grand_pids, "precondition: grandchild must exist before kill"
+
+        smoke._kill_process_tree(proc)
+        assert proc.poll() is not None
+        # _kill_process_tree waits for proc, but nothing here waits for the
+        # grandchild: init/launchd reaps it, and until then os.kill(pid, 0)
+        # still succeeds. Poll instead of a fixed 0.3 s, the same race as
+        # the spawn wait above in the other direction.
+        still_alive = list(grand_pids)
+        deadline = time.monotonic() + 10.0
+        while still_alive and time.monotonic() < deadline:
+            time.sleep(0.1)
+            alive = []
+            for gp in still_alive:
+                try:
+                    os.kill(gp, 0)
+                    alive.append(gp)
+                except OSError:
+                    pass
+            still_alive = alive
+        assert not still_alive, f"grandchild(s) survived killpg: {still_alive}"
+    finally:
+        smoke._kill_process_tree(proc)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("ps") is None,
+    reason="ps process listing",
+)
+def test_watcher_round_trip_does_not_leak_watch_process() -> None:
+    smoke = _load_smoke()
+    before = _watch_pids()
+    assert smoke.step_watcher_round_trip(["uv", "run", "mcp-audit"]) is True
+    time.sleep(0.5)
+    leaked = _watch_pids() - before
+    assert not leaked, f"watch process leaked after smoke step: {leaked}"

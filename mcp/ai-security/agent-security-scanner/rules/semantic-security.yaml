@@ -1,0 +1,679 @@
+# Semantic Security Rules
+# Requires Code Property Graph (CPG) analysis via semantic-analyzer.js
+# Detects logic-level vulnerabilities that AST+regex miss
+
+- id: semantic.unreachable-code
+  languages: [javascript, typescript, python, java, go, php, ruby, c, cpp, csharp, rust]
+  severity: WARNING
+  message: "Unreachable code detected - this code will never execute"
+  metadata:
+    category: dead-code
+    cwe: "CWE-561"
+    owasp: "A06:2021 - Vulnerable and Outdated Components"
+    confidence: high
+    impact: low
+    description: "Code that can never be executed wastes resources and may indicate logic errors"
+    remediation: "Remove unreachable code or fix the control flow"
+
+- id: semantic.missing-auth-check
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: ERROR
+  message: "Sensitive operation executed without authentication check"
+  metadata:
+    category: auth-bypass
+    cwe: "CWE-306"
+    owasp: "A07:2021 - Identification and Authentication Failures"
+    confidence: medium
+    impact: critical
+    description: "Sensitive operations (database writes, file access, command execution) must be protected by authentication checks"
+    remediation: "Add authentication/authorization check before sensitive operation"
+
+- id: semantic.missing-authz-check
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: ERROR
+  message: "Data access without authorization check - potential IDOR vulnerability"
+  metadata:
+    category: auth-bypass
+    cwe: "CWE-639"
+    owasp: "A01:2021 - Broken Access Control"
+    confidence: medium
+    impact: critical
+    description: "Direct object references (accessing resources by ID) without ownership verification enables IDOR attacks"
+    remediation: "Verify user owns/has access to the resource before returning it"
+
+- id: semantic.race-condition
+  languages: [javascript, typescript, python, java, go, c, cpp, csharp, rust]
+  severity: WARNING
+  message: "Potential race condition - concurrent access without synchronization"
+  metadata:
+    category: concurrency
+    cwe: "CWE-362"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: low
+    impact: medium
+    description: "Shared state accessed from multiple execution paths without proper locking can lead to race conditions"
+    remediation: "Use locks, mutexes, or atomic operations to protect shared state"
+
+- id: semantic.toctou
+  languages: [javascript, typescript, python, java, go, c, cpp, ruby, php]
+  severity: ERROR
+  message: "TOCTOU vulnerability - file state may change between check and use"
+  metadata:
+    category: race-condition
+    cwe: "CWE-367"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: medium
+    impact: high
+    description: "Time-of-check-time-of-use: file/resource state checked then used, allowing attacker to modify state between operations"
+    remediation: "Use atomic operations or file descriptors instead of check-then-use"
+
+- id: semantic.logic-contradiction
+  languages: [javascript, typescript, python, java, go, php, ruby, c, cpp, csharp, rust]
+  severity: WARNING
+  message: "Logic contradiction detected - condition conflicts with earlier condition"
+  metadata:
+    category: logic-error
+    cwe: "CWE-570"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: high
+    impact: low
+    description: "Contradictory conditions indicate logic errors and create unreachable code paths"
+    remediation: "Review and fix the logic flow"
+
+- id: semantic.use-after-free
+  languages: [c, cpp, rust]
+  severity: ERROR
+  message: "Use-after-free detected - variable used after being freed"
+  metadata:
+    category: memory-safety
+    cwe: "CWE-416"
+    owasp: "A06:2021 - Vulnerable and Outdated Components"
+    confidence: high
+    impact: critical
+    description: "Using memory after it has been freed can lead to crashes or arbitrary code execution"
+    remediation: "Set pointer to NULL after free, or use smart pointers (C++ unique_ptr/shared_ptr)"
+
+- id: semantic.double-free
+  languages: [c, cpp]
+  severity: ERROR
+  message: "Double free detected - memory freed twice"
+  metadata:
+    category: memory-safety
+    cwe: "CWE-415"
+    owasp: "A06:2021 - Vulnerable and Outdated Components"
+    confidence: high
+    impact: critical
+    description: "Freeing the same memory twice can corrupt memory allocator state and enable exploits"
+    remediation: "Set pointer to NULL after free to prevent double-free"
+
+- id: semantic.null-dereference
+  languages: [javascript, typescript, python, java, go, c, cpp, csharp, rust]
+  severity: WARNING
+  message: "Potential null pointer dereference"
+  metadata:
+    category: null-safety
+    cwe: "CWE-476"
+    owasp: "A06:2021 - Vulnerable and Outdated Components"
+    confidence: low
+    impact: medium
+    description: "Dereferencing a null pointer causes crashes or unpredictable behavior"
+    remediation: "Add null check before dereference"
+
+- id: semantic.dead-store
+  languages: [javascript, typescript, python, java, go, php, ruby, c, cpp, csharp, rust]
+  severity: INFO
+  message: "Dead store - assignment to variable never used"
+  metadata:
+    category: optimization
+    cwe: "CWE-563"
+    owasp: "A06:2021 - Vulnerable and Outdated Components"
+    confidence: high
+    impact: negligible
+    description: "Assignments that are never used waste resources and may indicate incomplete code"
+    remediation: "Remove the unused assignment or use the variable"
+
+- id: semantic.infinite-loop
+  languages: [javascript, typescript, python, java, go, php, ruby, c, cpp, csharp, rust]
+  severity: ERROR
+  message: "Infinite loop detected - loop has no exit condition"
+  metadata:
+    category: denial-of-service
+    cwe: "CWE-835"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: medium
+    impact: high
+    description: "Loops without exit conditions cause hangs and resource exhaustion"
+    remediation: "Add break condition, timeout, or iteration limit"
+
+- id: semantic.missing-null-check
+  languages: [javascript, typescript, python, java, go, c, cpp, csharp]
+  severity: WARNING
+  message: "Missing null check before dereference"
+  metadata:
+    category: null-safety
+    cwe: "CWE-476"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: medium
+    impact: medium
+    description: "Variables that can be null must be checked before access"
+    remediation: "Add null/undefined check before using variable"
+
+- id: semantic.missing-bounds-check
+  languages: [javascript, typescript, python, java, go, c, cpp, csharp, rust]
+  severity: ERROR
+  message: "Missing array bounds check - potential buffer overflow"
+  metadata:
+    category: buffer-overflow
+    cwe: "CWE-119"
+    owasp: "A03:2021 - Injection"
+    confidence: medium
+    impact: critical
+    description: "Array access without bounds checking can lead to buffer overflows"
+    remediation: "Validate array index is within bounds before access"
+
+- id: semantic.unvalidated-redirect
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: ERROR
+  message: "Unvalidated redirect - redirect destination not validated"
+  metadata:
+    category: redirect
+    cwe: "CWE-601"
+    owasp: "A01:2021 - Broken Access Control"
+    confidence: high
+    impact: medium
+    description: "Redirecting to user-controlled URLs without validation enables phishing attacks"
+    remediation: "Whitelist allowed redirect destinations or validate URL"
+
+- id: semantic.path-traversal
+  languages: [javascript, typescript, python, java, go, php, ruby, c, cpp]
+  severity: ERROR
+  message: "Path traversal vulnerability - user input used in file path without validation"
+  metadata:
+    category: path-traversal
+    cwe: "CWE-22"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: critical
+    description: "User-controlled file paths without validation allow reading arbitrary files"
+    remediation: "Use path.basename() or validate path is within allowed directory"
+
+- id: semantic.ssrf
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: ERROR
+  message: "SSRF vulnerability - user input used in HTTP request without validation"
+  metadata:
+    category: ssrf
+    cwe: "CWE-918"
+    owasp: "A10:2021 - Server-Side Request Forgery"
+    confidence: high
+    impact: critical
+    description: "User-controlled URLs in HTTP requests allow attackers to probe internal networks"
+    remediation: "Whitelist allowed domains/IPs or validate URL scheme and host"
+
+- id: semantic.xxe
+  languages: [java, csharp, php, python]
+  severity: ERROR
+  message: "XXE vulnerability - XML parsing without disabling external entities"
+  metadata:
+    category: xxe
+    cwe: "CWE-611"
+    owasp: "A05:2021 - Security Misconfiguration"
+    confidence: high
+    impact: critical
+    description: "XML External Entity attacks allow reading files and SSRF"
+    remediation: "Disable external entity processing in XML parser"
+
+- id: semantic.ldap-injection
+  languages: [java, python, csharp, php]
+  severity: ERROR
+  message: "LDAP injection - user input in LDAP query without sanitization"
+  metadata:
+    category: injection
+    cwe: "CWE-90"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: high
+    description: "User input in LDAP queries without sanitization allows LDAP injection"
+    remediation: "Use parameterized LDAP queries or escape special characters"
+
+- id: semantic.xpath-injection
+  languages: [java, python, csharp, php, javascript]
+  severity: ERROR
+  message: "XPath injection - user input in XPath query without sanitization"
+  metadata:
+    category: injection
+    cwe: "CWE-643"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: high
+    description: "User input in XPath queries without sanitization allows data extraction"
+    remediation: "Use parameterized XPath or escape special characters"
+
+- id: semantic.os-command-injection
+  languages: [javascript, typescript, python, java, go, php, ruby, c, cpp]
+  severity: ERROR
+  message: "Command injection - user input in shell command without sanitization"
+  metadata:
+    category: command-injection
+    cwe: "CWE-78"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: critical
+    description: "User input in shell commands without sanitization allows arbitrary command execution"
+    remediation: "Use safe APIs (execFile not exec) or validate/escape input"
+
+- id: semantic.insecure-deserialization
+  languages: [java, python, php, ruby, csharp]
+  severity: ERROR
+  message: "Insecure deserialization - deserializing untrusted data"
+  metadata:
+    category: deserialization
+    cwe: "CWE-502"
+    owasp: "A08:2021 - Software and Data Integrity Failures"
+    confidence: high
+    impact: critical
+    description: "Deserializing untrusted data can lead to remote code execution"
+    remediation: "Validate data before deserialization or use safe formats (JSON)"
+
+- id: semantic.weak-random
+  languages: [javascript, typescript, python, java, go, c, cpp, csharp]
+  severity: WARNING
+  message: "Weak random number generator used for security-sensitive operation"
+  metadata:
+    category: crypto
+    cwe: "CWE-338"
+    owasp: "A02:2021 - Cryptographic Failures"
+    confidence: high
+    impact: medium
+    description: "Non-cryptographic RNGs are predictable and unsuitable for security"
+    remediation: "Use cryptographic RNG (crypto.randomBytes, secrets module)"
+
+- id: semantic.hardcoded-secret
+  languages: [javascript, typescript, python, java, go, php, ruby, c, cpp, csharp]
+  severity: ERROR
+  message: "Hardcoded secret detected in source code"
+  metadata:
+    category: secrets
+    cwe: "CWE-798"
+    owasp: "A07:2021 - Identification and Authentication Failures"
+    confidence: high
+    impact: critical
+    description: "Secrets in source code are visible to anyone with repository access"
+    remediation: "Use environment variables or secret management services"
+
+- id: semantic.weak-crypto-algorithm
+  languages: [javascript, typescript, python, java, go, c, cpp, csharp]
+  severity: ERROR
+  message: "Weak cryptographic algorithm used (MD5, SHA1, DES)"
+  metadata:
+    category: crypto
+    cwe: "CWE-327"
+    owasp: "A02:2021 - Cryptographic Failures"
+    confidence: high
+    impact: high
+    description: "Weak algorithms are vulnerable to collision and brute-force attacks"
+    remediation: "Use SHA-256, SHA-3, or bcrypt/scrypt/argon2 for hashing"
+
+- id: semantic.missing-csrf-protection
+  languages: [javascript, typescript, python, java, php, ruby, csharp]
+  severity: ERROR
+  message: "State-changing operation without CSRF protection"
+  metadata:
+    category: csrf
+    cwe: "CWE-352"
+    owasp: "A01:2021 - Broken Access Control"
+    confidence: medium
+    impact: high
+    description: "POST/PUT/DELETE without CSRF tokens allow attackers to perform actions as victim"
+    remediation: "Add CSRF token validation or use SameSite cookies"
+
+- id: semantic.missing-rate-limiting
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: WARNING
+  message: "Sensitive endpoint without rate limiting"
+  metadata:
+    category: denial-of-service
+    cwe: "CWE-770"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: low
+    impact: medium
+    description: "Endpoints without rate limiting are vulnerable to brute-force and DoS attacks"
+    remediation: "Add rate limiting middleware (express-rate-limit, flask-limiter)"
+
+- id: semantic.missing-input-validation
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: WARNING
+  message: "User input used without validation"
+  metadata:
+    category: input-validation
+    cwe: "CWE-20"
+    owasp: "A03:2021 - Injection"
+    confidence: low
+    impact: medium
+    description: "All user input must be validated before use"
+    remediation: "Add validation (joi, validator, zod) or sanitization"
+
+- id: semantic.missing-output-encoding
+  languages: [javascript, typescript, python, java, php, ruby]
+  severity: ERROR
+  message: "User input rendered without encoding - XSS vulnerability"
+  metadata:
+    category: xss
+    cwe: "CWE-79"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: high
+    description: "User-controlled data in HTML output without encoding enables XSS attacks"
+    remediation: "Use template engines with auto-escaping or escape manually"
+
+- id: semantic.insecure-cookie
+  languages: [javascript, typescript, python, java, php, ruby, csharp]
+  severity: WARNING
+  message: "Cookie set without Secure/HttpOnly/SameSite flags"
+  metadata:
+    category: session
+    cwe: "CWE-614"
+    owasp: "A05:2021 - Security Misconfiguration"
+    confidence: high
+    impact: medium
+    description: "Cookies without security flags are vulnerable to interception and CSRF"
+    remediation: "Set Secure, HttpOnly, and SameSite=Strict flags"
+
+- id: semantic.sql-injection
+  languages: [javascript, typescript, python, java, php, ruby, go, csharp]
+  severity: ERROR
+  message: "SQL injection - user input in SQL query without parameterization"
+  metadata:
+    category: sql-injection
+    cwe: "CWE-89"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: critical
+    description: "User input in SQL queries without parameterization allows data theft and manipulation"
+    remediation: "Use parameterized queries or ORM methods"
+
+- id: semantic.nosql-injection
+  languages: [javascript, typescript, python, java, php, ruby]
+  severity: ERROR
+  message: "NoSQL injection - user input in database query without sanitization"
+  metadata:
+    category: nosql-injection
+    cwe: "CWE-943"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: high
+    description: "User input in NoSQL queries without sanitization allows unauthorized data access"
+    remediation: "Validate/sanitize input or use safe query builders"
+
+- id: semantic.prototype-pollution
+  languages: [javascript, typescript]
+  severity: ERROR
+  message: "Prototype pollution vulnerability - user input modifies object prototype"
+  metadata:
+    category: prototype-pollution
+    cwe: "CWE-1321"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: high
+    description: "Modifying Object.prototype allows attackers to inject properties into all objects"
+    remediation: "Use Map instead of objects, or Object.create(null)"
+
+- id: semantic.regex-dos
+  languages: [javascript, typescript, python, java, go, php, ruby]
+  severity: WARNING
+  message: "ReDoS vulnerability - regex with exponential backtracking"
+  metadata:
+    category: denial-of-service
+    cwe: "CWE-1333"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: medium
+    impact: medium
+    description: "Complex regexes with nested quantifiers cause exponential processing time"
+    remediation: "Simplify regex or add timeout"
+
+- id: semantic.xml-bomb
+  languages: [java, python, csharp, php]
+  severity: ERROR
+  message: "XML bomb vulnerability - entity expansion without limits"
+  metadata:
+    category: denial-of-service
+    cwe: "CWE-776"
+    owasp: "A05:2021 - Security Misconfiguration"
+    confidence: high
+    impact: high
+    description: "Unlimited entity expansion can exhaust memory and CPU"
+    remediation: "Limit entity expansion or disable entity processing"
+
+- id: semantic.open-redirect-via-referer
+  languages: [javascript, typescript, python, java, php, ruby]
+  severity: WARNING
+  message: "Open redirect via Referer header - untrusted header used for redirect"
+  metadata:
+    category: redirect
+    cwe: "CWE-601"
+    owasp: "A01:2021 - Broken Access Control"
+    confidence: medium
+    impact: medium
+    description: "Referer header is user-controlled and should not be trusted for redirects"
+    remediation: "Whitelist allowed redirect URLs or use signed tokens"
+
+- id: semantic.server-side-template-injection
+  languages: [python, java, php, ruby, javascript]
+  severity: ERROR
+  message: "Server-side template injection - user input in template without escaping"
+  metadata:
+    category: injection
+    cwe: "CWE-94"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: critical
+    description: "User input in templates without escaping allows code execution"
+    remediation: "Use safe template rendering or escape user input"
+
+- id: semantic.jwt-none-algorithm
+  languages: [javascript, typescript, python, java, php, ruby]
+  severity: ERROR
+  message: "JWT 'none' algorithm accepted - signature verification bypassed"
+  metadata:
+    category: crypto
+    cwe: "CWE-347"
+    owasp: "A02:2021 - Cryptographic Failures"
+    confidence: high
+    impact: critical
+    description: "Accepting 'none' algorithm allows attackers to forge JWTs"
+    remediation: "Explicitly reject 'none' algorithm or use algorithm whitelist"
+
+- id: semantic.missing-encryption-at-rest
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: WARNING
+  message: "Sensitive data stored without encryption"
+  metadata:
+    category: crypto
+    cwe: "CWE-311"
+    owasp: "A02:2021 - Cryptographic Failures"
+    confidence: low
+    impact: high
+    description: "Sensitive data (passwords, tokens, PII) must be encrypted at rest"
+    remediation: "Encrypt sensitive data before storage"
+
+- id: semantic.missing-encryption-in-transit
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: ERROR
+  message: "Sensitive data transmitted without encryption"
+  metadata:
+    category: crypto
+    cwe: "CWE-319"
+    owasp: "A02:2021 - Cryptographic Failures"
+    confidence: medium
+    impact: critical
+    description: "Unencrypted transmission of sensitive data allows interception"
+    remediation: "Use HTTPS/TLS for all sensitive data transmission"
+
+- id: semantic.insufficient-logging
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: WARNING
+  message: "Security-sensitive operation without logging"
+  metadata:
+    category: logging
+    cwe: "CWE-778"
+    owasp: "A09:2021 - Security Logging and Monitoring Failures"
+    confidence: low
+    impact: low
+    description: "Failed auth, access violations, and privilege changes should be logged"
+    remediation: "Add security event logging"
+
+- id: semantic.sensitive-data-in-logs
+  languages: [javascript, typescript, python, java, go, php, ruby, csharp]
+  severity: WARNING
+  message: "Sensitive data logged - potential information disclosure"
+  metadata:
+    category: logging
+    cwe: "CWE-532"
+    owasp: "A09:2021 - Security Logging and Monitoring Failures"
+    confidence: medium
+    impact: medium
+    description: "Passwords, tokens, and PII should not be logged"
+    remediation: "Redact or omit sensitive data from logs"
+
+- id: semantic.insecure-random-filename
+  languages: [javascript, typescript, python, java, go, php, ruby]
+  severity: WARNING
+  message: "Predictable filename used for temporary/uploaded file"
+  metadata:
+    category: file-upload
+    cwe: "CWE-330"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: medium
+    impact: medium
+    description: "Predictable filenames allow attackers to overwrite files or guess upload locations"
+    remediation: "Use cryptographic random for filenames (crypto.randomUUID, secrets.token_hex)"
+
+- id: semantic.path-injection-via-zip
+  languages: [javascript, typescript, python, java, go, php, ruby]
+  severity: ERROR
+  message: "Zip slip vulnerability - archive extraction without path validation"
+  metadata:
+    category: path-traversal
+    cwe: "CWE-22"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: critical
+    description: "Malicious archives with '../' in filenames can write outside extraction directory"
+    remediation: "Validate extracted paths are within target directory"
+
+- id: semantic.mass-assignment
+  languages: [javascript, typescript, python, ruby, php, java]
+  severity: ERROR
+  message: "Mass assignment vulnerability - user input directly assigned to model"
+  metadata:
+    category: mass-assignment
+    cwe: "CWE-915"
+    owasp: "A01:2021 - Broken Access Control"
+    confidence: high
+    impact: high
+    description: "Allowing users to set all model fields enables privilege escalation"
+    remediation: "Whitelist allowed fields or use explicit assignment"
+
+- id: semantic.session-fixation
+  languages: [javascript, typescript, python, java, php, ruby]
+  severity: ERROR
+  message: "Session fixation vulnerability - session ID not regenerated after login"
+  metadata:
+    category: session
+    cwe: "CWE-384"
+    owasp: "A07:2021 - Identification and Authentication Failures"
+    confidence: high
+    impact: high
+    description: "Reusing session IDs after authentication allows session hijacking"
+    remediation: "Regenerate session ID on login/privilege change"
+
+- id: semantic.insufficient-password-hash-iterations
+  languages: [javascript, typescript, python, java, php, ruby]
+  severity: WARNING
+  message: "Insufficient bcrypt/scrypt work factor - vulnerable to brute force"
+  metadata:
+    category: crypto
+    cwe: "CWE-916"
+    owasp: "A02:2021 - Cryptographic Failures"
+    confidence: high
+    impact: medium
+    description: "Low iteration counts make password hashes vulnerable to brute-force"
+    remediation: "Use bcrypt cost 12+, scrypt N=32768+, or argon2id"
+
+- id: semantic.timing-attack
+  languages: [javascript, typescript, python, java, go, c, cpp]
+  severity: WARNING
+  message: "Timing attack vulnerability - non-constant-time comparison of secrets"
+  metadata:
+    category: crypto
+    cwe: "CWE-208"
+    owasp: "A02:2021 - Cryptographic Failures"
+    confidence: medium
+    impact: medium
+    description: "Variable-time string comparison reveals information about secret values"
+    remediation: "Use constant-time comparison (crypto.timingSafeEqual, secrets.compare_digest)"
+
+- id: semantic.integer-overflow
+  languages: [c, cpp, java, go, rust]
+  severity: ERROR
+  message: "Potential integer overflow in arithmetic operation"
+  metadata:
+    category: integer-overflow
+    cwe: "CWE-190"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: low
+    impact: high
+    description: "Integer overflow can cause unexpected behavior or security vulnerabilities"
+    remediation: "Check for overflow before arithmetic or use safe math libraries"
+
+- id: semantic.buffer-overflow
+  languages: [c, cpp]
+  severity: ERROR
+  message: "Potential buffer overflow - unsafe buffer operation"
+  metadata:
+    category: buffer-overflow
+    cwe: "CWE-120"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: medium
+    impact: critical
+    description: "Buffer overflows allow arbitrary code execution"
+    remediation: "Use safe functions (strncpy not strcpy, snprintf not sprintf)"
+
+- id: semantic.format-string
+  languages: [c, cpp]
+  severity: ERROR
+  message: "Format string vulnerability - user input in format string"
+  metadata:
+    category: format-string
+    cwe: "CWE-134"
+    owasp: "A03:2021 - Injection"
+    confidence: high
+    impact: critical
+    description: "User-controlled format strings allow arbitrary read/write"
+    remediation: "Use static format strings, never pass user input as format"
+
+- id: semantic.unchecked-return-value
+  languages: [c, cpp, go, rust]
+  severity: WARNING
+  message: "Unchecked return value from security-sensitive function"
+  metadata:
+    category: error-handling
+    cwe: "CWE-252"
+    owasp: "A04:2021 - Insecure Design"
+    confidence: medium
+    impact: medium
+    description: "Ignoring error returns from security functions can lead to vulnerabilities"
+    remediation: "Check return values and handle errors appropriately"
+
+- id: semantic.privilege-escalation
+  languages: [c, cpp, python, java, go]
+  severity: ERROR
+  message: "Privilege escalation vulnerability - elevated privileges not dropped"
+  metadata:
+    category: privilege-escalation
+    cwe: "CWE-250"
+    owasp: "A01:2021 - Broken Access Control"
+    confidence: medium
+    impact: critical
+    description: "Running with elevated privileges without dropping them increases attack surface"
+    remediation: "Drop privileges after initialization (setuid, setgid)"

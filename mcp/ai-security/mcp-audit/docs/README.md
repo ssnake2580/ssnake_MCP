@@ -1,0 +1,40 @@
+# mcp-audit Documentation
+
+| File | Description |
+|------|-------------|
+| [docs-usage.md](docs-usage.md) | Getting started, all CLI commands and flags, common workflows |
+| [clients.md](clients.md) | Every supported client: user and project config paths, server keys, and how Codex's TOML and Gemini CLI's settings are read |
+| [github-action.md](github-action.md) | GitHub Action setup, example workflows, exit code behaviour |
+| [ci-workflows.md](ci-workflows.md) | WORKFLOW-001..003: AI agent steps in your GitHub Actions workflows that read stranger-written text with secrets and write access |
+| [building-binaries.md](building-binaries.md) | How the shipped PyInstaller binary is built (one composite, CI and release); per-release CycloneDX SBOMs |
+| [scoring.md](scoring.md) | Scan score methodology, grade thresholds, score/filter interaction |
+| [telemetry.md](telemetry.md) | Privacy policy: what mcp-audit does and does not collect |
+| [baselines.md](baselines.md) | Baseline snapshot workflow, drift detection, commands |
+| [governance.md](governance.md) | Governance policy schema, quickstart, worked examples |
+| [writing-rules.md](writing-rules.md) | Policy-as-code YAML rule format, match types, contributing |
+| [sast-rules.md](sast-rules.md) | Semgrep rule catalog, severity rationale, false positive guidance |
+| [extensions.md](extensions.md) | IDE extension scanner overview, supported clients, analysis layers |
+| [git-exec.md](git-exec.md) | Git can run code: the git config keys, hooks and nested bare repositories `scan`, `check` and `scan --project` flag (TRUST-006/007) |
+| [supply-chain.md](supply-chain.md) | Supply chain attestation, hash verification, contribution guide |
+| [dependency-reachability.md](dependency-reachability.md) | Why Dependabot findings in transitives are unused, and which call-site changes invalidate those dismissals |
+| [permission-rules.md](permission-rules.md) | Claude Code permission rules that don't do what they say (PERM-001..007) and sandbox settings a repository can loosen (SANDBOX-001..005): each rule or key, the vendor-documented reason, the bypass and the fix |
+| [gateways.md](gateways.md) | Servers behind an MCP gateway (mcptoon, 1MCP, MCPHub): where their configs are read from, how upstream servers are reported, and what is not covered |
+| [managed-policy.md](managed-policy.md) | Claude Code managed MCP policy versus the servers you have (MANAGED-001..005): which servers the organization's policy keeps from loading, and allowlists a repository can widen or that trust names |
+| [severity-framework.md](severity-framework.md) | CVSS base scores and OWASP Agentic Top 10 mappings for every finding ID; decision tree for calibrating new findings |
+| [agent-execution-surface.md](agent-execution-surface.md) | Every repository file mcp-audit reads that a coding-agent harness runs or obeys (Gemini CLI, Codex, Claude Code, VS Code), with the finding and vendor source for each |
+| [skill-packages.md](skill-packages.md) | Every file in a Claude Code skill (SKILL-005..008): install steps, what a skill ships into Claude Code, unreadable content, and the measured rate on 1,129 ordinary skills |
+| [registry.md](registry.md) | Known-server registry reference, contributing entries |
+| [registry-contributions.md](registry-contributions.md) | How to submit new registry entries |
+| [research/2026-10-top100-npm/](research/2026-10-top100-npm/README.md) | Scan of the 100 most-downloaded MCP servers on npm (2026-10-22): corpus, aggregate numbers, scripts |
+| [poisoning.md](poisoning.md) | Measured POISON-* recall (MCPTox) and precision (top-100 npm corpus), the measured gate the DELEG-001..003 cross-tool delegation checks passed, how they were measured, and how CI keeps them current |
+| [research/head-to-head/README.md](research/head-to-head/README.md) | Head-to-head scanner benchmark (STORY-0146): method, corpus, how to run SkillSpector, Cisco mcp-scanner and Snyk agent-scan beside mcp-audit, and the current table |
+| [nucleus-integration.md](nucleus-integration.md) | push-nucleus command, FlexConnect API, fleet push examples |
+| [fleet-scanning.md](fleet-scanning.md) | Fleet merge workflow, asset prefix, enterprise deployment |
+| [enterprise-deployment.md](enterprise-deployment.md) | Fleet deployment guide for IT/security teams |
+| [pre-commit.md](pre-commit.md) | Pre-commit hook setup and configuration |
+| [contributing-rules.md](contributing-rules.md) | Community detection rule contribution guide (template, bounty, attribution) |
+| [contributing-sast-rules.md](contributing-sast-rules.md) | Semgrep SAST rule authoring guide |
+| [community-rule-spec.md](community-rule-spec.md) | Community rule YAML format specification (Apache 2.0; ecosystem-adoptable) |
+| [contributors.md](contributors.md) | Attribution list for accepted community contributors |
+| [manual-test-matrix.md](manual-test-matrix.md) | Release-candidate manual validation checklist |
+| [offline-verification-findings.md](offline-verification-findings.md) | Empirical test of cosign's *keyless* verification path with zero network access. Not about the advisory feed, which signs with a static key and is offline by construction — see the scope note at the top |

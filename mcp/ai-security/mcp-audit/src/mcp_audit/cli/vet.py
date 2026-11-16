@@ -1,0 +1,1096 @@
+"""``mcp-audit vet <package>`` — pre-install verdict on a public MCP server package.
+
+Offline by default (zero network calls for a plain ``vet``).  Reports facts
+from the bundled known-server registry: verification status, known CVEs,
+declared capabilities, hash pins.  No letter grades — a package's risk depends
+on your deployment context.
+
+Offline behaviour:
+- Plain ``vet``: reads the bundled or user-cached registry.  No network.
+- ``--online``: fetches a live verdict from ``mcp-audit.dev`` and caches it.
+
+Exit codes:
+- 0: package known and every recorded CVE has a fix (or none recorded), no
+  typosquat; or unknown without ``--strict``
+- 1: a recorded CVE has no fix, **or** typosquat suspicion (edit distance or an
+  unscoped twin, STORY-0097), **or** OSV lists the latest release as malicious
+  (or unknown + ``--strict``)
+
+A package's fixed history does not fail ``vet`` (STORY-0083): ``vet`` takes no
+version, so it answers for the latest release, which a recorded fix covers.
+- 2: invalid / empty package name, network error that cannot fall back, etc.
+
+Supersedes the stale ``lookup`` command on branch ``story/0016-mcp-audit-dev``
+which used a different URL shape and included letter grades.  See
+``docs/decisions/ADR-0003-vet-verdict.md``.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+import typer
+from platformdirs import user_config_dir
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
+from mcp_audit._fs import atomic_write
+from mcp_audit.analyzers.supply_chain import split_credit
+from mcp_audit.cli import app
+from mcp_audit.registry.loader import (
+    KnownServerRegistry,
+    RegistryEntry,
+    RegistryLoadError,
+    levenshtein,
+    load_registry,
+    normalize_pypi_name,
+)
+from mcp_audit.registry.malicious import (
+    KnownMaliciousPackages,
+    MaliciousMatch,
+    assess,
+    load_known_malicious,
+)
+from mcp_audit.registry.twins import Twin, TwinIndex
+from mcp_audit.verdict import (
+    _REGISTRY_CONTRIBUTION_URL,
+    badge_url,
+    build_verdict,
+    malicious_item,
+    name_to_slug,
+    split_package_spec,
+    verdict_page_url,
+    with_pinned_version,
+)
+
+# ── Types ──────────────────────────────────────────────────────────────────────
+
+# Use built-in X | None union syntax (Python 3.10+; project targets 3.11+).
+# Typer option annotations still need Optional[] spelling for Click compat —
+# use the alias below to silence UP007 while keeping Typer happy.
+_StrOpt = str | None
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+_VERDICT_ONLINE_BASE = "https://mcp-audit.dev/v1/verdicts"
+_VERDICT_CACHE_PATH = Path(user_config_dir("mcp-audit")) / "verdict-cache.json"
+
+# Levenshtein threshold mirrors supply_chain.py:
+# short names (≤5 chars) use threshold=1; long names use threshold=3.
+_TYPO_THRESHOLD_SHORT = 1
+_TYPO_THRESHOLD_LONG = 3
+_SHORT_NAME_LIMIT = 5
+
+
+# ── Ecosystem resolution ───────────────────────────────────────────────────────
+
+
+def _detect_ecosystem(name: str) -> str:
+    """Heuristically determine ecosystem from the package name.
+
+    Scoped npm names start with ``@``; all others default to ``"npm"`` and the
+    pypi sub-index is also tried automatically when no ``--ecosystem`` is given.
+
+    Args:
+        name: Raw package name string.
+
+    Returns:
+        ``"npm"`` or ``"pypi"``.
+    """
+    return "npm" if name.startswith("@") else "npm"
+
+
+def _badge_target(name: str, offline_registry: bool) -> tuple[str, str]:
+    """Return ``(ecosystem, name)`` for ``vet <name> --badge`` without ``--ecosystem``.
+
+    The badge used to assume npm for every unscoped name, so a PyPI-only
+    registry entry such as ``mcptoon`` got an npm badge URL that 404s
+    (Q-020).  Registry names are unique across ecosystems (the loader
+    rejects duplicates), so when the name is listed only for PyPI the
+    badge points at PyPI, under the entry's own spelling.  Anything else,
+    including a registry that cannot be loaded, keeps the npm default:
+    the badge is still printed, as before.
+
+    Args:
+        name: Package name exactly as supplied.
+        offline_registry: Use only the bundled registry.
+
+    Returns:
+        The ecosystem and the package name to build the badge URL from.
+    """
+    if name.startswith("@"):
+        return "npm", name
+    try:
+        registry = load_registry(offline=offline_registry)
+    except (FileNotFoundError, RegistryLoadError):
+        return "npm", name
+    if registry.get_npm(name) is None:
+        entry = registry.get_pypi(name)
+        if entry is not None:
+            return "pypi", entry.name
+    return "npm", name
+
+
+def _lookup(
+    name: str,
+    ecosystem: str,
+    registry: KnownServerRegistry,
+) -> RegistryEntry | None:
+    """Look up *name* in the registry for the given *ecosystem*.
+
+    Args:
+        name: Package name exactly as supplied.
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        registry: Loaded registry instance.
+
+    Returns:
+        Matching :class:`~mcp_audit.registry.loader.RegistryEntry` or ``None``.
+    """
+    if ecosystem == "pypi":
+        return registry.get_pypi(name)
+    return registry.get_npm(name)
+
+
+def _typosquat_check(
+    name: str,
+    ecosystem: str,
+    registry: KnownServerRegistry,
+) -> RegistryEntry | None:
+    """Check whether *name* is a close edit-distance match to a known entry.
+
+    Applies the same threshold logic as
+    :class:`~mcp_audit.analyzers.supply_chain.SupplyChainAnalyzer`:
+    threshold=1 for names ≤5 chars, threshold=3 otherwise.
+
+    Args:
+        name: Package name to check.
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        registry: Loaded registry instance.
+
+    Returns:
+        The closest :class:`~mcp_audit.registry.loader.RegistryEntry` when a
+        typosquat candidate is found, else ``None``.
+    """
+    check_name = normalize_pypi_name(name) if ecosystem == "pypi" else name.lower()
+    threshold = (
+        _TYPO_THRESHOLD_SHORT
+        if len(check_name) <= _SHORT_NAME_LIMIT
+        else _TYPO_THRESHOLD_LONG
+    )
+
+    if ecosystem == "pypi":
+        return registry.find_closest_pypi(name, threshold=threshold)
+    return registry.find_closest_npm(name, threshold=threshold)
+
+
+def _twin_check(
+    name: str,
+    ecosystem: str,
+    registry: KnownServerRegistry,
+) -> list[Twin]:
+    """Return the registry entries *name* is an unscoped twin of (SC-007 logic).
+
+    Args:
+        name: Package name to check.
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        registry: Loaded registry instance.
+
+    Returns:
+        Twins, best first; empty when *name* is not a twin.
+    """
+    return TwinIndex(registry).find(name, "pypi" if ecosystem == "pypi" else "npm")
+
+
+def _malicious_matches(
+    name: str,
+    ecosystem: str,
+    registry: KnownServerRegistry,
+    index: KnownMaliciousPackages,
+) -> list[MaliciousMatch]:
+    """Return OSV ``MAL-*`` matches for *name* in *ecosystem* (SC-008 logic).
+
+    ``vet`` takes no version, so every record is assessed for an unpinned
+    install of the latest release.
+
+    Args:
+        name: Package name exactly as supplied.
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        registry: Loaded registry (a listed package gets the blanket-range
+            exception documented in :mod:`mcp_audit.registry.malicious`).
+        index: Loaded known-malicious index.
+
+    Returns:
+        Matches, possibly empty.
+    """
+    eco = "pypi" if ecosystem == "pypi" else "npm"
+    curated = (
+        registry.is_known_pypi(name) if eco == "pypi" else registry.is_known_npm(name)
+    )
+    return [
+        m
+        for m in (assess(r, None, curated=curated) for r in index.lookup(eco, name))
+        if m is not None
+    ]
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Return *value* as a list for rendering remote (``--online``) verdict data.
+
+    A list or tuple is returned as a list; a lone string becomes a one-item
+    list (not its characters); anything else (missing, ``None``, a number,
+    an object) becomes an empty list, so a malformed field degrades to
+    "not shown" instead of a ``TypeError``.
+    """
+    if isinstance(value, list | tuple):
+        return list(value)
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return *value* if it is a dict, else an empty dict (remote verdict data)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _exploit_date_line() -> str:
+    from mcp_audit.exploit import signals  # noqa: PLC0415
+
+    return signals.load().date_line()
+
+
+def _exploit_note(cve: str) -> str:
+    """KEV / EPSS / PoC for *cve* from the bundled data, or an empty string."""
+    from mcp_audit.exploit import signals  # noqa: PLC0415
+
+    sig = signals.load().for_cve(cve) if cve.upper().startswith("CVE-") else None
+    if not sig:
+        return ""
+    bits = []
+    if sig.get("kev"):
+        bits.append(f"on CISA KEV (added {sig.get('kev_added')})")
+    if "epss" in sig:
+        bits.append(f"EPSS {sig['epss'] * 100:.1f}%")
+    if sig.get("public_poc"):
+        bits.append("public PoC linked")
+    return ", ".join(bits)
+
+
+def _vuln_items(verdict: dict[str, Any]) -> list[dict[str, Any]]:
+    """The verdict's ``known_vulnerabilities`` as dicts, for rendering.
+
+    An item that is not an object (possible only in an ``--online`` verdict)
+    becomes ``{}``: it is still counted, and it has no recorded fix, so it
+    keeps the exit code at 1 rather than hiding a vulnerability.
+    """
+    return [_as_dict(v) for v in _as_list(verdict.get("known_vulnerabilities"))]
+
+
+def _with_local_malicious(
+    verdict: dict[str, Any],
+    name: str,
+    ecosystem: str,
+    registry: KnownServerRegistry,
+) -> dict[str, Any]:
+    """Return *verdict* with the bundled known-malicious matches merged in.
+
+    Used for ``--online`` verdicts, which may predate a record or come from a
+    site version without the ``malicious`` field.  Items already present
+    (same ``id``) are kept as the online verdict gives them.
+
+    Args:
+        verdict: The online verdict document.
+        name: The queried package name.
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        registry: Loaded registry (for the curated-package exception).
+
+    Returns:
+        A copy of *verdict* whose ``malicious`` list includes local matches.
+    """
+    local = [
+        malicious_item(m)
+        for m in _malicious_matches(name, ecosystem, registry, load_known_malicious())
+    ]
+    if not local:
+        return verdict
+    merged = dict(verdict)
+    existing = [m for m in _as_list(merged.get("malicious")) if isinstance(m, dict)]
+    # A remote id may be any JSON type; only a string can match a local id.
+    seen = {m.get("id") for m in existing if isinstance(m.get("id"), str)}
+    merged["malicious"] = existing + [m for m in local if m["id"] not in seen]
+    return merged
+
+
+# ── Online fetch + cache ───────────────────────────────────────────────────────
+
+
+def _fetch_online_verdict(
+    ecosystem: str,
+    name: str,
+    console: Console,
+) -> dict[str, Any] | None:
+    """Fetch a live verdict from mcp-audit.dev and write it to the local cache.
+
+    Uses ``urllib.request`` only (no third-party HTTP library).  Enforces an
+    ``https://`` scheme guard before opening the URL.
+
+    The cache file is written at ``0o600`` (registry-cache pattern) so verdict
+    data is not world-readable on multi-user systems.
+
+    Args:
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        name: Raw package name (slug conversion applied internally).
+        console: Rich console for dim status messages.
+
+    Returns:
+        Parsed verdict ``dict`` on success, ``None`` on any failure (the caller
+        falls back to the bundled registry).
+    """
+    slug = name_to_slug(name)
+    url = f"{_VERDICT_ONLINE_BASE}/{ecosystem}/{slug}.json"
+
+    # https scheme guard — never open http:// or file:// URLs.
+    if not url.startswith("https://"):
+        console.print(
+            "[dim]Online verdict URL must use HTTPS — skipping online fetch.[/dim]"
+        )
+        return None
+
+    try:
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — https:// guard above
+            url,
+            headers={"User-Agent": f"mcp-audit/{_ua_version()}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310  # nosec B310
+            raw = resp.read().decode("utf-8")
+        verdict: dict[str, Any] = json.loads(raw)
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return None
+
+    # Cache the verdict.
+    _write_verdict_cache(ecosystem, name, verdict, console)
+    return verdict
+
+
+def _write_verdict_cache(
+    ecosystem: str,
+    name: str,
+    verdict: dict[str, Any],
+    console: Console,
+) -> None:
+    """Persist a fetched verdict into the local cache file at 0o600.
+
+    Args:
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        name: Raw package name.
+        verdict: Parsed verdict dict to store.
+        console: Rich console for error reporting.
+    """
+    cache_key = f"{ecosystem}/{name_to_slug(name)}"
+    cache: dict[str, Any] = {}
+
+    _VERDICT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if _VERDICT_CACHE_PATH.exists():
+        try:
+            cache = json.loads(_VERDICT_CACHE_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+
+    cache[cache_key] = verdict
+
+    try:
+        atomic_write(_VERDICT_CACHE_PATH, json.dumps(cache, indent=2))
+    except OSError as exc:
+        console.print(f"[dim]Could not write verdict cache: {exc}[/dim]")
+
+
+def _ua_version() -> str:
+    """Return the mcp-audit version string for the User-Agent header."""
+    try:
+        from mcp_audit import __version__  # noqa: PLC0415
+
+        return __version__
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+# ── Rich output helpers ────────────────────────────────────────────────────────
+
+
+def _print_known_verdict(
+    verdict: dict[str, Any],
+    console: Console,
+) -> None:
+    """Render a Rich panel for a known (listed) package.
+
+    Args:
+        verdict: Fully built verdict dict.
+        console: Rich console to print to.
+    """
+    pkg = verdict["package"]
+    reg = _as_dict(verdict.get("registry"))
+    vulns = _vuln_items(verdict)
+    caps = verdict["capabilities"]
+    att = verdict["attestation"]
+    links = verdict["links"]
+
+    t = Text()
+
+    # STORY-0140: an archived entry keeps ``verified`` in the data (it is the
+    # real package), but the panel must not vouch for it in green.
+    if reg.get("archived"):
+        verified_str = "[yellow]Archived, not maintained[/yellow]"
+    elif reg.get("verified"):
+        verified_str = "[green]Verified[/green]"
+    else:
+        verified_str = "[yellow]Unverified[/yellow]"
+    listed_str = (
+        "[green]Listed[/green]" if reg.get("listed") else "[red]Not listed[/red]"
+    )
+    maintainer = reg.get("maintainer") or "unknown"
+    t.append(f"{pkg['name']}  ", style="bold")
+    t.append(f"({pkg['ecosystem']})\n\n", style="dim")
+    t.append_text(
+        Text.from_markup(
+            f"  Registry:      {listed_str} · {verified_str} · {maintainer}\n"
+        )
+    )
+    entry_updated = reg.get("entry_updated") or "n/a"
+    t.append(f"  Entry updated: {entry_updated}\n\n", style="dim")
+    if reg.get("archived"):
+        # STORY-0140: listed and verified as the real package, but archived.
+        successor = reg.get("successor")
+        t.append_text(
+            Text.from_markup(
+                "  [yellow]Archived upstream: no security fixes are coming[/yellow]\n"
+            )
+        )
+        if reg.get("archive_notice"):
+            t.append(f"  Notice:        {reg['archive_notice']}\n", style="dim")
+        if successor:
+            t.append(f"  Successor:     {successor}\n", style="dim")
+        t.append("\n")
+
+    # Capabilities.
+    if caps:
+        t.append_text(Text.from_markup(f"  Capabilities:  {', '.join(caps)}\n"))
+    else:
+        t.append("  Capabilities:  none declared\n", style="dim")
+
+    # Hash pins.
+    hash_note = "yes" if att.get("hash_pins_available") else "no"
+    t.append(f"  Hash pins:     {hash_note}\n")
+    att_note = "yes" if att.get("attestation_expected") else "no"
+    t.append(f"  Sigstore attestation expected: {att_note}\n\n")
+
+    # CVEs.
+    unfixed = _open_vulns(verdict, vulns)
+    pinned = pkg.get("version")
+    if pinned is not None:
+        t.append(f"  Version asked about: {pinned}\n\n")
+    if vulns and pinned is not None:
+        if unfixed:
+            heading = (
+                f"  [red bold]Known vulnerabilities: {len(vulns)} "
+                f"({len(unfixed)} affect or may affect {pinned})[/red bold]\n\n"
+            )
+        else:
+            heading = (
+                f"  [yellow bold]Known vulnerabilities: {len(vulns)} "
+                f"(all fixed in or before {pinned})[/yellow bold]\n\n"
+            )
+        t.append_text(Text.from_markup(heading))
+        for v in vulns:
+            cve = v.get("cve", "unknown")
+            fixed = v.get("fixed_in")
+            fixed_str = f"fixed in {fixed}" if fixed else "no fix available"
+            status = {
+                "affected": f"{pinned} is affected",
+                "fixed": f"{pinned} includes the fix",
+                "undecidable": (
+                    f"cannot tell offline whether {pinned} includes the fix "
+                    "(calendar versus semantic version numbering)"
+                ),
+            }.get(str(v.get("status")), "")
+            t.append_text(Text.from_markup(f"    [red]{cve}[/red]"))
+            t.append(f" — {status}\n" if status else "\n")
+            exploit = _exploit_note(str(cve))
+            if exploit:
+                t.append(f"    {exploit}\n", style="bold red")
+            t.append(f"    {fixed_str}\n", style="dim")
+            if v.get("link"):
+                t.append(f"    {v['link']}\n", style="dim")
+            t.append("\n")
+        if any(_exploit_note(str(v.get("cve", ""))) for v in vulns):
+            t.append(f"    {_exploit_date_line()}\n", style="dim")
+    elif vulns:
+        if unfixed:
+            heading = (
+                f"  [red bold]Known vulnerabilities: {len(vulns)} "
+                f"({len(unfixed)} with no fix)[/red bold]\n\n"
+            )
+        else:
+            heading = (
+                f"  [yellow bold]Known vulnerabilities: {len(vulns)} (all fixed; "
+                "pin a version at or above each fix)[/yellow bold]\n\n"
+            )
+        t.append_text(Text.from_markup(heading))
+        for v in vulns:
+            cve = v.get("cve", "unknown")
+            desc, reporter = split_credit(v.get("description") or "")
+            fixed = v.get("fixed_in")
+            fixed_str = f"fixed in {fixed}" if fixed else "no fix available"
+            link = v.get("link", "")
+            t.append_text(Text.from_markup(f"    [red]{cve}[/red]"))
+            if desc:
+                short_desc = desc[:80] + ("…" if len(desc) > 80 else "")
+                t.append(f" — {short_desc}")
+            if reporter:
+                t.append(f" - reported by {reporter}")
+            t.append("\n")
+            t.append(f"    {fixed_str}\n", style="dim")
+            if link:
+                t.append(f"    {link}\n", style="dim")
+            t.append("\n")
+    else:
+        t.append_text(
+            Text.from_markup("  [green]Known vulnerabilities: none[/green]\n\n")
+        )
+
+    # Links.
+    if links.get("repo"):
+        t.append(f"  Repo: {links['repo']}\n", style="dim")
+    t.append(f"  Verdict page: {links['verdict_page']}\n", style="dim")
+
+    border = (
+        "red"
+        if unfixed
+        else (
+            "green"
+            if reg.get("verified") and not vulns and not reg.get("archived")
+            else "yellow"
+        )
+    )
+    console.print(Panel(t, title="[bold]mcp-audit verdict[/bold]", border_style=border))
+
+
+def _print_typosquat_warning(
+    name: str,
+    typosquat_of: RegistryEntry,
+    console: Console,
+    twin: Twin | None = None,
+) -> None:
+    """Render a typosquat warning panel.
+
+    Args:
+        name: The queried package name.
+        typosquat_of: The registry entry the name closely resembles.
+        console: Rich console to print to.
+        twin: When the suspicion is an unscoped twin (SC-007 logic), the
+            twin relation; the panel then explains it instead of showing an
+            edit distance that would mean nothing.
+    """
+    t = Text()
+    t.append(f"  Queried:  {name}\n", style="bold")
+    label = "Twin of" if twin is not None else "Closest"
+    t.append_text(
+        Text.from_markup(
+            f"  {label}:  [bold]{typosquat_of.name}[/bold]"
+            f" (maintainer: {typosquat_of.maintainer},"
+            f" verified: {typosquat_of.verified})\n"
+        )
+    )
+    if twin is not None:
+        t.append(f"  Relation: the queried name is {twin.explain()}\n\n")
+    else:
+        dist = levenshtein(name.lower(), typosquat_of.name.lower())
+        t.append(f"  Distance: {dist} edit(s)\n\n")
+    t.append(
+        "  Did you mean the known-legitimate package above?\n"
+        "  Verify the name is intentional before installing.\n",
+        style="yellow",
+    )
+    title = "Possible unscoped twin" if twin is not None else "Possible typosquat"
+    console.print(
+        Panel(
+            t,
+            title=f"[bold yellow]{title} — vet exit 1[/bold yellow]",
+            border_style="yellow",
+        )
+    )
+
+
+def _open_range_phrase(item: dict[str, Any]) -> str:
+    """'every release' or 'every release from X on' for a malicious item."""
+    starts = [
+        events[0].get("introduced")
+        for events in _as_list(item.get("ranges"))
+        if isinstance(events, list)
+        and events
+        and all(isinstance(e, dict) for e in events)
+        and not any("fixed" in e or "last_affected" in e for e in events)
+        and "introduced" in events[0]
+    ]
+    if not starts or "0" in starts:
+        return "every release"
+    return f"every release from {starts[0]} on"
+
+
+def _print_malicious_panel(
+    name: str,
+    items: list[dict[str, Any]],
+    console: Console,
+    *,
+    other_ecosystem: str | None = None,
+) -> None:
+    """Render the OSV malicious-package panel (SC-008 data).
+
+    Args:
+        name: The queried package name.
+        items: ``malicious`` (or ``other_ecosystem_malicious``) verdict items.
+        console: Rich console to print to.
+        other_ecosystem: Set when *items* describe the same name in the other
+            registry, not the package this verdict is for.
+    """
+    # An ``--online`` verdict is remote data: an item may lack a field the
+    # bundled builder always sets, or not be an object at all.
+    items = [i for i in _as_list(items) if isinstance(i, dict)]
+    if not items:
+        # Nothing renderable (e.g. an --online ``malicious: 42`` or ``[1]``):
+        # no panel, rather than an empty "Malicious releases listed" one.
+        return
+    latest = any(i.get("latest_affected") for i in items)
+    t = Text()
+    if other_ecosystem is not None:
+        t.append(
+            f"  On {other_ecosystem}, a different package named {name} is listed "
+            "as malicious in OSV.\n  This verdict is for the other registry's "
+            "package; do not install it from "
+            f"{other_ecosystem}.\n\n",
+            style="bold",
+        )
+    for item in items:
+        # Appended as plain text, not markup: a '[' in a remote id must not
+        # be read as a Rich tag.
+        t.append("  ")
+        t.append(str(item.get("id") or "(no id)"), style="red bold")
+        aliases = _as_list(item.get("aliases"))
+        if aliases:
+            t.append(f" ({', '.join(str(a) for a in aliases)})")
+        if item.get("summary"):
+            t.append(f" — {item['summary']}")
+        t.append("\n")
+        if item.get("latest_affected"):
+            t.append(f"    {_open_range_phrase(item)} marked malicious\n")
+        elif _as_list(item.get("versions")):
+            listed = ", ".join(str(v) for v in _as_list(item["versions"])[:8])
+            t.append(f"    releases listed: {listed}\n")
+        if item.get("blanket_range_ignored"):
+            t.append(
+                "    OSV also marks every version; the registry lists this package "
+                "as legitimate, so the explicit list is used.\n",
+                style="dim",
+            )
+        if item.get("link"):
+            t.append(f"    {item['link']}\n", style="dim")
+        if item.get("note"):
+            t.append(f"    Note: {item['note']}\n", style="dim")
+        t.append("\n")
+    if other_ecosystem is None and not latest:
+        t.append(
+            "  Only past releases are listed; vet answers for the latest release.\n"
+            "  If you install this package, pin a release that is not listed.\n",
+            style="yellow",
+        )
+    title = (
+        "Listed as malicious in OSV — vet exit 1"
+        if latest and other_ecosystem is None
+        else "Malicious releases listed in OSV"
+    )
+    console.print(
+        Panel(
+            t,
+            title=f"[bold red]{title}[/bold red]",
+            border_style="red" if latest else "yellow",
+        )
+    )
+
+
+def _print_unknown_verdict(
+    name: str,
+    ecosystem: str,
+    entry_count: int,
+    console: Console,
+) -> None:
+    """Render an 'unknown package' informational panel.
+
+    The absence of a registry entry is **not** a safety signal — the registry
+    covers a curated corpus, not all MCP packages.
+
+    Args:
+        name: Queried package name.
+        ecosystem: ``"npm"`` or ``"pypi"``.
+        entry_count: Total number of entries in the registry (for context).
+        console: Rich console to print to.
+    """
+    t = Text()
+    t.append(f"  {name}  ", style="bold")
+    t.append(f"({ecosystem})\n\n", style="dim")
+    t.append(
+        f"  No verdict available. The registry covers {entry_count} known servers;\n"
+        "  this package is not among them.\n\n"
+    )
+    t.append(
+        "  Absence of registry data is NOT a safety signal.\n"
+        "  The registry covers a curated corpus, not every MCP package.\n\n",
+        style="dim",
+    )
+    t.append("  After installing and configuring, run:\n")
+    t.append("    mcp-audit scan\n\n", style="bold")
+    t.append(
+        f"  Help grow the registry: {_REGISTRY_CONTRIBUTION_URL}\n",
+        style="dim",
+    )
+    console.print(
+        Panel(
+            t,
+            title="[bold]mcp-audit verdict — unknown package[/bold]",
+            border_style="dim",
+        )
+    )
+
+
+# ── Terminal output dispatch ───────────────────────────────────────────────────
+
+
+def print_verdict(
+    verdict: dict[str, Any],
+    registry: KnownServerRegistry,
+    typosquat_entry: RegistryEntry | None,
+    console: Console,
+    twin: Twin | None = None,
+) -> None:
+    """Render the appropriate Rich terminal panel for *verdict*.
+
+    Args:
+        verdict: Fully built verdict dict.
+        registry: Loaded registry (for unknown panel entry count).
+        typosquat_entry: Pre-resolved :class:`~mcp_audit.registry.loader.RegistryEntry`
+            for the typosquat candidate when known; ``None`` otherwise.
+        console: Rich console to print to.
+        twin: The unscoped-twin relation when ``typosquat_basis`` is
+            ``"unscoped-twin"``; ``None`` otherwise.
+    """
+    reg = _as_dict(verdict.get("registry"))
+    typosquat_name = verdict.get("typosquat_of")
+    pkg_name = verdict["package"]["name"]
+
+    if verdict.get("malicious"):
+        _print_malicious_panel(pkg_name, verdict["malicious"], console)
+    if verdict.get("other_ecosystem_malicious"):
+        other = "npm" if verdict["package"]["ecosystem"] == "pypi" else "PyPI"
+        _print_malicious_panel(
+            pkg_name,
+            verdict["other_ecosystem_malicious"],
+            console,
+            other_ecosystem=other,
+        )
+
+    if typosquat_name is not None:
+        if typosquat_entry is not None:
+            _print_typosquat_warning(pkg_name, typosquat_entry, console, twin)
+        else:
+            console.print(
+                f"[yellow]Warning:[/yellow] Possible typosquat of {typosquat_name!r}"
+            )
+        return
+
+    if reg.get("listed"):
+        _print_known_verdict(verdict, console)
+    else:
+        _print_unknown_verdict(
+            verdict["package"]["name"],
+            verdict["package"]["ecosystem"],
+            len(registry.entries),
+            console,
+        )
+
+
+# ── Exit code logic ────────────────────────────────────────────────────────────
+
+
+def _open_vulns(
+    verdict: dict[str, Any], vulns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The vulnerabilities that count against the verdict.
+
+    Without a pinned version: those with no recorded fix.  With one
+    (``vet pkg@1.2.3``): those the pinned version is still affected by
+    (``status`` ``affected``) or cannot be ruled out (``undecidable``: an
+    unsure answer is not a clean one).
+    """
+    if _as_dict(verdict.get("package")).get("version") is None:
+        return [v for v in vulns if not v.get("fixed_in")]
+    return [v for v in vulns if v.get("status", "affected") != "fixed"]
+
+
+def _verdict_exit_code(verdict: dict[str, Any], strict: bool) -> int:
+    """Map a verdict dict to the appropriate process exit code.
+
+    Rules:
+    - 0: listed in registry, every recorded CVE has a fix, no typosquat suspicion
+    - 1: a recorded CVE has no fix **or** typosquat suspicion **or** OSV lists
+      the latest release as malicious (``malicious[].latest_affected``) **or**
+      (not listed + ``--strict``).  Malicious *past* releases and records for
+      the other registry's same-named package do not change the exit code.
+
+    Args:
+        verdict: Fully built verdict dict.
+        strict: When ``True``, unlisted packages exit 1 instead of 0.
+
+    Returns:
+        Integer exit code (0 or 1).
+    """
+    vulns = _vuln_items(verdict)
+    typosquat = verdict.get("typosquat_of")
+    listed = _as_dict(verdict.get("registry")).get("listed", False)
+    unfixed = _open_vulns(verdict, vulns)
+    malicious_latest = [
+        m
+        for m in _as_list(verdict.get("malicious"))
+        if isinstance(m, dict) and m.get("latest_affected")
+    ]
+
+    if unfixed or typosquat or malicious_latest:
+        return 1
+    if not listed and strict:
+        return 1
+    return 0
+
+
+# ── Command ────────────────────────────────────────────────────────────────────
+
+
+@app.command("vet")
+def vet(
+    package: str = typer.Argument(  # noqa: B008
+        ...,
+        help=(
+            "Package name to vet (npm: '@scope/name' or 'name'; "
+            "pypi: 'package-name'); add @1.2.3 (or ==1.2.3) to judge one version. "
+            "Use --ecosystem to disambiguate."
+        ),
+    ),
+    ecosystem: _StrOpt = typer.Option(  # noqa: B008
+        None,
+        "--ecosystem",
+        "-e",
+        help="Force ecosystem lookup: 'npm' or 'pypi'. Auto-detected when omitted.",
+        show_default=False,
+    ),
+    format_flag: _StrOpt = typer.Option(  # noqa: B008
+        None,
+        "--format",
+        "-f",
+        help="Output format. 'json' emits the full verdict document.",
+        show_default=False,
+    ),
+    badge: bool = typer.Option(  # noqa: B008
+        False,
+        "--badge",
+        help="Print a Shields.io Markdown badge for this package and exit.",
+    ),
+    online: bool = typer.Option(  # noqa: B008
+        False,
+        "--online",
+        help=(
+            "Fetch a live verdict from mcp-audit.dev (HTTPS GET) and cache it. "
+            "Falls back to the bundled registry on network failure."
+        ),
+    ),
+    strict: bool = typer.Option(  # noqa: B008
+        False,
+        "--strict",
+        help="Exit 1 when the package is not in the registry (CI mode).",
+    ),
+    offline_registry: bool = typer.Option(  # noqa: B008
+        False,
+        "--offline-registry",
+        help="Use the bundled registry only, skip the user-local cache.",
+    ),
+) -> None:
+    """Pre-install verdict on a public MCP server package.
+
+    Reports facts from the known-server registry: verification status, known CVEs,
+    declared capabilities, hash pins, and typosquat detection.  Offline by default
+    — no network calls for a plain ``vet``.
+
+    Exit codes:
+    - 0: known, every recorded CVE fixed, no typosquat (or unknown without --strict)
+    - 1: a recorded CVE has no fix, typosquat suspicion (edit distance or an
+      unscoped twin), OSV lists the latest release as malicious (checked
+      against the bundled data, with or without --online), or unknown + --strict
+    - 2: invalid/empty package name or unrecoverable error
+
+    Examples::
+
+        mcp-audit vet @modelcontextprotocol/server-filesystem
+        mcp-audit vet mcp-atlassian --ecosystem pypi
+        mcp-audit vet @azure/mcp --format json
+        mcp-audit vet mcp-remote@0.1.30
+        mcp-audit vet @scope/name --badge
+        mcp-audit vet @scope/name --online
+    """
+    console = Console()
+
+    # ── Input validation ──────────────────────────────────────────────────────
+    pkg_name, pinned_version = split_package_spec(package if package else "")
+    raw_spec = (package or "").strip()
+    if pinned_version is None and pkg_name != raw_spec:
+        Console(stderr=True).print(
+            f"[dim]No version applied: {raw_spec[len(pkg_name) :]!r} names no "
+            "single release.[/dim]"
+        )
+    if not pkg_name:
+        console.print("[red]Error:[/red] Package name must not be empty.")
+        raise typer.Exit(2)
+
+    # ── Ecosystem resolution ──────────────────────────────────────────────────
+    if ecosystem is not None:
+        eco = ecosystem.lower()
+        if eco not in ("npm", "pypi"):
+            console.print(
+                f"[red]Error:[/red] Unknown ecosystem {ecosystem!r}. "
+                "Use 'npm' or 'pypi'."
+            )
+            raise typer.Exit(2)
+    else:
+        eco = _detect_ecosystem(pkg_name)
+
+    # ── Badge-only output ─────────────────────────────────────────────────────
+    if badge:
+        badge_name = pkg_name
+        if ecosystem is None:
+            eco, badge_name = _badge_target(pkg_name, offline_registry)
+        url = badge_url(eco, badge_name)
+        vpage = verdict_page_url(eco, badge_name)
+        sys.stdout.write(f"[![mcp-audit verdict]({url})]({vpage})\n")
+        raise typer.Exit(0)
+
+    # ── Load registry ─────────────────────────────────────────────────────────
+    try:
+        registry = load_registry(offline=offline_registry)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Registry not found:[/red] {exc}")
+        raise typer.Exit(2) from None
+    except RegistryLoadError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    # ── Online mode: attempt live fetch, fall back to registry ────────────────
+    if online:
+        online_verdict = _fetch_online_verdict(eco, pkg_name, console)
+        if online_verdict is None:
+            console.print(
+                "[dim]Online fetch failed or package not found on mcp-audit.dev — "
+                "using bundled registry.[/dim]"
+            )
+        else:
+            # The bundled OSV MAL-* data is always checked, also when the
+            # verdict came from mcp-audit.dev (STORY-0097 review): an online
+            # verdict must never hide a record the offline one would report.
+            online_verdict = _with_local_malicious(
+                online_verdict, pkg_name, eco, registry
+            )
+            local_entry = _lookup(pkg_name, eco, registry)
+            online_verdict = with_pinned_version(
+                online_verdict,
+                pinned_version,
+                local_entry.semver_resumed_at if local_entry else None,
+            )
+            # Emit and exit.  We have no typosquat_entry for online verdicts
+            # (the server computed it), so pass None.
+            if format_flag == "json":
+                sys.stdout.write(json.dumps(online_verdict, indent=2))
+                sys.stdout.write("\n")
+            else:
+                print_verdict(online_verdict, registry, None, console)
+            raise typer.Exit(_verdict_exit_code(online_verdict, strict))
+
+    # ── Registry lookup ───────────────────────────────────────────────────────
+    entry = _lookup(pkg_name, eco, registry)
+
+    # If not found in the primary ecosystem and no explicit flag was given,
+    # also try pypi (for plain names like "mcp-atlassian" without --ecosystem).
+    if entry is None and ecosystem is None and eco == "npm":
+        pypi_entry = registry.get_pypi(pkg_name)
+        if pypi_entry is not None:
+            entry = pypi_entry
+            eco = "pypi"
+
+    # ── Known-malicious check (OSV MAL-* records, offline; STORY-0097) ────────
+    mal_index = load_known_malicious()
+    malicious = _malicious_matches(pkg_name, eco, registry, mal_index)
+    # An unlisted plain name with no npm record but a PyPI one: answer for
+    # PyPI, the same "try npm, then pypi" rule as the registry lookup.
+    if entry is None and ecosystem is None and eco == "npm" and not malicious:
+        pypi_malicious = _malicious_matches(pkg_name, "pypi", registry, mal_index)
+        if pypi_malicious:
+            eco, malicious = "pypi", pypi_malicious
+    # Without --ecosystem, also say when the *other* registry's package of
+    # this name is malicious: `vet mcp-server-git` answers for Anthropic's
+    # PyPI package, while `npx mcp-server-git` installs MAL-2026-5478.
+    other_malicious: list[MaliciousMatch] = []
+    if ecosystem is None:
+        other = "npm" if eco == "pypi" else "pypi"
+        other_malicious = _malicious_matches(pkg_name, other, registry, mal_index)
+
+    # ── Typosquat check (only for unlisted packages) ──────────────────────────
+    # An unscoped twin (SC-007 logic) takes precedence over edit distance,
+    # exactly as in `scan`.
+    typosquat_of: RegistryEntry | None = None
+    twin: Twin | None = None
+    basis: str | None = None
+    if entry is None:
+        twins = _twin_check(pkg_name, eco, registry)
+        if twins:
+            twin = twins[0]
+            typosquat_of = twin.entry
+            basis = "unscoped-twin"
+        else:
+            typosquat_of = _typosquat_check(pkg_name, eco, registry)
+
+    # ── Build verdict ─────────────────────────────────────────────────────────
+    verdict = build_verdict(
+        name=pkg_name,
+        ecosystem=eco,
+        entry=entry,
+        typosquat_of=typosquat_of,
+        registry=registry,
+        typosquat_basis=basis,
+        malicious=[malicious_item(m) for m in malicious],
+        other_ecosystem_malicious=[malicious_item(m) for m in other_malicious],
+        pinned_version=pinned_version,
+    )
+
+    # ── Emit output ───────────────────────────────────────────────────────────
+    if format_flag == "json":
+        sys.stdout.write(json.dumps(verdict, indent=2))
+        sys.stdout.write("\n")
+    else:
+        print_verdict(verdict, registry, typosquat_of, console, twin)
+
+    # ── Exit code ─────────────────────────────────────────────────────────────
+    raise typer.Exit(_verdict_exit_code(verdict, strict))

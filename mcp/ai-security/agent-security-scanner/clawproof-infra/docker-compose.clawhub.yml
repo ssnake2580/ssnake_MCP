@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  clawhub-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile.clawhub-scanner
+    container_name: clawhub-security-scan
+
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    read_only: false  # Need write access for skill downloads
+
+    # Resource limits
+    mem_limit: 4g
+    cpus: 2
+
+    # Network isolation (no internet access after initial setup if desired)
+    # network_mode: none  # Uncomment to fully isolate (will break clawhub CLI)
+
+    # Mount only the output directory
+    volumes:
+      - ./clawhub-scan-safe:/scan/clawhub-scan-safe
+      - /tmp  # Tmpfs for temporary files
+
+    # Environment
+    environment:
+      - NODE_ENV=production
+      - SCANNER_PREWARM=0
+
+    # Restart policy
+    restart: "no"
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

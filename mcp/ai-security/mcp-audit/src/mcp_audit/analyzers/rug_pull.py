@@ -1,0 +1,453 @@
+"""Detect rug-pull attacks by tracking MCP server configuration hashes.
+
+A rug-pull attack works as follows:
+  1. Attacker publishes a clean MCP server that developers install and trust.
+  2. After adoption, the attacker silently mutates tool descriptions to include
+     malicious instructions (data exfiltration, behavioral overrides, etc.).
+  3. The developer never sees the change; the AI agent reads poisoned descriptions
+     on every subsequent invocation.
+
+Detection strategy: hash each server's configuration on first scan and store the
+hashes in a local state file.  On subsequent scans, re-hash and compare.  Any
+deviation is flagged as a potential rug-pull.
+
+Research basis: "Compromising LLM-Integrated Applications with Indirect Prompt
+Injection" — Greshake et al., arXiv 2023 §4.2
+  https://arxiv.org/abs/2302.12173
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+from datetime import UTC, datetime
+from pathlib import Path
+
+from platformdirs import user_config_dir
+from rich.console import Console
+
+from mcp_audit._fs import atomic_write
+from mcp_audit.analyzers.base import BaseAnalyzer
+from mcp_audit.discovery import AGENT_DEFINITION_CLIENT, DiscoveredConfig
+from mcp_audit.gateways import GATEWAY_UPSTREAM_CLIENTS
+from mcp_audit.lock.identity import remote_host
+from mcp_audit.models import Finding, ServerConfig, Severity
+
+_STATE_DIR: Path = Path(user_config_dir("mcp-audit")) / "state"
+DEFAULT_STATE_PATH: Path = _STATE_DIR / "state.json"
+_STATE_VERSION = 1
+_LEGACY_STATE_DIR: Path = Path.home() / ".mcp-audit"
+
+_console = Console(stderr=True)
+
+
+# ── One-time migration from legacy ~/.mcp-audit location ──────────────────────
+
+_migration_done: bool = False
+
+
+def _migrate_legacy_state() -> None:
+    """Copy state_*.json files from the old ~/.mcp-audit path to the new location.
+
+    Runs at most once per process.  Safe to call on fresh installs (no-op when
+    the legacy directory does not exist).
+    """
+    global _migration_done  # noqa: PLW0603
+    if _migration_done:
+        return
+    _migration_done = True
+
+    if not _LEGACY_STATE_DIR.exists():
+        return
+
+    legacy_files = list(_LEGACY_STATE_DIR.glob("state*.json"))
+    if not legacy_files:
+        return
+
+    _STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    migrated: list[str] = []
+    for src in legacy_files:
+        dst = _STATE_DIR / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            os.chmod(dst, 0o600)
+            migrated.append(src.name)
+
+    if migrated:
+        _console.print(
+            f"[dim]mcp-audit: migrated {len(migrated)} state file(s) from "
+            f"{_LEGACY_STATE_DIR} → {_STATE_DIR}[/dim]"
+        )
+
+
+# ── Public helpers (used by cli.py pin/diff commands) ─────────────────────────
+
+
+def derive_state_path(configs: list[DiscoveredConfig]) -> Path:
+    """Return a scoped state file path derived from the set of config files.
+
+    Different invocations that scan different config files produce different
+    state paths, preventing cross-contamination between e.g. demo configs and
+    real machine configs.
+
+    The derivation is deterministic: sort the absolute config paths, join with
+    newlines, SHA-256 hash, take the first 8 hex characters.
+
+    Args:
+        configs: Discovered config files for the current scan.
+
+    Returns:
+        A path like ``<user-config-dir>/mcp-audit/state/state_a1b2c3d4.json``.
+        Falls back to :data:`DEFAULT_STATE_PATH` when *configs* is empty so
+        that there is always a valid path to write to.
+
+    Configs from Claude Code plugins (client ``claude-code-plugin``) are left
+    out of the key.  Their paths contain the plugin version, so including them
+    would move every server's rug-pull history to a fresh state file on each
+    plugin update.  Their servers are still tracked in whichever file the rest
+    of the scan uses.  A repository's skills-directory plugin
+    (``.claude/skills/<name>``, ``is_project_scoped``) stays in the key: its
+    path does not change, and leaving it out would record its servers in the
+    state a scan of another repository reads, which would then report them as
+    removed (RUGPULL-003; STORY-0095).
+
+    Subagent definitions (client ``claude-code-agent``, STORY-0094) are left
+    out for a related reason: every agent file is a discovered config whether
+    or not it declares a server, so adding or deleting one would otherwise move
+    the whole scan's rug-pull history to a new state file.
+
+    User-level MCP gateway configs (``<gateway>-upstream`` clients,
+    STORY-0111) are left out too, so a machine that already had one does not
+    lose its rug-pull history to a new state file when they join discovery;
+    their servers are tracked in whichever file the rest of the scan uses.  A
+    working directory's gateway project file (``is_project_scoped``) stays in
+    the key, for the reason given above for skills-directory plugins.
+    """
+    _migrate_legacy_state()
+    configs = [
+        c
+        for c in configs
+        if c.client_name != AGENT_DEFINITION_CLIENT
+        and (c.client_name != "claude-code-plugin" or c.is_project_scoped)
+        and (c.client_name not in GATEWAY_UPSTREAM_CLIENTS or c.is_project_scoped)
+    ]
+    if not configs:
+        return DEFAULT_STATE_PATH
+    paths_str = "\n".join(sorted(str(c.path) for c in configs))
+    digest = hashlib.sha256(paths_str.encode()).hexdigest()[:8]
+    return _STATE_DIR / f"state_{digest}.json"
+
+
+#: Separates a gateway upstream's name from its config path in a state key.
+_GATEWAY_KEY_SEP = " @ "
+
+
+def server_key(server: ServerConfig) -> str:
+    """Return the canonical state-file key for a server: ``'{client}/{name}'``.
+
+    A server read from an MCP gateway's config (``<gateway>-upstream``,
+    STORY-0111) also carries its config file, ``'{client}/{name} @ {path}'``:
+    a gateway reads several files (mcptoon's user and project configs, JSON
+    and TOML) that can each name the same server, and one key for all of
+    them would let a change in one file go unreported.  No earlier state
+    used these keys.
+    """
+    if server.client in GATEWAY_UPSTREAM_CLIENTS:
+        try:
+            path = str(server.config_path.resolve())
+        except (OSError, RuntimeError):
+            path = str(server.config_path)
+        return f"{server.client}/{server.name}{_GATEWAY_KEY_SEP}{path}"
+    return f"{server.client}/{server.name}"
+
+
+def compute_hashes(server: ServerConfig) -> dict[str, str]:
+    """Return a dict of SHA-256 digests for the four tracked aspects of a server.
+
+    Args:
+        server: The server whose config to hash.
+
+    Returns:
+        Dict with keys ``command``, ``args``, ``env_keys``, and ``raw``.
+    """
+
+    def _h(value: str) -> str:
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    return {
+        "command": _h(server.command or ""),
+        "args": _h(" ".join(server.args)),
+        "env_keys": _h(json.dumps(sorted(server.env.keys()))),
+        "raw": _h(json.dumps(server.raw, sort_keys=True)),
+    }
+
+
+def load_state(state_path: Path) -> dict:
+    """Load the state file, returning an empty baseline if it does not exist.
+
+    Args:
+        state_path: Path to the state JSON file.
+
+    Returns:
+        Parsed state dict.  Always valid — never raises.
+    """
+    if not state_path.exists():
+        return {"version": _STATE_VERSION, "servers": {}}
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"version": _STATE_VERSION, "servers": {}}
+        return data
+    except (ValueError, OSError, RecursionError):
+        return {"version": _STATE_VERSION, "servers": {}}
+
+
+def save_state(state: dict, state_path: Path) -> None:
+    """Persist the state dict to disk, creating parent directories as needed.
+
+    The directory is created with mode 0o700 and the file with mode 0o600
+    to prevent other users on the system from reading config path metadata.
+
+    Args:
+        state: State dict to serialise.
+        state_path: Destination path.
+    """
+    content = json.dumps(state, indent=2).encode("utf-8")
+    atomic_write(state_path, content, dir_mode=0o700)
+
+
+def build_state_entry(server: ServerConfig, first_seen: str | None = None) -> dict:
+    """Build a state entry dict for a single server.
+
+    Args:
+        server: The server to record.
+        first_seen: ISO timestamp to use as ``first_seen``.  Defaults to now.
+
+    Returns:
+        A dict ready to be stored under the server's key in the state file.
+    """
+    now = datetime.now(UTC).isoformat()
+    entry = {
+        "config_path": str(server.config_path),
+        "first_seen": first_seen or now,
+        "last_seen": now,
+        "hashes": compute_hashes(server),
+    }
+    host = remote_host(server.url)
+    if host:
+        entry["remote_host"] = host
+    return entry
+
+
+# ── Analyzer ──────────────────────────────────────────────────────────────────
+
+
+class RugPullAnalyzer(BaseAnalyzer):
+    """Detect silent configuration changes across consecutive scans.
+
+    The single-server :meth:`analyze` method is intentionally a no-op.  Call
+    :meth:`analyze_all` with the complete list of servers after the per-server
+    analysis loop.  The state file is updated on every :meth:`analyze_all` call.
+
+    Args:
+        state_path: Override the state file location.  Defaults to the
+            platform-specific user config directory:
+
+            - macOS:   ``~/Library/Application Support/mcp-audit/state/``
+            - Linux:   ``~/.config/mcp-audit/state/`` (respects
+              ``$XDG_CONFIG_HOME``)
+            - Windows: ``%APPDATA%/mcp-audit/state/``
+
+            Pass a ``tmp_path`` in tests.
+    """
+
+    def __init__(self, state_path: Path | None = None) -> None:
+        self._state_path = state_path or DEFAULT_STATE_PATH
+
+    @property
+    def name(self) -> str:
+        return "rug_pull"
+
+    @property
+    def description(self) -> str:
+        return "Detect silent MCP server configuration changes (rug-pull attacks)"
+
+    def analyze(self, server: ServerConfig) -> list[Finding]:
+        """No-op.  Rug-pull detection requires the full server list.
+
+        Use :meth:`analyze_all` instead.
+        """
+        return []
+
+    def analyze_all(self, servers: list[ServerConfig]) -> list[Finding]:
+        """Compare current server configs against the stored baseline.
+
+        Behaviour:
+
+        * **First scan** (no state file present): records baseline and emits one
+          ``RUGPULL-000`` INFO finding per server.
+        * **Known server changed**: emits ``RUGPULL-001`` HIGH.
+        * **New server** (not in prior baseline): emits ``RUGPULL-002`` INFO.
+        * **Removed server** (in baseline, not in current scan): emits
+          ``RUGPULL-003`` INFO.
+
+        The state file is always written at the end, updating ``last_seen`` and
+        current hashes for all present servers.
+
+        Args:
+            servers: All parsed server configurations from the current scan.
+
+        Returns:
+            List of :class:`~mcp_audit.models.Finding` objects.
+        """
+        findings: list[Finding] = []
+        first_scan = not self._state_path.exists()
+        state = load_state(self._state_path)
+        stored: dict = state.setdefault("servers", {})
+
+        current: dict[str, ServerConfig] = {server_key(s): s for s in servers}
+
+        # ── Evaluate each current server ──────────────────────────────────────
+        for key, srv in current.items():
+            if key not in stored:
+                if first_scan:
+                    findings.append(self._baseline_finding(srv))
+                else:
+                    findings.append(self._new_server_finding(srv, key))
+            else:
+                stored_hashes = stored[key].get("hashes", {})
+                current_hashes = compute_hashes(srv)
+                if current_hashes["raw"] != stored_hashes.get("raw"):
+                    changed = [
+                        f
+                        for f in ("command", "args", "env_keys", "raw")
+                        if current_hashes.get(f) != stored_hashes.get(f)
+                    ]
+                    old_host = stored[key].get("remote_host")
+                    new_host = remote_host(srv.url)
+                    moved = None
+                    if isinstance(old_host, str) and new_host and old_host != new_host:
+                        moved = f"remote host changed from {old_host} to {new_host}"
+                    findings.append(self._changed_finding(srv, key, changed, moved))
+
+        # ── Detect removed servers ─────────────────────────────────────────────
+        for key, entry in stored.items():
+            if key not in current:
+                client, _, srv_name = key.partition("/")
+                if client in GATEWAY_UPSTREAM_CLIENTS:
+                    srv_name = srv_name.rsplit(_GATEWAY_KEY_SEP, 1)[0]
+                findings.append(self._removed_finding(client, srv_name, key, entry))
+
+        # ── Persist updated state ─────────────────────────────────────────────
+        now = datetime.now(UTC).isoformat()
+        for key, srv in current.items():
+            first_seen = stored.get(key, {}).get("first_seen", now)
+            stored[key] = build_state_entry(srv, first_seen)
+            stored[key]["last_seen"] = now
+        save_state(state, self._state_path)
+
+        return findings
+
+    # ── Private finding factories ──────────────────────────────────────────────
+
+    def _baseline_finding(self, srv: ServerConfig) -> Finding:
+        return Finding(
+            id="RUGPULL-000",
+            severity=Severity.INFO,
+            analyzer=self.name,
+            client=srv.client,
+            server=srv.name,
+            title=f"First scan — baseline recorded for {srv.name!r}",
+            description=(
+                "No previous baseline existed for this server. "
+                "Configuration hashes have been recorded. "
+                "Future scans will detect any changes."
+            ),
+            evidence=f"State file: {self._state_path}",
+            remediation=(
+                "No action required. "
+                "Run 'mcp-audit scan' regularly to detect rug-pull attacks."
+            ),
+            finding_path=str(srv.config_path),
+        )
+        # owasp_mcp_top_10 intentionally empty: baseline INFO, not a security violation
+
+    def _new_server_finding(self, srv: ServerConfig, key: str) -> Finding:
+        return Finding(
+            id="RUGPULL-002",
+            severity=Severity.INFO,
+            analyzer=self.name,
+            client=srv.client,
+            server=srv.name,
+            title=f"New MCP server detected: {srv.name!r}",
+            description=(
+                f"Server {key!r} was not present in the previous baseline. "
+                "Its configuration has been recorded for future comparison."
+            ),
+            evidence=f"config_path: {srv.config_path}",
+            remediation=(
+                "Verify this server was intentionally added to your configuration."
+            ),
+            finding_path=str(srv.config_path),
+            owasp_mcp_top_10=["MCP09"],
+        )
+
+    def _changed_finding(
+        self,
+        srv: ServerConfig,
+        key: str,
+        changed_fields: list[str],
+        host_move: str | None = None,
+    ) -> Finding:
+        evidence = f"Changed hash fields: {', '.join(changed_fields)}"
+        if host_move:
+            evidence = f"{host_move}; {evidence}"
+        return Finding(
+            id="RUGPULL-001",
+            severity=Severity.HIGH,
+            analyzer=self.name,
+            client=srv.client,
+            server=srv.name,
+            title=f"Server configuration changed since last scan: {srv.name!r}",
+            description=(
+                f"The configuration of {key!r} has changed since the last recorded "
+                "baseline. This pattern is consistent with a rug-pull attack where "
+                "tool descriptions or parameters are silently modified after initial "
+                "trust is established."
+            ),
+            evidence=evidence,
+            remediation=(
+                "Inspect the current tool descriptions for malicious instructions. "
+                "If the change was intentional, run 'mcp-audit pin' to update the "
+                "baseline."
+            ),
+            cwe="CWE-494",
+            finding_path=str(srv.config_path),
+            owasp_mcp_top_10=["MCP03", "MCP04"],
+        )
+
+    def _removed_finding(
+        self, client: str, srv_name: str, key: str, entry: dict
+    ) -> Finding:
+        last_seen = entry.get("last_seen", "unknown")
+        return Finding(
+            id="RUGPULL-003",
+            severity=Severity.INFO,
+            analyzer=self.name,
+            client=client,
+            server=srv_name,
+            title=f"Previously tracked server no longer configured: {srv_name!r}",
+            description=(
+                f"Server {key!r} was present in the previous baseline but is "
+                "no longer in the current configuration."
+            ),
+            evidence=f"Last seen: {last_seen}",
+            remediation=(
+                "If intentionally removed, this is expected. "
+                "If unexpected, verify your MCP configuration was not tampered with."
+            ),
+            finding_path=entry.get("config_path", ""),
+        )

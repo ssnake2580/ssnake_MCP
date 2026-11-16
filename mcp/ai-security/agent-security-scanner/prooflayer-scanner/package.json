@@ -1,0 +1,70 @@
+{
+  "name": "@prooflayer/security-scanner",
+  "version": "1.0.1",
+  "description": "Lightweight, zero-Python security scanner MCP server for AI coding agents. Fast install (~5s), 1700+ vulnerability rules with pure JavaScript regex engine, 4.3M+ package hallucination detection. For Claude Code, Cursor, Windsurf, Cline.",
+  "main": "index.js",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "prooflayer-scanner": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Tests coming soon\" && exit 0"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "security",
+    "scanner",
+    "vulnerability",
+    "sast",
+    "code-analysis",
+    "regex",
+    "sql-injection",
+    "xss",
+    "secrets-detection",
+    "hallucination-detection",
+    "package-verification",
+    "prompt-injection",
+    "agent-security",
+    "llm-security",
+    "ai-safety",
+    "claude-code",
+    "mcp-server",
+    "cursor",
+    "cline",
+    "windsurf",
+    "lightweight",
+    "zero-python",
+    "prooflayer"
+  ],
+  "author": "Sinewave AI <divya@sinewave.ai>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sinewaveai/agent-security-scanner-mcp.git",
+    "directory": "prooflayer-scanner"
+  },
+  "homepage": "https://www.proof-layer.com/",
+  "bugs": {
+    "url": "https://github.com/sinewaveai/agent-security-scanner-mcp/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^4.3.6"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "index.js",
+    "src/*.js",
+    "rules/**",
+    "packages/**"
+  ]
+}

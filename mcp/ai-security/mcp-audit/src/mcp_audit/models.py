@@ -1,0 +1,581 @@
+"""Core data models for mcp-audit."""
+
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+
+from mcp_audit import __version__
+from mcp_audit.gateways import GATEWAY_UPSTREAM_CLIENTS as _GATEWAY_CLIENTS
+
+# ── Machine identification ─────────────────────────────────────────────────────
+
+
+class MachineInfo(BaseModel):
+    """Identifies the machine that produced scan results."""
+
+    hostname: str
+    username: str
+    os: str  # e.g., "Darwin", "Linux", "Windows"
+    os_version: str
+    scan_id: str  # UUID generated per scan run
+    asset_id: str | None = None  # set by --asset-prefix in fleet deployments
+
+
+def _collect_machine_info() -> MachineInfo:
+    """Gather machine identification data at scan time.
+
+    Falls back to :func:`getpass.getuser` when :func:`os.getlogin` is
+    unavailable (e.g., inside CI containers or systemd services that lack a
+    controlling terminal).
+    """
+    import getpass  # noqa: PLC0415
+    import os as _os  # noqa: PLC0415
+    import platform  # noqa: PLC0415
+    import uuid  # noqa: PLC0415
+
+    try:
+        username = _os.getlogin()
+    except OSError:
+        username = getpass.getuser()
+
+    return MachineInfo(
+        hostname=platform.node(),
+        username=username,
+        os=platform.system(),
+        os_version=platform.version(),
+        scan_id=str(uuid.uuid4()),
+    )
+
+
+class Severity(StrEnum):
+    """Finding severity levels."""
+
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
+
+
+class TransportType(StrEnum):
+    """MCP server transport types."""
+
+    STDIO = "stdio"
+    SSE = "sse"
+    STREAMABLE_HTTP = "streamable-http"
+    UNKNOWN = "unknown"
+
+
+class ServerConfig(BaseModel):
+    """A parsed MCP server configuration."""
+
+    name: str
+    client: str
+    config_path: Path
+    transport: TransportType = TransportType.UNKNOWN
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    url: str | None = None
+    # HTTP headers explicitly configured for this server (e.g. Authorization,
+    # x-api-key).  Populated by the parser from the "headers" key in the raw
+    # server entry.  Present across all supported clients — the MCP config
+    # format is identical for Claude Desktop, Cursor, VS Code, and others.
+    headers: dict[str, str] = Field(default_factory=dict)
+    raw: dict = Field(default_factory=dict)
+    # MCP capability declarations from the server config entry.
+    # e.g. {"sampling": {}, "resources": {"subscribe": True}}
+    # None means the config entry has no 'capabilities' key.
+    capabilities: dict | None = None
+    # True when this server was discovered via --project (repo-level config file).
+    # Used by _apply_project_scan() to emit TRUST-001.  Never set by the normal
+    # user-level discovery path so default-scan behaviour is unchanged.
+    is_project_scoped: bool = False
+    # True when the config entry launches the server through ``mcp-audit run``
+    # (EPIC-0009 Story 1.2). ``command``/``args`` then hold the wrapped
+    # server's own launch, so every analyzer, the lock and the launch gate see
+    # what actually runs; ``raw`` keeps the entry as written.
+    wrapped: bool = False
+    # The wrapper's ``--mode`` (``monitor`` or ``enforce``) when ``wrapped``.
+    wrap_mode: str | None = None
+
+    # ── JSON serialisation: launch credentials never leave in clear (STORY-0108)
+    #
+    # JSON scan output, ``check --json`` and native snapshots dump servers with
+    # ``model_dump_json``.  A launch command or URL can carry a credential
+    # (a database URL with a password before ``@``, an ``--api-key`` value), so
+    # in JSON mode the command, args, url and matching keys of ``raw`` have URL
+    # userinfo and SECRET_PATTERNS matches replaced with ``[REDACTED]``
+    # (``supply_chain.redact_args``).  The in-memory object is unchanged, so
+    # analyzers, lock and rug-pull hashing still see the real values.  ``env``
+    # values (and ``raw["env"]``) go through ``supply_chain.redact_env_values``
+    # for every client (STORY-0118): references and plainly benign settings are
+    # kept, a credential becomes ``[REDACTED]`` / ``[REDACTED-FLAG]``.
+    # Header values are
+    # (``supply_chain.redact_header_values``), and so are the secret-only keys
+    # of Codex and Gemini CLI entries in ``raw`` (STORY-0110).
+
+    @field_serializer("headers", when_used="json")
+    def _serialize_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+            redact_header_values,
+        )
+
+        return redact_header_values(headers)
+
+    # Servers read from an MCP gateway's config (``<gateway>-upstream``
+    # clients, STORY-0111) also have their ``env`` values redacted
+    # (``supply_chain.redact_env_values``), and in ``raw`` their ``env`` and
+    # every secret-named key (``supply_chain.redact_nested_secrets``), on top
+    # of the all-client header and secret-key redaction: a gateway config
+    # typically holds every upstream's keys.
+
+    @field_serializer("env", when_used="json")
+    def _serialize_env(self, env: dict[str, str]) -> dict[str, str]:
+        from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+            redact_env_values,
+        )
+
+        return redact_env_values(env)
+
+    @field_serializer("command", "url", when_used="json")
+    def _serialize_launch_text(self, value: str | None) -> str | None:
+        from mcp_audit.analyzers.supply_chain import redact_url  # noqa: PLC0415
+
+        return redact_url(value)
+
+    @field_serializer("args", when_used="json")
+    def _serialize_args(self, args: list[str]) -> list[str]:
+        from mcp_audit.analyzers.supply_chain import redact_args  # noqa: PLC0415
+
+        return redact_args([str(arg) for arg in args])
+
+    @field_serializer("raw", when_used="json")
+    def _serialize_raw(self, raw: dict) -> dict:
+        from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+            redact_args,
+            redact_url,
+        )
+
+        if not isinstance(raw, dict):
+            return raw
+        out = dict(raw)
+        args = out.get("args")
+        if isinstance(args, list):
+            if all(isinstance(a, str) for a in args):
+                out["args"] = redact_args(args)
+            else:
+                out["args"] = [
+                    redact_args([a])[0] if isinstance(a, str) else a for a in args
+                ]
+        for key in _RAW_LAUNCH_TEXT_KEYS:
+            value = out.get(key)
+            if isinstance(value, str):
+                out[key] = redact_url(value)
+        out = _redact_raw_secrets(out)
+        # OpenCode (STORY-0142): ``command`` is an argv list and the env table
+        # is ``environment``.
+        from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+            redact_env_values as _redact_environment,
+        )
+
+        command = out.get("command")
+        if isinstance(command, list):
+            out["command"] = [
+                redact_args([a])[0] if isinstance(a, str) else a for a in command
+            ]
+            if all(isinstance(a, str) for a in command):
+                out["command"] = redact_args(command)
+        if isinstance(out.get("environment"), dict):
+            out["environment"] = _redact_environment(out["environment"])
+        if isinstance(out.get("env"), dict):
+            from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+                redact_env_values as _redact_env,
+            )
+
+            out["env"] = _redact_env(out["env"])
+        if self.client in _GATEWAY_CLIENTS:
+            from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+                redact_env_values,
+                redact_nested_secrets,
+            )
+
+            # Every other key the gateway wrote (1MCP ``oauth.clientSecret``,
+            # MCPHub fields, …): secret-named values and credential formats.
+            out = redact_nested_secrets(  # type: ignore[assignment]
+                out,
+                frozenset({"env", "headers", "args", *_RAW_LAUNCH_TEXT_KEYS}),
+            )
+            if isinstance(out.get("env"), dict):
+                out["env"] = redact_env_values(out["env"])
+        return out
+
+
+def _redact_raw_secrets(out: dict) -> dict:
+    """Redact the secret-carrying keys of a raw entry in place (STORY-0110).
+
+    ``headers`` (Gemini CLI, Claude, …) and ``http_headers`` (Codex) go
+    through ``supply_chain.redact_header_values``; Codex's retired literal
+    ``bearer_token`` and the OAuth client secret (Codex ``oauth.client_secret``,
+    Gemini CLI ``oauth.clientSecret``) are replaced unless they are only an
+    environment reference.
+    """
+    from mcp_audit.analyzers.credentials import (  # noqa: PLC0415
+        is_header_value_env_only,
+    )
+    from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+        REDACTION_MARKER,
+        redact_header_values,
+    )
+
+    def _secret(value: object) -> object:
+        if isinstance(value, str) and value and not is_header_value_env_only(value):
+            return REDACTION_MARKER
+        return value
+
+    for key in _RAW_HEADER_KEYS:
+        if isinstance(out.get(key), dict):
+            out[key] = redact_header_values(out[key])
+    # Codex's http_headers_helper is a shell command that prints the headers,
+    # so it often carries the credential itself.
+    from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+        redact_command_text,
+    )
+
+    helper = out.get("http_headers_helper")
+    if isinstance(helper, str):
+        out["http_headers_helper"] = redact_command_text(helper)
+    if "bearer_token" in out:
+        out["bearer_token"] = _secret(out["bearer_token"])
+    oauth = out.get("oauth")
+    if isinstance(oauth, dict):
+        oauth = dict(oauth)
+        for key in _RAW_OAUTH_SECRET_KEYS:
+            if key in oauth:
+                oauth[key] = _secret(oauth[key])
+        out["oauth"] = oauth
+    return out
+
+
+#: Keys of a raw server entry holding HTTP headers (``http_headers``: Codex).
+_RAW_HEADER_KEYS: tuple[str, ...] = ("headers", "http_headers")
+
+#: OAuth client-secret spellings: Codex (``client_secret``), Gemini CLI
+#: (``clientSecret``).
+_RAW_OAUTH_SECRET_KEYS: tuple[str, ...] = ("client_secret", "clientSecret")
+
+
+#: Keys of a raw server entry whose string value is a launch command or an
+#: endpoint URL (``serverUrl``: Windsurf; ``httpUrl``: Gemini CLI).
+_RAW_LAUNCH_TEXT_KEYS: tuple[str, ...] = ("command", "url", "serverUrl", "httpUrl")
+
+
+class ToolInfo(BaseModel):
+    """A tool exposed by a live MCP server.
+
+    ``title``, ``output_schema`` and ``annotations`` are carried as the server
+    sent them (wire format, camelCase keys inside ``annotations``) so
+    ``mcp-audit lock --connect`` can digest the whole definition — see
+    :mod:`mcp_audit.lock.tool_digests`. ``None`` means the server did not
+    send the field.
+    """
+
+    name: str
+    title: str | None = None
+    description: str | None = None
+    input_schema: dict = Field(default_factory=dict)
+    output_schema: dict | None = None
+    annotations: dict | None = None
+
+
+class ResourceInfo(BaseModel):
+    """A resource exposed by a live MCP server."""
+
+    uri: str
+    name: str | None = None
+    description: str | None = None
+
+
+class PromptInfo(BaseModel):
+    """A prompt template exposed by a live MCP server."""
+
+    name: str
+    description: str | None = None
+
+
+class ServerEnumeration(BaseModel):
+    """Live enumeration results from connecting to an MCP server.
+
+    Populated by :func:`~mcp_audit.mcp_client.connect_and_enumerate`.
+    When ``error`` is set, the other fields are empty.
+    ``server_stderr`` carries any text the server process wrote to stderr
+    during startup; ``None`` when no output was captured (e.g. SSE servers).
+    """
+
+    tools: list[ToolInfo] = Field(default_factory=list)
+    resources: list[ResourceInfo] = Field(default_factory=list)
+    prompts: list[PromptInfo] = Field(default_factory=list)
+    error: str | None = None
+    server_stderr: str | None = None
+    #: Set when the handshake succeeded but ``tools/list`` failed or could not
+    #: be read to the last page. ``tools`` is then empty or partial and must
+    #: not be read as "this server has no tools" — ``lock --connect`` keeps
+    #: the previous record and ``lock --verify --connect`` reports the server
+    #: as not compared. ``error`` stays ``None`` (resources and prompts may
+    #: still have been read).
+    tools_error: str | None = None
+
+
+_EVIDENCE_LINE_RE = re.compile(r"Line (\d{1,9}): ")
+
+
+class Finding(BaseModel):
+    """A security finding from an analyzer."""
+
+    id: str
+    severity: Severity
+    analyzer: str
+    client: str
+    server: str
+    tool: str | None = None
+    title: str
+    description: str
+    evidence: str
+    remediation: str
+    cwe: str | None = None
+    finding_path: str | None = None
+    # OWASP MCP Top 10 category codes (e.g., ["MCP03", "MCP10"]).
+    # A finding may map to multiple categories. Empty list = unmapped.
+    owasp_mcp_top_10: list[str] = Field(default_factory=list)
+    # CVE identifiers associated with this finding (e.g. ["CVE-2026-33032"]).
+    # Empty list = no CVE cross-reference. Populated by analyzers and the rule
+    # engine for findings that map to a named, public vulnerability.
+    cve: list[str] = Field(default_factory=list)
+    # Exploitability signals per CVE (CISA KEV, FIRST EPSS, public PoC), set by
+    # mcp_audit.exploit.signals.annotate. Empty = no CVE or nothing known.
+    exploit: dict[str, dict] = Field(default_factory=dict)
+    # 1-based line in ``finding_path`` where the matched text sits (STORY-0141).
+    # Set on agent-file content findings, whose evidence starts "Line N:";
+    # ``None`` everywhere else, including tool-description findings. SARIF
+    # puts it in ``region.startLine``.
+    line: int | None = None
+
+    @model_validator(mode="after")
+    def _line_from_evidence(self) -> Finding:
+        """Fill ``line`` from an agent-file finding's ``Line N:`` evidence."""
+        # getattr: tests pass MagicMock(spec=Finding) through ScanResult.
+        evidence = getattr(self, "evidence", None)
+        if (
+            getattr(self, "line", 0) is None
+            and getattr(self, "analyzer", None) in ("agent_files", "poisoning")
+            and isinstance(evidence, str)
+            and getattr(self, "finding_path", None)
+        ):
+            m = _EVIDENCE_LINE_RE.match(evidence)
+            if m is not None:
+                self.line = int(m.group(1))
+        return self
+
+
+class AttackPath(BaseModel):
+    """A multi-hop attack path across MCP servers."""
+
+    id: str  # e.g., "PATH-001"
+    severity: Severity
+    title: str  # e.g., "File exfiltration via network"
+    description: str  # Plain-English narrative of the attack
+    hops: list[str]  # Server names in order: ["filesystem", "fetch"]
+    source_capability: str  # e.g., "file_read"
+    sink_capability: str  # e.g., "network_out"
+
+
+class AttackPathSummary(BaseModel):
+    """Summary of all attack paths and recommended removal targets."""
+
+    paths: list[AttackPath] = Field(default_factory=list)
+    hitting_set: list[str] = Field(default_factory=list)  # Servers to remove
+    # Maps every server that appears in a path to the path IDs it would break.
+    paths_broken_by: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ScanScore(BaseModel):
+    """Score and letter grade for a completed scan."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    # "numeric" is the JSON key; Python code uses .numeric_score throughout.
+    numeric_score: int = Field(
+        validation_alias="numeric",
+        serialization_alias="numeric",
+    )
+    grade: str
+    positive_signals: list[str]
+    deductions: list[str]
+    # Audit field: "default" when hardcoded weights are used; "policy:<path>"
+    # when a governance policy supplied custom weights for this scan.
+    weights_source: str = "default"
+
+
+class RegistryStats(BaseModel):
+    """Metadata about the known-server registry used during a scan."""
+
+    entry_count: int
+    schema_version: str
+    last_updated: str
+
+
+class FeedStatus(BaseModel):
+    """Freshness of an optional advisory feed consulted during a scan.
+
+    ``absent`` means no feed was supplied, or the feed could not be used
+    (unreadable, rollback, integrity failure). ``scan`` never fails the run
+    because a feed expired — that is ``expired``, matching skipped.
+    """
+
+    state: Literal["fresh", "expired", "absent"] = "absent"
+    published_at: str | None = None
+    expires: str | None = None
+    age_days: int | None = None
+
+
+def printable_text(value: str) -> str:
+    """Return *value* with lone UTF-16 surrogates written as ``\\udXXX`` escapes.
+
+    A JSON key or a non-UTF-8 file name can carry a lone surrogate; it is a
+    valid ``str`` but cannot be encoded, so it would crash every serialiser.
+    """
+    if value.isascii():
+        return value
+    return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+class LockStatus(BaseModel):
+    """Result of automatic ``mcp-lock.json`` verification during ``check``/``scan``.
+
+    Mirrors :class:`FeedStatus`'s shape (R9 precedent): a small, always-present
+    summary object rather than requiring callers to re-derive it from
+    ``findings``. ``present=False`` (the default) means no ``mcp-lock.json``
+    was found for any scanned server — STORY-0070's "no lock file → no change
+    in behavior" contract; ``findings`` stays 0 and no LOCK-* findings are
+    appended to the scan in that case. ``verified`` is ``True`` only when a
+    lock was present and produced zero LOCK-001/002/004/005 findings.
+    """
+
+    present: bool = False
+    verified: bool = False
+    findings: int = 0
+    checked_servers: int = 0
+    #: Absolute paths to every distinct ``mcp-lock.json`` consulted (a
+    #: monorepo may have more than one — the nearest ancestor per server).
+    lock_paths: list[str] = Field(default_factory=list)
+    #: Locked server keys whose package resolution was never confirmed
+    #: (``source: "unresolved"``, e.g. locked while offline) — surfaced so a
+    #: clean ``verified=True`` never silently hides one.
+    unresolved_entries: list[str] = Field(default_factory=list)
+    #: Top-level lock sections present but never checked by mcp-audit (e.g.
+    #: ``["trees"]``) — merged across every lock file consulted. See
+    #: ``lock/model.py::unverified_sections()``; mcp-audit never assumes an
+    #: internal shape for a foreign section, so this can only ever name it.
+    unverified_sections: list[str] = Field(default_factory=list)
+    #: Config files seen during verification that live outside every lock
+    #: root consulted — not described by any lock, so they produce no LOCK
+    #: finding in either direction (R61). Named here so the skip is visible.
+    outside_root: list[str] = Field(default_factory=list)
+    #: Servers declared inline in a project subagent definition
+    #: (``claude-code-agent``, STORY-0094), or by a repository's
+    #: skills-directory plugin (``claude-code-plugin``, project-scoped,
+    #: STORY-0095), that sit under a lock root. The lock never records them, so
+    #: they are skipped rather than failed; named here so a ``verified`` lock
+    #: never reads as covering them.
+    not_covered: list[str] = Field(default_factory=list)
+    #: Locked servers with recorded tool definitions (STORY-0086). Automatic
+    #: verification never starts servers, so these are never compared here;
+    #: the count lets the ``Lock:`` line say so instead of reading as fully
+    #: verified.
+    tools_recorded: int = 0
+
+    @field_validator(
+        "lock_paths",
+        "unresolved_entries",
+        "unverified_sections",
+        "outside_root",
+        "not_covered",
+        mode="after",
+    )
+    @classmethod
+    def _printable_names(cls, names: list[str]) -> list[str]:
+        """Escape lone surrogates (lock key names, odd file names)."""
+        return [printable_text(n) for n in names]
+
+
+class ScanResult(BaseModel):
+    """Complete results from a scan run."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    version: str = __version__
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    machine: MachineInfo = Field(
+        default_factory=_collect_machine_info,
+        serialization_alias="machine_info",
+    )
+    clients_scanned: int = 0
+    servers_found: int = 0
+    servers: list[ServerConfig] = Field(default_factory=list)
+    findings: list[Finding] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    attack_path_summary: AttackPathSummary | None = None
+    score: ScanScore | None = None
+    registry_stats: RegistryStats | None = None
+    feed_status: FeedStatus = Field(default_factory=FeedStatus)
+    lock_status: LockStatus = Field(default_factory=LockStatus)
+    # As-of dates and origin of the exploit signals shown on CVE findings
+    # (mcp_audit.exploit.signals); None when no finding carries a CVE.
+    exploit_data: dict | None = None
+    findings_below_threshold: int = 0
+    active_severity_threshold: str | None = None
+    # Captured stderr from stdio MCP server subprocesses launched during --connect.
+    # Populated only when --connect is used; empty for static-only scans.
+    # Surfaced in terminal output via --verbose; always present in JSON output.
+    server_logs: list[str] = Field(default_factory=list)
+
+    @property
+    def critical_count(self) -> int:
+        return sum(1 for f in self.findings if f.severity == Severity.CRITICAL)
+
+    @property
+    def high_count(self) -> int:
+        return sum(1 for f in self.findings if f.severity == Severity.HIGH)
+
+    @property
+    def has_findings(self) -> bool:
+        return len(self.findings) > 0
+
+    @property
+    def max_severity(self) -> Severity | None:
+        if not self.findings:
+            return None
+        order = [
+            Severity.CRITICAL,
+            Severity.HIGH,
+            Severity.MEDIUM,
+            Severity.LOW,
+            Severity.INFO,
+        ]
+        for sev in order:
+            if any(f.severity == sev for f in self.findings):
+                return sev
+        return None

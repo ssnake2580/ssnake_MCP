@@ -1,0 +1,505 @@
+"""Baseline snapshot and drift detection manager.
+
+Users can capture a point-in-time snapshot of their MCP configuration and
+then compare future scans against it to detect drift: new servers, removed
+servers, or configuration changes.
+
+Baselines are architecturally separate from the rug-pull analyzer.  The
+rug-pull analyzer tracks automatic per-scan hashes; baselines are explicit,
+user-named snapshots stored in the platform user config directory under
+``mcp-audit/baselines/`` (e.g. ``~/.config/mcp-audit/baselines/`` on Linux).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path
+
+from platformdirs import user_config_dir
+from pydantic import BaseModel, Field
+
+from mcp_audit import __version__
+from mcp_audit._fs import atomic_write
+from mcp_audit.models import ServerConfig, Severity
+
+_SCANNER_VERSION = __version__
+_DEFAULT_STORAGE_DIR = Path(user_config_dir("mcp-audit")) / "baselines"
+
+logger = logging.getLogger(__name__)
+
+_SEVERITY_ORDER: dict[Severity, int] = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+    Severity.INFO: 4,
+}
+
+
+# ── Data models ───────────────────────────────────────────────────────────────
+
+
+class BaselineServer(BaseModel):
+    """Snapshot of a single MCP server at the time of baseline capture.
+
+    ``env`` stores only environment variable key names — never values — to
+    avoid persisting secrets to disk.
+    """
+
+    name: str
+    client: str
+    command: str | None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    transport: str | None = None
+    config_hash: str
+
+
+class Baseline(BaseModel):
+    """A complete named snapshot of MCP server state."""
+
+    name: str
+    created_at: datetime
+    scanner_version: str
+    servers: list[BaselineServer] = Field(default_factory=list)
+    server_count: int
+    finding_count: int | None = None
+    config_paths: list[str] = Field(default_factory=list)
+
+
+class DriftType(StrEnum):
+    """Categories of configuration drift detected against a baseline."""
+
+    SERVER_ADDED = "server_added"
+    SERVER_REMOVED = "server_removed"
+    COMMAND_CHANGED = "command_changed"
+    ARGS_CHANGED = "args_changed"
+    ENV_CHANGED = "env_changed"
+    HASH_CHANGED = "hash_changed"
+
+
+_DRIFT_SEVERITY: dict[DriftType, Severity] = {
+    DriftType.SERVER_ADDED: Severity.MEDIUM,
+    DriftType.SERVER_REMOVED: Severity.INFO,
+    DriftType.COMMAND_CHANGED: Severity.HIGH,
+    DriftType.ARGS_CHANGED: Severity.MEDIUM,
+    DriftType.ENV_CHANGED: Severity.MEDIUM,
+    DriftType.HASH_CHANGED: Severity.HIGH,
+}
+
+
+class DriftFinding(BaseModel):
+    """A single detected drift item between a baseline and the current state."""
+
+    drift_type: DriftType
+    server_name: str
+    client: str
+    severity: Severity
+    description: str
+    baseline_value: str | None = None
+    current_value: str | None = None
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _compute_config_hash(server: ServerConfig) -> str:
+    """Return the SHA-256 digest of the server's raw config dict.
+
+    Uses the same algorithm as the rug-pull analyzer's ``raw`` hash so that
+    the two systems are directly comparable.
+    """
+    return hashlib.sha256(json.dumps(server.raw, sort_keys=True).encode()).hexdigest()
+
+
+def _server_to_baseline_server(server: ServerConfig) -> BaselineServer:
+    """Convert a live ``ServerConfig`` into a ``BaselineServer`` snapshot.
+
+    Env values are intentionally dropped; only key names are stored.
+    """
+    return BaselineServer(
+        name=server.name,
+        client=server.client,
+        command=server.command,
+        args=list(server.args),
+        env=dict.fromkeys(server.env.keys(), ""),
+        transport=server.transport.value if server.transport is not None else None,
+        config_hash=_compute_config_hash(server),
+    )
+
+
+# ── BaselineManager ───────────────────────────────────────────────────────────
+
+
+class BaselineManager:
+    """Manages storage and comparison of MCP configuration baselines.
+
+    Args:
+        storage_dir: Directory in which baseline JSON files are stored.
+            Defaults to the platform user config directory under
+            ``mcp-audit/baselines/`` (resolved via ``platformdirs``).
+    """
+
+    def __init__(self, storage_dir: Path | None = None) -> None:
+        self._storage_dir = (storage_dir or _DEFAULT_STORAGE_DIR).resolve()
+        # Security: 0o700 — only the owning user can list or enter this directory.
+        self._storage_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Populated by list() with (filename, exception) pairs for callers that
+        # want to surface load errors to the user (e.g. the CLI's baseline list).
+        self.load_errors: list[tuple[str, Exception]] = []
+
+    # ── private helpers ────────────────────────────────────────────────────────
+
+    def _safe_baseline_path(self, name: str) -> Path:
+        """Resolve and validate that *name* stays within the storage directory.
+
+        Security: prevents path-traversal attacks where a caller passes a name
+        like ``../../etc/cron.d/evil``.  After stripping the ``.json`` suffix,
+        any remaining path separator (``/`` or ``..``) is rejected outright, and
+        the fully-resolved candidate path is confirmed to sit inside
+        ``self._storage_dir``.
+
+        Args:
+            name: Baseline label, with or without the ``.json`` extension.
+
+        Returns:
+            Validated absolute :class:`Path` for the baseline JSON file.
+
+        Raises:
+            ValueError: If *name* contains path-separator characters or would
+                resolve outside ``self._storage_dir``.
+        """
+        stem = name.removesuffix(".json")
+        # Reject names that contain explicit path components.
+        if "/" in stem or "\\" in stem or stem in (".", ".."):
+            raise ValueError(
+                f"Invalid baseline name {name!r}: must not contain path separators."
+            )
+        candidate = (self._storage_dir / f"{stem}.json").resolve()
+        # Confirm the resolved path is inside the storage directory.
+        try:
+            candidate.relative_to(self._storage_dir)
+        except ValueError:
+            raise ValueError(
+                f"Invalid baseline name {name!r}: resolves outside the "
+                "storage directory."
+            ) from None
+        return candidate
+
+    # ── persistence ───────────────────────────────────────────────────────────
+
+    def save(
+        self,
+        servers: list[ServerConfig],
+        config_paths: list[str],
+        name: str | None = None,
+        finding_count: int | None = None,
+    ) -> Baseline:
+        """Capture a baseline snapshot of the provided servers and persist it.
+
+        Args:
+            servers: Live server configurations to snapshot.
+            config_paths: Config file paths included in this snapshot.
+            name: Human-readable label.  Auto-generated from timestamp if
+                ``None``.
+            finding_count: Number of findings produced by the scan at save
+                time.  ``None`` for baselines saved before this field existed.
+
+        Returns:
+            The saved :class:`Baseline`.
+        """
+        if name is None:
+            name = datetime.now(UTC).strftime("baseline-%Y%m%d-%H%M%S")
+
+        baseline = Baseline(
+            name=name,
+            created_at=datetime.now(UTC),
+            scanner_version=_SCANNER_VERSION,
+            servers=[_server_to_baseline_server(s) for s in servers],
+            server_count=len(servers),
+            finding_count=finding_count,
+            config_paths=config_paths,
+        )
+
+        path = self._safe_baseline_path(name)
+        content = baseline.model_dump_json(indent=2).encode("utf-8")
+        # Security: owner read/write only, set on every write; atomic.
+        atomic_write(path, content)
+
+        return baseline
+
+    def list(self) -> list[Baseline]:
+        """Return all saved baselines, newest first.
+
+        Malformed or unreadable files are skipped with a warning.
+
+        Returns:
+            Baselines sorted by :attr:`Baseline.created_at` descending.
+        """
+        self.load_errors = []
+        baselines: list[Baseline] = []
+        for path in self._storage_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                baselines.append(Baseline.model_validate(data))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Skipping malformed baseline file %s: %s", path.name, exc
+                )
+                self.load_errors.append((path.name, exc))
+        baselines.sort(key=lambda b: b.created_at, reverse=True)
+        return baselines
+
+    def load(self, name: str) -> Baseline:
+        """Load a baseline by name.
+
+        Args:
+            name: Baseline label, with or without the ``.json`` extension.
+
+        Returns:
+            The loaded :class:`Baseline`.
+
+        Raises:
+            FileNotFoundError: If no baseline with that name exists.
+            ValueError: If *name* contains path-traversal sequences, or the
+                file is not valid JSON, not a baseline, or nested too deeply.
+        """
+        path = self._safe_baseline_path(name)
+        stem = name.removesuffix(".json")
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No baseline named {stem!r} found in {self._storage_dir}. "
+                "Run 'mcp-audit baseline list' to see available baselines."
+            )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return Baseline.model_validate(data)
+        except RecursionError as exc:
+            raise ValueError(f"Baseline {stem!r} is nested too deeply") from exc
+
+    def load_latest(self) -> Baseline | None:
+        """Return the most recently created baseline, or ``None`` if none exist.
+
+        Returns:
+            The newest :class:`Baseline` or ``None``.
+        """
+        baselines = self.list()
+        return baselines[0] if baselines else None
+
+    def exists(self, name: str) -> bool:
+        """Return whether a baseline with *name* exists.
+
+        Args:
+            name: Baseline label, with or without the ``.json`` extension.
+
+        Returns:
+            ``True`` if the baseline file is present; ``False`` otherwise.
+            Also returns ``False`` when *name* contains path-traversal
+            sequences (rather than raising).
+        """
+        try:
+            path = self._safe_baseline_path(name)
+        except ValueError:
+            return False
+        return path.exists()
+
+    def delete(self, name: str) -> None:
+        """Delete a baseline file.
+
+        Confirmation prompting is handled at the CLI layer; this method
+        performs the deletion unconditionally once called.
+
+        Args:
+            name: Baseline label, with or without the ``.json`` extension.
+
+        Raises:
+            ValueError: If no baseline with that name exists or *name* contains
+                path-traversal sequences.
+        """
+        path = self._safe_baseline_path(name)
+        stem = name.removesuffix(".json")
+        if not path.exists():
+            raise ValueError(
+                f"No baseline named {stem!r} found in {self._storage_dir}."
+            )
+        path.unlink()
+
+    def export(self, name: str) -> str:
+        """Return the raw JSON content of a baseline for stdout piping.
+
+        Args:
+            name: Baseline label, with or without the ``.json`` extension.
+
+        Returns:
+            Raw JSON string (no Rich formatting).
+
+        Raises:
+            FileNotFoundError: If the baseline does not exist.
+            ValueError: If *name* contains path-traversal sequences.
+        """
+        path = self._safe_baseline_path(name)
+        stem = name.removesuffix(".json")
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No baseline named {stem!r} found in {self._storage_dir}."
+            )
+        return path.read_text(encoding="utf-8")
+
+    # ── comparison ────────────────────────────────────────────────────────────
+
+    def compare(
+        self,
+        baseline: Baseline,
+        current_servers: list[ServerConfig],
+    ) -> list[DriftFinding]:
+        """Detect drift between a baseline snapshot and the current server state.
+
+        Servers are matched by ``(client, name)`` pair so that two different
+        AI clients can each have a server named "filesystem" without
+        producing false positives.
+
+        A single server can produce multiple :class:`DriftFinding` entries
+        (e.g. both ``hash_changed`` and ``command_changed`` simultaneously).
+
+        Args:
+            baseline: The reference snapshot to compare against.
+            current_servers: Live server configurations from the current scan.
+
+        Returns:
+            List of :class:`DriftFinding` sorted by severity descending
+            (highest severity first).
+        """
+        findings: list[DriftFinding] = []
+
+        baseline_map: dict[tuple[str, str], BaselineServer] = {
+            (bs.client, bs.name): bs for bs in baseline.servers
+        }
+        current_map: dict[tuple[str, str], ServerConfig] = {
+            (s.client, s.name): s for s in current_servers
+        }
+
+        # Detect added servers
+        for key, server in current_map.items():
+            if key not in baseline_map:
+                findings.append(
+                    DriftFinding(
+                        drift_type=DriftType.SERVER_ADDED,
+                        server_name=server.name,
+                        client=server.client,
+                        severity=_DRIFT_SEVERITY[DriftType.SERVER_ADDED],
+                        description=(
+                            f"Server '{server.name}' (client: {server.client}) "
+                            "was not present in the baseline — it has been added "
+                            "since the snapshot was taken."
+                        ),
+                        baseline_value=None,
+                        current_value=(
+                            f"{server.command} {' '.join(server.args)}".strip()
+                        ),
+                    )
+                )
+
+        # Detect removed servers
+        for key, bs in baseline_map.items():
+            if key not in current_map:
+                findings.append(
+                    DriftFinding(
+                        drift_type=DriftType.SERVER_REMOVED,
+                        server_name=bs.name,
+                        client=bs.client,
+                        severity=_DRIFT_SEVERITY[DriftType.SERVER_REMOVED],
+                        description=(
+                            f"Server '{bs.name}' (client: {bs.client}) "
+                            "was present in the baseline but is no longer configured."
+                        ),
+                        baseline_value=f"{bs.command} {' '.join(bs.args)}".strip(),
+                        current_value=None,
+                    )
+                )
+
+        # Detect per-field drift for servers present in both
+        for key in baseline_map.keys() & current_map.keys():
+            bs = baseline_map[key]
+            srv = current_map[key]
+            current_hash = _compute_config_hash(srv)
+
+            if current_hash != bs.config_hash:
+                findings.append(
+                    DriftFinding(
+                        drift_type=DriftType.HASH_CHANGED,
+                        server_name=srv.name,
+                        client=srv.client,
+                        severity=_DRIFT_SEVERITY[DriftType.HASH_CHANGED],
+                        description=(
+                            f"The full configuration of '{srv.name}' "
+                            f"(client: {srv.client}) has changed since the baseline."
+                        ),
+                        baseline_value=bs.config_hash[:16] + "…",
+                        current_value=current_hash[:16] + "…",
+                    )
+                )
+
+            if srv.command != bs.command:
+                findings.append(
+                    DriftFinding(
+                        drift_type=DriftType.COMMAND_CHANGED,
+                        server_name=srv.name,
+                        client=srv.client,
+                        severity=_DRIFT_SEVERITY[DriftType.COMMAND_CHANGED],
+                        description=(
+                            f"The executable command for '{srv.name}' "
+                            f"(client: {srv.client}) has changed since the baseline."
+                        ),
+                        baseline_value=bs.command,
+                        current_value=srv.command,
+                    )
+                )
+
+            if list(srv.args) != list(bs.args):
+                findings.append(
+                    DriftFinding(
+                        drift_type=DriftType.ARGS_CHANGED,
+                        server_name=srv.name,
+                        client=srv.client,
+                        severity=_DRIFT_SEVERITY[DriftType.ARGS_CHANGED],
+                        description=(
+                            f"The arguments for '{srv.name}' "
+                            f"(client: {srv.client}) have changed since the baseline."
+                        ),
+                        baseline_value=json.dumps(list(bs.args)),
+                        current_value=json.dumps(list(srv.args)),
+                    )
+                )
+
+            current_env_keys = set(srv.env.keys())
+            baseline_env_keys = set(bs.env.keys())
+            if current_env_keys != baseline_env_keys:
+                added = sorted(current_env_keys - baseline_env_keys)
+                removed = sorted(baseline_env_keys - current_env_keys)
+                parts = []
+                if added:
+                    parts.append(f"added: {added}")
+                if removed:
+                    parts.append(f"removed: {removed}")
+                findings.append(
+                    DriftFinding(
+                        drift_type=DriftType.ENV_CHANGED,
+                        server_name=srv.name,
+                        client=srv.client,
+                        severity=_DRIFT_SEVERITY[DriftType.ENV_CHANGED],
+                        description=(
+                            f"Environment variable keys for '{srv.name}' "
+                            f"(client: {srv.client}) have changed since the baseline. "
+                            + "; ".join(parts)
+                        ),
+                        baseline_value=json.dumps(sorted(baseline_env_keys)),
+                        current_value=json.dumps(sorted(current_env_keys)),
+                    )
+                )
+
+        findings.sort(key=lambda f: _SEVERITY_ORDER.get(f.severity, 99))
+        return findings

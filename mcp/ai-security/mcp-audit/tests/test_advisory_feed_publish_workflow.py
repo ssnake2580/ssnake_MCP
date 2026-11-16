@@ -1,0 +1,325 @@
+"""Structural checks for .github/workflows/advisory-feed-publish.yml.
+
+R30 split the single `publish` job into `build` (read-only) and `publish`
+(write) so the destination that Amendment 7 gated signing on actually
+exists. R31 removed the R30 gate that skipped `publish` when advisory
+content was unchanged — that gate froze `expires` on a feed with a TTL,
+which is worse than a noisy commit log. R32 turned signing on: `build`
+declares `environment: feed-signing` (the only place
+`MCP_AUDIT_FEED_SIGNING_KEY` is reachable) and signs with a minisign
+project key; `publish` still has no access to that secret at all. These
+tests pin the shape of that split, the unconditional publish, and the new
+signing step, so a future edit cannot silently recombine the two jobs'
+capabilities, re-widen a permission, reintroduce a publish gate, or let
+the signing secret leak into the wrong job.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKFLOW = ROOT / ".github" / "workflows" / "advisory-feed-publish.yml"
+CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+SETUP_PYTHON = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+UPLOAD = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+DOWNLOAD = "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
+
+
+def _load() -> dict:
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+
+
+def _on(workflow: dict) -> dict:
+    value = workflow.get("on", workflow.get(True))
+    assert isinstance(value, dict), "workflow is missing an `on:` block"
+    return value
+
+
+def _steps(job: dict) -> list[dict]:
+    return job["steps"]
+
+
+def _uses(steps: list[dict]) -> list[str]:
+    return [s.get("uses", "") for s in steps]
+
+
+def _run_text(steps: list[dict]) -> str:
+    return "\n".join(str(s.get("run", "")) for s in steps)
+
+
+def _has_secret_env(step: dict) -> bool:
+    return "MCP_AUDIT_FEED_SIGNING_KEY" in str(step.get("env", {}))
+
+
+def test_schedule_and_ttl_are_unchanged() -> None:
+    """R30 must not touch the cadence or the freshness design."""
+    on = _on(_load())
+    assert on["schedule"] == [{"cron": "0 14 * * 0"}]
+    assert "workflow_dispatch" in on
+
+
+def test_top_level_permissions_are_read_only() -> None:
+    wf = _load()
+    assert wf["permissions"] == {"contents": "read"}
+
+
+def test_exactly_two_jobs_named_build_and_publish() -> None:
+    jobs = _load()["jobs"]
+    assert set(jobs) == {"build", "publish"}
+
+
+def test_build_job_is_read_only() -> None:
+    build = _load()["jobs"]["build"]
+    assert build["permissions"] == {"contents": "read"}
+
+
+def test_publish_job_has_write_and_nothing_else() -> None:
+    publish = _load()["jobs"]["publish"]
+    assert publish["permissions"] == {"contents": "write"}
+
+
+def test_publish_depends_on_build_and_is_unconditional() -> None:
+    """R31: publish must run on every scheduled run, changed or not — a
+    TTL-backed feed cannot skip refreshing its expiry just because the
+    advisory content happens to be identical this week."""
+    publish = _load()["jobs"]["publish"]
+    assert publish["needs"] == "build"
+    assert "if" not in publish
+
+
+def test_build_never_checks_out_or_writes_the_feed_branch() -> None:
+    build = _load()["jobs"]["build"]
+    uses = _uses(_steps(build))
+    checkout_steps = [
+        s for s in _steps(build) if str(s.get("uses", "")).startswith(CHECKOUT)
+    ]
+    assert checkout_steps, "build must check out the repo to run mcp-audit advise"
+    for step in checkout_steps:
+        assert step.get("with", {}).get("ref") in (None, "main", "${{ github.ref }}")
+    run_text = _run_text(_steps(build))
+    assert "git push" not in run_text
+    assert "git commit" not in run_text
+    assert any(u.startswith(SETUP_PYTHON) for u in uses)
+    assert any(u.startswith(UPLOAD) for u in uses)
+
+
+def test_build_reads_the_live_feed_branch_not_a_local_file() -> None:
+    run_text = _run_text(_steps(_load()["jobs"]["build"]))
+    assert "git fetch --depth 1 origin feed" in run_text
+    assert "git archive FETCH_HEAD" in run_text
+    assert "--previous-index previous_feed/index.json" in run_text
+
+
+def test_build_diffs_with_feed_diff_script() -> None:
+    run_text = _run_text(_steps(_load()["jobs"]["build"]))
+    assert "scripts/feed_diff.py" in run_text
+    assert "--github-output" in run_text
+    assert '"$GITHUB_OUTPUT"' in run_text
+
+
+def test_build_declares_the_outputs_publish_consumes() -> None:
+    build = _load()["jobs"]["build"]
+    outputs = build["outputs"]
+    assert outputs["changed"] == "${{ steps.diff.outputs.changed }}"
+    assert outputs["changed_count"] == "${{ steps.diff.outputs.changed_count }}"
+    assert outputs["snapshot_version"] == "${{ steps.diff.outputs.snapshot_version }}"
+    assert outputs["count"] == "${{ steps.diff.outputs.count }}"
+    assert outputs["commit_message"] == "${{ steps.diff.outputs.commit_message }}"
+
+
+def test_publish_checks_out_the_feed_branch_and_downloads_the_artifact() -> None:
+    publish = _load()["jobs"]["publish"]
+    steps = _steps(publish)
+    checkout = next(s for s in steps if str(s.get("uses", "")).startswith(CHECKOUT))
+    assert checkout["with"]["ref"] == "feed"
+    assert any(str(s.get("uses", "")).startswith(DOWNLOAD) for s in steps)
+
+
+def test_publish_commit_message_comes_from_build_diff_classification() -> None:
+    """R31: the commit message is built entirely by scripts/feed_diff.py
+    (unit-tested separately) and passed through, not reconstructed with
+    ad hoc bash string interpolation in the workflow."""
+    publish = _load()["jobs"]["publish"]
+    commit_step = next(
+        s for s in _steps(publish) if "COMMIT_MESSAGE" in str(s.get("env", {}))
+    )
+    assert commit_step["env"]["COMMIT_MESSAGE"] == (
+        "${{ needs.build.outputs.commit_message }}"
+    )
+    run_text = commit_step["run"]
+    assert 'git commit -m "${COMMIT_MESSAGE}"' in run_text
+    assert "git push origin feed" in run_text
+
+
+def test_publish_has_a_belt_and_suspenders_empty_diff_guard() -> None:
+    """R31: publish is unconditional, so this is the only remaining guard
+    against an empty commit — defence-in-depth, expected to never fire
+    since snapshot_version/expires change every run."""
+    run_text = _run_text(_steps(_load()["jobs"]["publish"]))
+    assert "git diff --cached --quiet" in run_text
+
+
+def test_publish_copies_index_json_sig_alongside_index_json() -> None:
+    """Regression test for the 2026-09-07T19:40:39Z publish (snapshot_version
+    4): sign_feed() writes index.json.sig next to index.json in the candidate
+    artifact, not inside advisories/, so the replace step must copy it
+    explicitly. Missing this line published a feed whose index.json carried
+    a "signing" block but no signature to back it — every advisory verified
+    fine, but `mcp-audit feed verify` failed closed on the index itself
+    ("Missing signature artifact index.json.sig"), caught by
+    experiment-r32-offline-feed-verify.yml before any user consumed it, not
+    by this test suite. It is now."""
+    run_text = _run_text(_steps(_load()["jobs"]["publish"]))
+    assert "cp new_feed/index.json.sig index.json.sig" in run_text
+    # Must also be cleared before the copy, same as index.json itself, or a
+    # stale signature from a previous publish could survive a run that
+    # regresses this again.
+    assert "rm -rf advisories osv index.json index.json.sig" in run_text
+
+
+def test_build_declares_the_feed_signing_environment() -> None:
+    """The signing secret is only reachable inside this environment, which is
+    restricted (via its deployment-branch-policy, confirmed separately with
+    `gh api`, not just the repo UI setting) to the `main` branch."""
+    build = _load()["jobs"]["build"]
+    assert build["environment"] == "feed-signing"
+
+
+def test_publish_never_declares_an_environment_or_touches_the_signing_secret() -> None:
+    """`publish` keeps `contents: write` and must stay key-blind — it cannot
+    declare `environment: feed-signing` and cannot reference the secret."""
+    publish = _load()["jobs"]["publish"]
+    assert "environment" not in publish
+    run_text = _run_text(_steps(publish))
+    assert "secrets." not in run_text
+    assert "MCP_AUDIT_FEED_SIGNING_KEY" not in run_text
+    for step in _steps(publish):
+        assert "MCP_AUDIT_FEED_SIGNING_KEY" not in str(step.get("env", {}))
+
+
+def test_build_signs_with_a_runner_temp_minisign_keyfile() -> None:
+    """The secret is written once to a chmod-600 file under $RUNNER_TEMP — never
+    the checkout (where `git add` in `publish` could pick it up), never passed
+    inline on the command line, and never relied on via mcp-audit's own
+    $MCP_AUDIT_SIGNING_KEY (the name mismatch the secret was deliberately not
+    renamed to match) — and is removed by a trap regardless of how the step
+    exits."""
+    build = _load()["jobs"]["build"]
+    sign_step = next(s for s in _steps(build) if _has_secret_env(s))
+    assert sign_step["env"]["MCP_AUDIT_FEED_SIGNING_KEY"] == (
+        "${{ secrets.MCP_AUDIT_FEED_SIGNING_KEY }}"
+    )
+    run_text = sign_step["run"]
+    assert 'KEYFILE="${RUNNER_TEMP}' in run_text
+    assert "chmod 600" in run_text
+    assert "trap" in run_text
+    assert "--sign" in run_text
+    assert "--key-alt minisign" in run_text
+    assert '--key "$KEYFILE"' in run_text
+    # Never rely on the CLI's own env-var name for the private key as an
+    # actual shell variable — the secret is passed explicitly by path
+    # instead. (The name is discussed in a comment, which is fine; it must
+    # just never be expanded as $MCP_AUDIT_SIGNING_KEY.)
+    assert "MCP_AUDIT_SIGNING_KEY" not in sign_step.get("env", {})
+    assert "$MCP_AUDIT_SIGNING_KEY" not in run_text
+
+
+def test_build_verifies_the_signed_candidate_before_upload() -> None:
+    """A feed that fails its own verification must fail the workflow before
+    `publish` ever sees it, using the public key committed in this checkout."""
+    build = _load()["jobs"]["build"]
+    steps = _steps(build)
+    sign_idx = next(i for i, s in enumerate(steps) if _has_secret_env(s))
+    upload_idx = next(
+        i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith(UPLOAD)
+    )
+    verify_idx = next(
+        i
+        for i, s in enumerate(steps)
+        if "feed verify" in str(s.get("run", ""))
+        and "mcp-audit" in str(s.get("run", ""))
+    )
+    assert sign_idx < verify_idx < upload_idx
+    run_text = steps[verify_idx]["run"]
+    assert "--key-alt minisign" in run_text
+    assert "--public-key keys/mcp-audit-feed.pub" in run_text
+
+
+def test_build_installs_minisign() -> None:
+    """minisign comes from its pinned upstream release, checked by SHA-256
+    before install, not from apt (the runner mirror failed every run on
+    2026-11-11)."""
+    steps = _steps(_load()["jobs"]["build"])
+    step = next(s for s in steps if s.get("name") == "Install minisign")
+    run_text = str(step["run"])
+    env = step.get("env", {})
+    assert len(str(env.get("MINISIGN_SHA256", ""))) == 64
+    assert "github.com/jedisct1/minisign/releases/download/" in run_text
+    assert run_text.index("sha256sum -c") < run_text.index("/usr/local/bin/minisign")
+    assert "apt-get" not in _run_text(steps)
+
+
+def test_no_keyless_signing_and_no_secret_outside_the_signing_step() -> None:
+    """`--keyless` binds a signature to an individual OIDC identity and is
+    never appropriate for a published feed (docs/advisory-feed.md); and no
+    step besides the one signing step may reference the secret at all."""
+    build = _load()["jobs"]["build"]
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "--keyless" not in text
+    steps_with_secret = [s for s in _steps(build) if _has_secret_env(s)]
+    assert len(steps_with_secret) == 1
+
+
+def test_amendment_7_gate_comment_reflects_it_is_now_satisfied() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "Amendment 7" in text
+    assert "satisfied" in text
+    assert "feed-signing" in text
+
+
+def test_documents_the_public_feed_url() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert (
+        "https://raw.githubusercontent.com/adudley78/mcp-audit/feed/index.json" in text
+    )
+
+
+def test_bundle_is_built_in_the_signing_step_and_verified_before_upload() -> None:
+    """Q-058: the feed branch is an air-gapped bundle, signed with the same key."""
+    steps = _steps(_load()["jobs"]["build"])
+    sign_step = next(s for s in steps if _has_secret_env(s))
+    run = str(sign_step["run"])
+    assert "scripts/build_bundle.py" in run
+    assert "--in-place" in run
+    assert '--private-key "$KEYFILE"' in run
+    names = [s.get("name", "") for s in steps]
+    verify_idx = next(
+        i
+        for i, s in enumerate(steps)
+        if "build_bundle.py --verify" in str(s.get("run", ""))
+    )
+    upload_idx = next(
+        i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith(UPLOAD)
+    )
+    assert names.index(sign_step["name"]) < verify_idx < upload_idx
+
+
+def test_signal_refresh_is_best_effort_and_keyless() -> None:
+    """Q-055: a KEV/EPSS outage must never stop the publish (the TTL depends on it)."""
+    steps = _steps(_load()["jobs"]["build"])
+    fetch = next(s for s in steps if "sync_exploit_signals.py" in str(s.get("run", "")))
+    assert fetch.get("continue-on-error") is True
+    assert not _has_secret_env(fetch)
+    assert "--out" in str(fetch["run"]) and "--write" not in str(fetch["run"])
+
+
+def test_publish_copies_the_bundle_files() -> None:
+    steps = _steps(_load()["jobs"]["publish"])
+    run_text = _run_text(steps)
+    assert "rm -rf data bundle.json bundle.json.sig" in run_text
+    assert "cp -r new_feed/data data" in run_text
+    assert "cp new_feed/bundle.json bundle.json" in run_text
+    assert "cp new_feed/bundle.json.sig bundle.json.sig" in run_text

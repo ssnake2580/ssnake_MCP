@@ -1,0 +1,26 @@
+# Source
+src/
+
+# Development configs
+tsconfig.json
+.github/
+.gitignore
+
+# Dependencies
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test files
+__tests__/
+*.test.ts
+*.spec.ts
+
+# Other
+.DS_Store

@@ -1,0 +1,195 @@
+// src/scan-security.js (lightweight version)
+import { z } from "zod";
+import { existsSync, readFileSync, statSync } from "fs";
+import { dirname } from "path";
+import { detectLanguage, runAnalyzerAsync, generateFix, toSarif, getEngineMode, extractImports, isTestFile } from './utils.js';
+import { deduplicateFindings } from './dedup.js';
+import { applyContextFilter, detectFrameworks, applyFrameworkAdjustments } from './context.js';
+import { loadConfig, shouldExcludeFile, applyConfig } from './config.js';
+
+const MAX_FILE_SIZE = 1024 * 1024;  // 1MB - skip files larger than this to avoid timeouts
+
+export const scanSecuritySchema = {
+  file_path: z.string().describe("Path to the file to scan"),
+  output_format: z.enum(['json', 'sarif']).optional().describe("Output format: 'json' (default) or 'sarif' for GitHub/GitLab integration"),
+  verbosity: z.enum(['minimal', 'compact', 'full']).optional().describe("Response detail level: 'minimal' (counts only), 'compact' (default, actionable info), 'full' (complete metadata)"),
+  engine: z.enum(['regex']).optional().describe("Analysis engine: 'regex' (pure JavaScript, no Python)"),
+  include_context: z.boolean().optional().describe("Include surrounding code context for each issue")
+};
+
+// Verbosity formatters
+function formatMinimal(file_path, language, issues) {
+  const bySeverity = { error: 0, warning: 0, info: 0 };
+  issues.forEach(i => bySeverity[i.severity] = (bySeverity[i.severity] || 0) + 1);
+  return {
+    file: file_path,
+    language,
+    engine_mode: getEngineMode(),
+    total: issues.length,
+    critical: bySeverity.error,
+    warning: bySeverity.warning,
+    info: bySeverity.info,
+    message: issues.length > 0
+      ? `Found ${issues.length} issue(s). Use verbosity='compact' for details.`
+      : "No security issues found."
+  };
+}
+
+function formatCompact(file_path, language, issues) {
+  return {
+    file: file_path,
+    language,
+    engine_mode: getEngineMode(),
+    issues_count: issues.length,
+    issues: issues.map(i => ({
+      line: i.line + 1,
+      ruleId: i.ruleId,
+      severity: i.severity,
+      confidence: i.confidence || 'MEDIUM',
+      message: i.message,
+      fix: i.suggested_fix?.fixed ? i.suggested_fix.fixed.trim() : null
+    }))
+  };
+}
+
+function formatFull(file_path, language, issues) {
+  return {
+    file: file_path,
+    language,
+    engine_mode: getEngineMode(),
+    issues_count: issues.length,
+    issues: issues
+  };
+}
+
+export async function scanSecurity({ file_path, output_format, verbosity, engine, include_context }) {
+  if (!existsSync(file_path)) {
+    return {
+      content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }]
+    };
+  }
+
+  // Check file size to avoid timeouts on very large files
+  try {
+    const stats = statSync(file_path);
+    if (stats.size > MAX_FILE_SIZE) {
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            file: file_path,
+            message: `File too large (${(stats.size / 1024).toFixed(0)}KB). Skipping to avoid timeout. Max size: ${MAX_FILE_SIZE / 1024}KB.`,
+            issues_count: 0,
+            skipped: true
+          })
+        }]
+      };
+    }
+  } catch (err) {
+    // If stat fails, continue anyway
+  }
+
+  // Load project configuration
+  const config = loadConfig(file_path);
+
+  // Check file exclusion
+  if (shouldExcludeFile(file_path, config)) {
+    return {
+      content: [{ type: "text", text: JSON.stringify({ file: file_path, message: "File excluded by configuration", issues_count: 0 }) }]
+    };
+  }
+
+  const rawIssues = await runAnalyzerAsync(file_path, engine || 'regex');
+
+  if (rawIssues.error) {
+    return {
+      content: [{ type: "text", text: JSON.stringify(rawIssues) }]
+    };
+  }
+
+  // Cross-engine deduplication
+  const dedupedIssues = deduplicateFindings(rawIssues);
+
+  // Read file content for fix suggestions
+  const content = readFileSync(file_path, 'utf-8');
+  const lines = content.split('\n');
+  const language = detectLanguage(file_path);
+
+  // Context-aware filtering (suppress known module imports)
+  const contextFiltered = applyContextFilter(dedupedIssues, file_path, language);
+
+  // Framework-aware severity adjustment
+  const frameworks = detectFrameworks(file_path, language);
+  const frameworkAdjusted = applyFrameworkAdjustments(contextFiltered, frameworks);
+
+  // Apply .scannerrc configuration (rule suppression, severity/confidence thresholds)
+  const issues = applyConfig(frameworkAdjusted, file_path, config);
+
+  // Enhance issues with fix suggestions and optional surrounding context
+  const enhancedIssues = issues.map(issue => {
+    const line = lines[issue.line] || '';
+    const fix = generateFix(issue, line, language);
+    const enhanced = {
+      ...issue,
+      line_content: line.trim(),
+      suggested_fix: fix
+    };
+
+    if (include_context) {
+      const lineIdx = issue.line;
+      const contextLines = 3;
+      enhanced.context_before = [];
+      enhanced.context_after = [];
+      for (let i = Math.max(0, lineIdx - contextLines); i < lineIdx; i++) {
+        enhanced.context_before.push({ line: i + 1, content: lines[i] || '' });
+      }
+      for (let i = lineIdx + 1; i <= Math.min(lines.length - 1, lineIdx + contextLines); i++) {
+        enhanced.context_after.push({ line: i + 1, content: lines[i] || '' });
+      }
+    }
+
+    return enhanced;
+  });
+
+  // Determine verbosity (default: compact)
+  const level = verbosity || 'compact';
+
+  // Return SARIF format if requested (always full detail)
+  if (output_format === 'sarif') {
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify(toSarif(file_path, language, enhancedIssues), null, 2)
+      }]
+    };
+  }
+
+  // Format based on verbosity
+  let result;
+  switch (level) {
+    case 'minimal':
+      result = formatMinimal(file_path, language, enhancedIssues);
+      break;
+    case 'full':
+      result = formatFull(file_path, language, enhancedIssues);
+      break;
+    case 'compact':
+    default:
+      result = formatCompact(file_path, language, enhancedIssues);
+  }
+
+  // Attach project context if requested
+  if (project_context) {
+    const projectDir = dirname(file_path);
+    result.project = discoverProjectContext(projectDir);
+    result.is_test_file = isTestFile(file_path);
+    result.file_imports = extractImports(content, language);
+  }
+
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify(result, null, 2)
+    }]
+  };
+}

@@ -1,0 +1,47 @@
+# Dockerfile for ClawHub Security Scanner
+# Isolated environment for safe skill scanning
+
+FROM node:20-slim
+
+# Install Python and dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN useradd -m -s /bin/bash scanner && \
+    mkdir -p /scan /app && \
+    chown -R scanner:scanner /scan /app
+
+WORKDIR /app
+
+# Copy package files and scripts (needed for postinstall)
+COPY package*.json ./
+COPY requirements.txt ./
+COPY scripts ./scripts
+
+# Install Node.js dependencies
+RUN npm install && \
+    npm install -g clawhub
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
+
+# Copy application code
+COPY --chown=scanner:scanner . .
+
+# Switch to non-root user
+USER scanner
+
+# Set working directory for scans
+WORKDIR /scan
+
+# Environment variables
+ENV SCANNER_PREWARM=0
+ENV NODE_ENV=production
+
+# Run the scanner
+CMD ["node", "/app/index.js", "scan-clawhub"]

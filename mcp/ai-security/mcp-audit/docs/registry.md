@@ -1,0 +1,273 @@
+# Known-Server Registry
+
+mcp-audit ships with a curated registry of known-legitimate MCP servers used
+by the supply chain analyzer for typosquatting detection.
+
+## Registry Location
+
+The bundled registry ships at `registry/known-servers.json` in the repo root
+and is embedded in both the pip-installable wheel and the PyInstaller standalone
+binary.
+
+A user-local cache can be maintained at:
+
+```
+~/.config/mcp-audit/registry/known-servers.json
+```
+
+## Resolution Order
+
+When the supply chain analyzer loads the registry, it searches in this order:
+
+1. **`--registry PATH`** — explicit path passed to `mcp-audit scan`
+2. **User-local cache** — `~/.config/mcp-audit/registry/known-servers.json`
+   (written by `mcp-audit update-registry`)
+3. **PyInstaller bundle** — `sys._MEIPASS/registry/known-servers.json`
+4. **Installed wheel** — located via `importlib.resources` inside the
+   `mcp_audit.registry` package
+5. **Dev / editable install fallback** — `registry/known-servers.json`
+   relative to the repo root
+
+## Updating the Registry
+
+```
+mcp-audit update-registry
+```
+
+Fetches the latest registry from the mcp-audit GitHub repository and saves it
+to the user-local cache. On the next scan, the updated registry is used
+automatically.
+
+On failure (network error, malformed JSON), the command prints an error and
+exits with code 2. The existing cached registry is never overwritten on failure.
+
+## Using a Custom Registry
+
+```
+mcp-audit scan --registry /path/to/my-registry.json
+```
+
+Overrides both the bundled and cached registry for a single scan run. Useful
+for testing custom entry sets or running offline with a pre-fetched registry.
+
+## Registry Format
+
+`known-servers.json` has this top-level structure:
+
+```json
+{
+  "schema_version": "1.0",
+  "last_updated": "2026-04-15",
+  "entry_count": 57,
+  "entries": [ ... ]
+}
+```
+
+Each entry follows this schema:
+
+```json
+{
+  "name": "@modelcontextprotocol/server-filesystem",
+  "source": "npm",
+  "repo": "https://github.com/modelcontextprotocol/servers",
+  "maintainer": "Anthropic",
+  "verified": true,
+  "last_verified": "2026-04-15",
+  "known_versions": [],
+  "tags": ["official", "filesystem", "local"]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Exact package name as published (npm, pip, etc.) |
+| `source` | enum | `npm` \| `pip` \| `github` \| `docker` |
+| `repo` | string \| null | Canonical source repository URL |
+| `maintainer` | string | Organisation or `"community"` |
+| `verified` | bool | `true` for entries with confirmed publisher identity |
+| `last_verified` | ISO date | Date the entry was last reviewed |
+| `known_versions` | list | Pinned versions (empty = all versions accepted) |
+| `tags` | list | Descriptive labels, e.g. `official`, `database`, `remote` |
+| `semver_resumed_at` | string \| null | Optional (STORY-0105). The first semantic version a package released after it used calendar versions, e.g. `"1.0.0"` for `@modelcontextprotocol/server-filesystem` (0.6.2, then 2025.1.14 … 2026.8.31, then 1.0.0 on 2026-10-11). SC-004 uses it to order a pin against a fix recorded in the other scheme. Set it only from the package registry's own publish times. |
+| `archived` | bool | Optional, default `false` (STORY-0140). The upstream repository says the package is archived and gets no further fixes. Drives SC-010 and the `vet` verdict. Set it only from the upstream notice, and record that notice in `archive_notice`. |
+| `archive_notice` | string \| null | Optional (STORY-0140). URL of the upstream notice that says the package is archived. |
+| `successor` | string \| null | Optional (STORY-0140). The replacement the upstream notice names, e.g. `github/github-mcp-server` for `@modelcontextprotocol/server-github`. Leave `null` when the notice names none; never fill it from our own judgement. |
+
+## Current Coverage
+
+The live figures are `entry_count` and `last_updated` at the top of
+`registry/known-servers.json`; the terminal scan output's "Registry:" line
+prints the same numbers from whichever copy the scan loaded. Entries tagged
+`official` are the Anthropic-maintained reference servers and SDK
+(`@modelcontextprotocol/*`, `mcp`, `mcp-server-fetch`, `mcp-server-git`);
+every other entry is community-maintained. Counts are not repeated here
+because a hand-maintained number drifts from the file.
+
+## Contributing to the Registry
+
+To add a server, open a pull request against the mcp-audit repository editing
+`registry/known-servers.json`. Guidelines:
+
+- **Verified entries** (`"verified": true`) require a link to the official
+  repository and a named maintainer with a verifiable presence.
+- **Community entries** (`"verified": false`) should include the npm/pip
+  package name exactly as published. The `repo` field can be `null` if unknown.
+- Increment `entry_count` to match the actual number of entries in the array.
+- Set `last_verified` to the ISO date of your review.
+- **`capabilities` is derived from the package's own source and documentation,
+  never from the submission form's checkboxes.** The registry-submission
+  issue template's checkboxes are a starting point for that review, not the
+  record — a submitter's free-text description or the package's own README
+  frequently says more than their checkboxes do (docpull's checkbox omitted
+  filesystem access that both its own issue text and its README stated
+  plainly; R34 corrected a comment that had been written from the checkbox
+  instead of the merged entry). This matters beyond accuracy: when an entry
+  has an explicit `capabilities` list, `toxic_flow.py`'s registry-first
+  lookup returns it verbatim and skips the keyword-heuristic fallback
+  entirely — so an incomplete list on a `verified` entry is *strictly worse*
+  than no list at all, because it silently switches off the inference that
+  would otherwise have caught the gap. `scripts/audit_registry.py` reports
+  (read-only) any entry whose declared `capabilities` are a strict subset of
+  what the keyword heuristics alone would infer from the package name, and
+  separately reports any capability string that is not a defined
+  `Capability` enum member — see that script's module docstring.
+- **`comms_out`** (STORY-0101) is for a server that posts to a shared service:
+  issue, pull-request or review comments, pushed commits or files, chat
+  messages, social posts, webhooks. Record it from the package's own tool
+  list (a write tool such as `add_issue_comment`, `push_files`,
+  `slack_post_message`, `confluence_add_comment`), not from the platform's
+  name: a read-only GitHub search server is `git`, not `comms_out`. A server
+  that sends email is `email`, not `comms_out`. Keep `network_out` when the
+  server also reaches arbitrary hosts (the reference Slack server does,
+  through link previews Slack fetches, CVE-2025-34072); entries that declared
+  `network_out` before `comms_out` existed keep it so their existing
+  TOXIC-001/003/005/006/007 findings do not disappear. A capability that is
+  switched off by default (Discourse's `--allow_writes`) is left out, as
+  `@toolbox-sdk/server`'s conditional `shell_exec` is (GAPS.md).
+
+## Auditing the registry
+
+`scripts/audit_registry.py` re-checks every entry against the live npm / PyPI
+registries. **Default is read-only** — it prints a report and writes
+`.registry_audit_raw.json` (gitignored). It never adds or removes entries.
+
+```
+python scripts/audit_registry.py
+python scripts/audit_registry.py --refresh          # ignore the local cache
+python scripts/audit_registry.py --stamp            # write field updates
+python scripts/audit_registry.py --stamp --date 2026-08-22
+```
+
+### Buckets
+
+| Bucket | Meaning |
+|--------|---------|
+| `OK` | Package exists in its declared ecosystem and the registry `repo` matches the package's own metadata (after URL normalization). |
+| `MISSING` | Package does not exist (404). The registry is vouching for a name anyone could register. |
+| `UNCLAIMABLE_MISMATCH` | Package exists, but its declared repository does not match ours (or ours is `null` while the package points somewhere identifiable). |
+| `THIN` | Package exists but looks like a placeholder (version `0.0.x` and/or very low recent downloads). |
+| `UNCHECKED` | Network / rate-limit / ambiguous data. Never guessed. |
+
+`--stamp` sets `last_verified` to today's date **only** on entries this run
+classified as `OK`. Non-OK entries are left alone — the field is published as
+`entry_updated` on mcp-audit.dev, so it must mean this run actually verified
+the package.
+
+### `attestation_expected`
+
+The flag turns a missing Sigstore attestation from a neutral absence into a
+MEDIUM finding (`ATTEST-013`). A `true` that the package does not actually
+publish is the same class of defect as vouching for a nonexistent name.
+
+On `--stamp`, for every entry currently `attestation_expected: true`:
+
+| Provenance class | Action |
+|------------------|--------|
+| `HAS_PROVENANCE` | Leave `true` (npm `dist.attestations` SLSA, or PyPI PEP 740 integrity API). |
+| `NO_PROVENANCE` | Set to `false`. |
+| `UNCHECKED` | Leave `true` and list the name — unverifiable is not the same as false. |
+
+The script **never** sets `attestation_expected: true`. Weak evidence (for
+example an npm publish attestation without an SLSA provenance predicate)
+classifies as `NO_PROVENANCE`.
+
+Do **not** wire `--stamp` to an unattended CI cron. Packages disappearing is a
+real event; a nightly job that mutates the registry without a human looking at
+the buckets is its own hazard.
+
+### Scheduled drift check
+
+`.github/workflows/registry-drift.yml` runs the audit **read-only** every Monday
+at 14:00 UTC (`workflow_dispatch` for on-demand). It fails the job when the
+registry is lying:
+
+| Fails on | Why |
+|----------|-----|
+| `MISSING` | We are vouching for a name that no longer exists — the 2026-04 exposure. |
+| `attestation_expected` + `NO_PROVENANCE` | Every user who scans that package gets a MEDIUM finding (`ATTEST-013`) for a condition that is not true. |
+
+It deliberately does **not** fail on `THIN` (`@playwright/mcp` is legitimately
+`0.0.79`) or on a stale `last_verified`. Staleness is not drift, and failing on
+it is the pressure that produces unattended mutation.
+
+`--stamp` stays a human act. The job hashes `registry/known-servers.json`
+before and after the audit and fails if the bytes moved. It never opens a PR.
+Each run uploads a counts artifact (`registry-drift-report`); that series is
+the provenance-adoption / disappearance corpus. The report is not committed
+and is not published to mcp-audit.dev.
+
+Investigate a red run with `python scripts/audit_registry.py`. Clear a false
+`attestation_expected` with `python scripts/audit_registry.py --stamp`. Remove
+a `MISSING` entry; do not stamp it.
+
+## Known-malicious packages (`registry/known-malicious.json`)
+
+A second bundled data file, added by STORY-0097, sits next to the registry. It
+is a mirror of OSV's malicious-package (`MAL-*`) records for npm and PyPI
+packages whose name contains `mcp`, that `known-servers.json` lists, or whose
+name has a token naming a coding agent mcp-audit reads or an agent skill
+(STORY-0152: `claude`, `cursor`, `windsurf`, `copilot`, `augment`, `amazon-q`,
+`codex`, `gemini-cli`, `opencode`, `openclaw`, `skill(s)`, `subagent(s)`), and it
+drives `SC-008`, the `malicious` block of `mcp-audit vet` and `MAL-*` lookups in
+`mcp-audit affected` (see
+[docs/supply-chain.md](supply-chain.md#sc-008-known-malicious-packages)).
+It is a separate file, not new `known-servers.json` fields, because most of the
+packages it names are not (and never will be) registry entries, and the
+registry schema stays unchanged.
+
+Each entry keeps OSV's `id`, `ecosystem`, `name`, `aliases`, `summary`,
+`published`, `versions` and `ranges` as OSV states them, plus an optional
+mcp-audit `note`. `scripts/sync_registry_advisories.py --write` regenerates it;
+do not edit it by hand. It ships in the wheel and in every PyInstaller binary
+(`sys._MEIPASS/registry/known-malicious.json`). `mcp-audit update-registry`
+does not refresh it; it updates with each release. If the file can't be read,
+the scan still runs and says so in its errors (`known-malicious data: …`).
+
+The same release added `SC-007`, which reads only `known-servers.json`: an
+unscoped name derived from a registry entry (`mcp-server-github` from
+`@modelcontextprotocol/server-github`) is reported as a twin. See
+`src/mcp_audit/registry/twins.py`.
+
+## Implementation Notes
+
+- `src/mcp_audit/registry/loader.py` — `KnownServerRegistry` class,
+  `RegistryEntry` Pydantic model, `load_registry()` convenience function, and
+  a standalone `levenshtein()` implementation used for typosquatting distance
+  calculations.
+- `SupplyChainAnalyzer` accepts `registry=KnownServerRegistry` or
+  `registry_path=Path` in its constructor, enabling direct injection in tests
+  without touching the filesystem.
+- The `pyproject.toml` `[tool.hatch.build.targets.wheel.force-include]` section
+  copies `registry/known-servers.json` into the wheel at
+  `mcp_audit/registry/known-servers.json` so `importlib.resources` resolves it
+  correctly in installed packages.
+- Each PyInstaller spec passes `(registry/known-servers.json, "registry")` in
+  `datas=` so the file is available as `sys._MEIPASS/registry/known-servers.json`
+  in the standalone binary.
+
+## Known Limitations
+
+See GAPS.md (Supply chain coverage section) for:
+
+- Registry size vs. launch target
+- Levenshtein threshold false-positive risk for short package names

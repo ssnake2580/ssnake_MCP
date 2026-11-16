@@ -1,0 +1,7 @@
+tests/
+*.test.js
+.github/
+.vscode/
+coverage/
+.nyc_output/
+test-results/

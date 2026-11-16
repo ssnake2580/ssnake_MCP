@@ -1,0 +1,58 @@
+{
+  "name": "agent-security-scanner-mcp-full",
+  "version": "3.1.0",
+  "description": "Full MCP security scanner with npm hallucination detection (3.3M npm packages). 1000+ vulnerability rules with AST & taint analysis, auto-fix. Use 'agent-security-scanner-mcp' for lightweight version without npm.",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "agent-security-scanner-mcp-full": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "opencode",
+    "kilocode",
+    "security",
+    "scanner",
+    "npm",
+    "hallucination-detection",
+    "package-verification",
+    "ast-analysis",
+    "taint-analysis",
+    "sql-injection",
+    "xss",
+    "auto-fix"
+  ],
+  "author": "Sinewave AI <divya@sinewave.ai>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sinewaveai/agent-security-scanner-mcp.git"
+  },
+  "homepage": "https://github.com/sinewaveai/agent-security-scanner-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "bloom-filters": "^3.0.4",
+    "zod": "^4.3.6"
+  },
+  "files": [
+    "index.js",
+    "analyzer.py",
+    "ast_parser.py",
+    "generic_ast.py",
+    "pattern_matcher.py",
+    "regex_fallback.py",
+    "semgrep_loader.py",
+    "taint_analyzer.py",
+    "rules/**",
+    "packages/**",
+    "README.md"
+  ]
+}

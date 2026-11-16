@@ -1,0 +1,330 @@
+{
+  "schema_version": "1.0",
+  "framework": "AIUC-1",
+  "source": "https://www.aiuc-1.com/crosswalks",
+  "source_snapshot": "2026-03-14",
+  "source_note": "Controls extracted from AIUC-1 crosswalks page, pinned to this date. Update source_snapshot if re-extracted.",
+  "domains": ["security", "safety"],
+  "controls": [
+    {
+      "id": "B001",
+      "title": "Third-party testing of adversarial robustness",
+      "domain": "security",
+      "aivss_threats": ["Agent Cascading Failures", "Agent Goal Manipulation"],
+      "owasp_llm": ["LLM01", "LLM04", "LLM08"],
+      "scanner_tools": ["scan_agent_prompt", "scan_security", "scan_skill"],
+      "evidence_requirements": [
+        "Scan results showing prompt injection detection coverage",
+        "AIVSS scores for adversarial robustness findings"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_prompt"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B002",
+      "title": "Detection of adversarial inputs",
+      "domain": "security",
+      "aivss_threats": ["Prompt Injection", "Evasion Attacks"],
+      "owasp_llm": ["LLM01"],
+      "scanner_tools": ["scan_agent_prompt"],
+      "evidence_requirements": [
+        "Prompt injection detection results",
+        "Coverage of OWASP prompt injection categories"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_prompt"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B003",
+      "title": "Protection of technical details from unauthorized access",
+      "domain": "security",
+      "aivss_threats": ["Model Theft", "Information Disclosure"],
+      "owasp_llm": ["LLM06", "LLM10"],
+      "scanner_tools": ["scan_security", "scan_project"],
+      "evidence_requirements": [
+        "Code scan results showing no information disclosure vulnerabilities",
+        "No hardcoded credentials or API keys"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 6.0,
+        "fail_on_actions": [],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_security"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B004",
+      "title": "Prevention of endpoint scraping and data extraction",
+      "domain": "security",
+      "aivss_threats": ["Data Exfiltration", "API Abuse"],
+      "owasp_llm": ["LLM02", "LLM06"],
+      "scanner_tools": ["scan_security", "scan_agent_action"],
+      "evidence_requirements": [
+        "Scan results for data exfiltration patterns",
+        "Action monitoring for unauthorized HTTP requests"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_security"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B005",
+      "title": "Filtering and validation of AI system inputs",
+      "domain": "security",
+      "aivss_threats": ["Prompt Injection", "Input Manipulation"],
+      "owasp_llm": ["LLM01", "LLM03"],
+      "scanner_tools": ["scan_agent_prompt", "scan_security"],
+      "evidence_requirements": [
+        "Input validation scan results",
+        "Prompt injection detection coverage"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_prompt"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B006",
+      "title": "Prevention of unauthorized actions by AI system",
+      "domain": "security",
+      "aivss_threats": ["Agent Goal Manipulation", "Unauthorized Actions"],
+      "owasp_llm": ["LLM01", "LLM08"],
+      "scanner_tools": ["scan_agent_action", "scan_security"],
+      "evidence_requirements": [
+        "Action monitoring results",
+        "Security scan for privilege escalation"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_action"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B007",
+      "title": "Restriction of access privileges for AI components",
+      "domain": "security",
+      "aivss_threats": ["Privilege Escalation", "Lateral Movement"],
+      "owasp_llm": ["LLM06", "LLM08"],
+      "scanner_tools": ["scan_security", "scan_mcp_server"],
+      "evidence_requirements": [
+        "MCP server permission audit results",
+        "Least-privilege analysis"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 6.0,
+        "fail_on_actions": [],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_security"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B008",
+      "title": "Protection of deployment infrastructure",
+      "domain": "security",
+      "aivss_threats": ["Supply Chain Compromise", "Infrastructure Attacks"],
+      "owasp_llm": ["LLM05", "LLM09"],
+      "scanner_tools": ["scan_security", "scan_project"],
+      "evidence_requirements": [
+        "Project-level security scan results",
+        "Dependency and supply chain analysis"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": [],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_project"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "B009",
+      "title": "Prevention of sensitive output exposure",
+      "domain": "security",
+      "aivss_threats": ["Data Leakage", "Output Manipulation"],
+      "owasp_llm": ["LLM02", "LLM06"],
+      "scanner_tools": ["scan_security", "scan_agent_prompt"],
+      "evidence_requirements": [
+        "Output exposure vulnerability scan results",
+        "Sensitive data handling analysis"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 6.0,
+        "fail_on_actions": [],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_security"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "C003",
+      "title": "Prevention of harmful AI outputs",
+      "domain": "safety",
+      "aivss_threats": ["Harmful Content Generation", "Agent Goal Manipulation"],
+      "owasp_llm": ["LLM02", "LLM07"],
+      "scanner_tools": ["scan_agent_prompt", "scan_skill"],
+      "evidence_requirements": [
+        "Prompt safety scan results",
+        "Skill content safety analysis"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 6.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_prompt"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "C004",
+      "title": "Prevention of out-of-scope AI outputs",
+      "domain": "safety",
+      "aivss_threats": ["Scope Creep", "Unauthorized Actions"],
+      "owasp_llm": ["LLM07", "LLM08"],
+      "scanner_tools": ["scan_agent_prompt", "scan_agent_action"],
+      "evidence_requirements": [
+        "Scope boundary enforcement results",
+        "Action monitoring for out-of-scope operations"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 6.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_prompt"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "C005",
+      "title": "Detection and mitigation of high-risk AI outputs",
+      "domain": "safety",
+      "aivss_threats": ["High-Risk Actions", "Safety Violations"],
+      "owasp_llm": ["LLM02", "LLM07"],
+      "scanner_tools": ["scan_agent_action", "scan_security"],
+      "evidence_requirements": [
+        "High-risk action detection results",
+        "Safety check coverage analysis"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_action"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "C006",
+      "title": "Detection and remediation of output vulnerabilities",
+      "domain": "safety",
+      "aivss_threats": ["Output Injection", "Cross-Site Scripting"],
+      "owasp_llm": ["LLM02"],
+      "scanner_tools": ["scan_security", "scan_project"],
+      "evidence_requirements": [
+        "Output vulnerability scan results",
+        "XSS and injection detection coverage"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": [],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_security"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "C007",
+      "title": "Flagging of potentially unsafe AI-generated content",
+      "domain": "safety",
+      "aivss_threats": ["Unsafe Content", "Content Quality"],
+      "owasp_llm": ["LLM02", "LLM09"],
+      "scanner_tools": ["scan_agent_prompt", "scan_skill"],
+      "evidence_requirements": [
+        "Content safety scanning results",
+        "Unsafe content detection coverage"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 6.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_agent_prompt"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "C008",
+      "title": "Continuous monitoring and logging of AI system behavior",
+      "domain": "safety",
+      "aivss_threats": ["Unmonitored Drift", "Behavioral Anomalies"],
+      "owasp_llm": ["LLM09", "LLM10"],
+      "scanner_tools": ["scan_project", "scan_security"],
+      "evidence_requirements": [
+        "Monitoring infrastructure scan results",
+        "Logging coverage analysis"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 6.0,
+        "fail_on_actions": [],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_project"],
+        "min_grade": "C",
+        "max_critical_findings": 0
+      }
+    },
+    {
+      "id": "C012",
+      "title": "Third-party safety testing of AI systems",
+      "domain": "safety",
+      "aivss_threats": ["Untested Scenarios", "Safety Gaps"],
+      "owasp_llm": ["LLM01", "LLM07"],
+      "scanner_tools": ["scan_skill", "scan_agent_prompt", "scan_security"],
+      "evidence_requirements": [
+        "Third-party scan results (skill, prompt, security)",
+        "AIVSS posture scores across all domains"
+      ],
+      "evaluation": {
+        "max_aivss_posture": 7.0,
+        "fail_on_actions": ["BLOCK"],
+        "fail_on_severities": ["CRITICAL"],
+        "required_tools": ["scan_skill"],
+        "min_grade": "D",
+        "max_critical_findings": 0
+      }
+    }
+  ]
+}

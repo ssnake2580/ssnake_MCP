@@ -1,0 +1,102 @@
+---
+name: Registry submission — add my MCP server
+description: Request that your MCP server be added to the mcp-audit registry. Once added, developers running `mcp-audit vet` get a verdict before installing, and you get an embeddable badge.
+title: "Registry submission: [your-package-name]"
+labels: ["registry-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for submitting! We aim to review within 7 days. Most submissions are processed in 1–2 days.
+
+        **What you get:**
+        - Your server appears in `mcp-audit vet` output (offline, no network required for users)
+        - A dedicated page at `mcp-audit.dev/servers/{eco}/{slug}/`
+        - A live Shields.io badge: `![mcp-audit](https://img.shields.io/endpoint?url=https://mcp-audit.dev/v1/badge/{eco}/{slug}.json)`
+
+  - type: input
+    id: package_name
+    attributes:
+      label: Package name
+      description: "The exact package name as published. For npm: include the scope (e.g. `@modelcontextprotocol/server-filesystem`). For PyPI: the pip install name (e.g. `mcp-server-git`)."
+      placeholder: "@your-org/your-mcp-server"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ecosystem
+    attributes:
+      label: Package ecosystem
+      description: Where the package is published.
+      options:
+        - npm
+        - pypi
+        - other (describe in notes)
+    validations:
+      required: true
+
+  - type: input
+    id: repo_url
+    attributes:
+      label: Repository URL
+      description: Public GitHub or GitLab repository.
+      placeholder: "https://github.com/your-org/your-repo"
+    validations:
+      required: true
+
+  - type: input
+    id: maintainer
+    attributes:
+      label: Maintainer or organization name
+      description: Shown on the verdict page. Optional.
+      placeholder: "Anthropic / Your Company / Your Name"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: capabilities
+    attributes:
+      label: What can this server do?
+      description: >
+        Check all that apply. This is a starting point for our review, not
+        the record: capabilities are derived from the package's own source
+        and documentation before an entry is verified, and the recorded
+        entry — not this checklist — is what ships. If your server persists
+        data across sessions (memory), check whichever box below matches
+        *how* it persists — local files, a database, or a remote/network
+        service — rather than looking for a "memory" option; persistence
+        is a mechanism, not a capability we track separately. A server that
+        sends email checks "Send or read email", not the shared-service box.
+      options:
+        - label: "Read files on the user's machine"
+        - label: "Write or modify files on the user's machine"
+        - label: "Execute shell commands or run arbitrary code"
+        - label: "Make network requests or fetch content from the internet"
+        - label: "Query databases"
+        - label: "Handle credentials or secrets"
+        - label: "Send or read email"
+        - label: "Control a web browser"
+        - label: "Access git repositories or version history"
+        - label: "Access cloud resources (AWS, GCP, Azure, etc.)"
+        - label: "Post to a shared service: issue or PR comments, git push, chat messages, social posts, webhooks"
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else we should know
+      description: "CVEs that apply to a dependency but not this package specifically, verification links, maintainer contact, or anything else."
+      placeholder: "Optional."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Confirmation
+      options:
+        - label: "The package is publicly available on npm or PyPI."
+          required: true
+        - label: "The repository is public."
+          required: true
+        - label: "I am the maintainer or have authorization to submit this package."
+          required: true

@@ -1,0 +1,2501 @@
+"""scan / discover / pin / diff / watch commands.
+
+The ``scan`` command is composed from small ``_apply_*`` pipeline stages and
+``_write_*`` output helpers so that each optional phase (baseline drift,
+governance, SAST, extensions, agent-files, advisory feed, severity filtering,
+formatting) can be read and reviewed in isolation.  New scan-pipeline stages
+should follow the same pattern.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import threading
+from datetime import UTC, datetime
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.rule import Rule
+
+from mcp_audit import cli as _cli
+from mcp_audit._network import NetworkPolicy, require_offline_compatible
+from mcp_audit.analyzers import git_exec as _git_exec
+from mcp_audit.analyzers.auth import AuthAnalyzer
+from mcp_audit.analyzers.config_hygiene import ConfigHygieneAnalyzer
+from mcp_audit.analyzers.credentials import CredentialsAnalyzer
+from mcp_audit.analyzers.poisoning import PoisoningAnalyzer
+from mcp_audit.analyzers.rug_pull import (
+    build_state_entry,
+    derive_state_path,
+    load_state,
+    save_state,
+    server_key,
+)
+from mcp_audit.analyzers.supply_chain import SupplyChainAnalyzer
+from mcp_audit.analyzers.transport import TransportAnalyzer
+
+# Import modules (rather than the bound names) for symbols that tests patch at
+# their source location — e.g. ``patch("mcp_audit.sast.runner.run_semgrep")``.
+# Accessing these via the module attribute at call time preserves those patch
+# intercepts that would otherwise be bypassed by a ``from X import Y``.
+from mcp_audit.attestation import verifier as _attestation_verifier
+from mcp_audit.baselines.manager import BaselineManager
+from mcp_audit.cli import app, console
+from mcp_audit.cli._bundle import open_bundle
+from mcp_audit.cli._helpers import _write_output
+from mcp_audit.discovery import (
+    AGENT_DEFINITION_CLIENT,
+    build_project_symlink_finding,
+    discover_project_agent_configs,
+    discover_project_autoexec_files,
+    discover_project_configs,
+    discover_project_git_surfaces,
+)
+from mcp_audit.extensions import analyzer as _extensions_analyzer
+from mcp_audit.extensions import discovery as _extensions_discovery
+from mcp_audit.gateways import GATEWAY_UPSTREAM_CLIENTS, gateway_spawn_text
+from mcp_audit.governance.evaluator import evaluate_governance
+from mcp_audit.governance.loader import load_policy
+from mcp_audit.governance.models import GovernancePolicy
+from mcp_audit.lock.auto_verify import auto_verify as _lock_auto_verify
+from mcp_audit.models import Finding, ScanResult, Severity
+from mcp_audit.output.nucleus import format_nucleus
+from mcp_audit.output.sarif import format_sarif
+from mcp_audit.output.terminal import print_results
+from mcp_audit.owasp_mcp import OWASP_MCP_TOP_10
+from mcp_audit.registry.loader import KnownServerRegistry, RegistryLoadError
+from mcp_audit.sast import runner as _sast_runner
+from mcp_audit.scanner import _USER_RULES_DIR
+from mcp_audit.scoring import calculate_score
+from mcp_audit.watcher import ConfigWatcher
+
+# Severity comparison uses a descending-critical list so ``index`` returns a
+# smaller value for higher severities — a finding is kept when its index is
+# ``<=`` the threshold index.
+_SEVERITY_ORDER: list[Severity] = [
+    Severity.CRITICAL,
+    Severity.HIGH,
+    Severity.MEDIUM,
+    Severity.LOW,
+    Severity.INFO,
+]
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+
+# Status, progress and error lines for a machine-readable ``scan`` run. The
+# stream is looked up when printing, so a test runner's captured stderr works.
+_STDERR_CONSOLE = Console(stderr=True)
+
+
+def _status_console(fmt: str) -> Console:
+    """Return the console ``scan`` prints status, warning and error lines to.
+
+    With ``--format json``/``sarif``/``nucleus`` (or ``--json``), stdout is the
+    document and a consumer pipes it into a parser, so every other line goes
+    to stderr. That holds whether or not ``--output-file`` is given. With the
+    terminal format, everything stays on stdout as before.
+
+    Args:
+        fmt: The resolved output format.
+
+    Returns:
+        The shared stdout console for ``terminal``, a stderr console otherwise.
+    """
+    return console if fmt == "terminal" else _STDERR_CONSOLE
+
+
+def _scoped_state_path(extra_paths: list[Path] | None) -> Path:
+    """Derive the scoped rug-pull state path for the given extra paths."""
+    configs = _cli.discover_configs(extra_paths=extra_paths)
+    return derive_state_path(configs)
+
+
+def _reset_scoped_state(extra_paths: list[Path] | None, con: Console) -> None:
+    """Delete the scoped state file if it exists, printing a status line."""
+    scoped = _scoped_state_path(extra_paths)
+    if scoped.exists():
+        scoped.unlink()
+        con.print(f"[dim]Reset state: {scoped.name}[/dim]\n")
+    else:
+        con.print(f"[dim]No state file to reset ({scoped.name}).[/dim]\n")
+
+
+def _drift_to_findings(
+    drift: list,  # list[DriftFinding]
+) -> list[Finding]:
+    """Convert DriftFinding objects to standard Finding objects.
+
+    Uses ``analyzer="baseline"`` so drift findings appear in all output
+    formats alongside analyzer findings.
+
+    Each finding's ID is derived from the drift event's own identity (client,
+    server, drift type) rather than its position in the input list. A positional
+    ``DRIFT-{i:03d}`` id (the previous scheme) mints a *different* id for the exact
+    same drift event across two runs whenever an unrelated server's drift shifts it
+    earlier or later in the list — ``BaselineManager.compare()`` iterates a set
+    intersection for per-field drift, whose order is not guaranteed. That id feeds
+    ``Advisory.mcp_audit_rule_id``, part of the advisory ID's hash basis, so an
+    unstable finding id silently forks one recurring issue into two advisory records.
+    The drift type is embedded as a literal segment (not hashed away) so
+    ``advisory.classify.is_advisable()`` can recognise and exclude benign drift
+    kinds (e.g. a removed server) by id prefix alone.
+    """
+    findings: list[Finding] = []
+    for df in drift:
+        evidence_parts = []
+        if df.baseline_value is not None:
+            evidence_parts.append(f"baseline: {df.baseline_value}")
+        if df.current_value is not None:
+            evidence_parts.append(f"current: {df.current_value}")
+        evidence = "; ".join(evidence_parts) if evidence_parts else "N/A"
+
+        digest = hashlib.sha256(
+            f"{df.client}|{df.server_name}|{df.drift_type.value}".encode()
+        ).hexdigest()[:12]
+
+        findings.append(
+            Finding(
+                id=f"DRIFT-{df.drift_type.value.upper()}-{digest}",
+                severity=df.severity,
+                analyzer="baseline",
+                client=df.client,
+                server=df.server_name,
+                title=f"Baseline drift [{df.drift_type.value}]: {df.server_name}",
+                description=df.description,
+                evidence=evidence,
+                remediation=(
+                    "Review this change. If intentional, run "
+                    "'mcp-audit baseline save' to update your baseline."
+                ),
+            )
+        )
+    return findings
+
+
+# ── scan() pipeline stages ────────────────────────────────────────────────────
+
+
+def _preflight_checks(
+    offline: bool,
+    verify_hashes: bool,
+    registry: Path | None,
+    sast: Path | None,
+    con: Console,
+    path: Path | None = None,
+    verify_signatures: bool = False,
+    check_vulns: bool = False,
+    connect: bool = False,
+    vuln_registry: str | None = None,
+    live: bool = False,
+) -> None:
+    """Validate incompatible flag combinations and user-supplied paths.
+
+    Raises ``typer.Exit(2)`` with a human-readable message for any failure so
+    callers never see a Python traceback for routine input mistakes.
+    """
+    if path is not None and not path.resolve().exists():
+        con.print(f"[red]Error:[/red] Config path not found: {path}")
+        raise typer.Exit(2)
+
+    policy = NetworkPolicy(
+        verify_hashes=verify_hashes,
+        verify_signatures=verify_signatures,
+        check_vulns=check_vulns,
+        connect=connect,
+        live=live,
+    )
+    require_offline_compatible(policy, offline)
+
+    if registry is not None and not registry.resolve().exists():
+        con.print(f"[red]Registry file not found:[/red] {registry}")
+        raise typer.Exit(2)
+
+    if sast is not None and not sast.resolve().exists():
+        con.print(f"[red]SAST target path does not exist:[/red] {sast}")
+        raise typer.Exit(2)
+
+    if vuln_registry is not None and not vuln_registry.lower().startswith(
+        ("https://", "http://")
+    ):
+        # urllib would otherwise open file:// or ftp:// targets (STORY-0106).
+        con.print(
+            "[red]Error:[/red] --vuln-registry must be an http:// or https:// URL"
+        )
+        raise typer.Exit(2)
+
+
+def _annotate_exploit_signals(result: ScanResult) -> ScanResult:
+    from mcp_audit.scanner import apply_exploit_signals  # noqa: PLC0415
+
+    apply_exploit_signals(result)
+    return result
+
+
+def _write_vex(
+    result: ScanResult,
+    path: Path,
+    con: Console,
+    registry: Path | None = None,
+    offline_registry: bool = False,
+) -> None:
+    """Write the scan's servers as an OpenVEX document (STORY-0125).
+
+    Uses the registry the scan itself used (``--registry`` / ``--offline-registry``).
+    Nothing is written when there is nothing to state; an unwritable path is an
+    error (exit 2).
+    """
+    from mcp_audit.affected import vex as vex_mod  # noqa: PLC0415
+    from mcp_audit.affected.match import LockIndex  # noqa: PLC0415
+    from mcp_audit.registry.loader import load_registry  # noqa: PLC0415
+
+    problems: list[str] = []
+    pairs = vex_mod.pairs_for_servers(
+        result.servers,
+        load_registry(registry, offline_registry),
+        LockIndex([], problems),
+    )
+    document = vex_mod.build(pairs)
+    for problem in problems:
+        con.print(f"[yellow]WARN[/yellow] --vex: {problem}")
+    if not document["statements"]:
+        con.print(
+            "[yellow]WARN[/yellow] --vex: no discovered server runs a package with "
+            "a bundled advisory, so no file was written"
+        )
+        return
+    try:
+        _write_output(path, vex_mod.render(document))
+    except OSError as exc:
+        con.print(f"[red]Error:[/red] --vex: could not write {path}: {exc.strerror}")
+        raise typer.Exit(2) from exc
+    con.print(
+        f"[dim]Wrote {len(document['statements'])} OpenVEX statement(s) to {path}[/dim]"
+    )
+
+
+def apply_live_signals(result: ScanResult, con: Console) -> ScanResult:
+    """Replace the bundled exploit signals on *result* with current ones.
+
+    On any network or parse failure the bundled data stays and one line says so.
+    """
+    from mcp_audit.exploit import signals  # noqa: PLC0415
+    from mcp_audit.scanner import apply_exploit_signals  # noqa: PLC0415
+
+    cves = signals.finding_cves(result.findings)
+    if not cves:
+        return result
+    try:
+        index = signals.fetch_live(cves)
+    except (OSError, ValueError, RecursionError) as exc:
+        con.print(
+            f"[yellow]WARN[/yellow] --live: could not refresh exploit signals "
+            f"({type(exc).__name__}); using the bundled data."
+        )
+        apply_exploit_signals(result)
+        return result
+    apply_exploit_signals(result, index)
+    return result
+
+
+def _print_owasp_report(result: ScanResult, con: Console) -> None:
+    """Print a polished OWASP MCP Top 10 category-level summary to the terminal.
+
+    Shows all 10 categories regardless of whether findings are present.
+    Zero-finding categories display a green check.  Always shows the coverage
+    line "Coverage: 10/10 OWASP MCP Top 10 categories checked."
+
+    Args:
+        result: Completed scan result.
+        con: Rich console to write to.
+    """
+    from rich.table import Table  # noqa: PLC0415
+
+    # Aggregate findings per category code.
+    category_findings: dict[str, list[Finding]] = {}
+    for f in result.findings:
+        for code in f.owasp_mcp_top_10:
+            category_findings.setdefault(code, []).append(f)
+
+    # Severity ordering for "worst finding" summary.
+    sev_order = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+
+    def _worst_finding_summary(findings: list[Finding]) -> str:
+        """Return a one-line summary of the most severe finding in the list."""
+        if not findings:
+            return ""
+        worst = min(
+            findings,
+            key=lambda f: (
+                sev_order.index(f.severity.value)
+                if f.severity.value in sev_order
+                else len(sev_order)
+            ),
+        )
+        sev = worst.severity.value
+        title = worst.title
+        # Truncate long titles so the table stays readable.
+        if len(title) > 60:
+            title = title[:57] + "…"
+        return f"[{sev}] {title}"
+
+    con.print()
+    con.print(
+        Rule(
+            "[bold]OWASP MCP Top 10[/bold]  —  coverage in this scan",
+            style="cyan",
+        )
+    )
+    con.print()
+
+    table = Table(
+        show_header=True,
+        header_style="bold",
+        box=None,
+        padding=(0, 1),
+        expand=False,
+    )
+    # R55: all four columns were declared with `min_width`/`max_width` only
+    # (no hard `width=`), or (an earlier revision of this fix) `no_wrap=True`
+    # on columns whose content is not actually bounded. A `min_width`-only
+    # column forced to shrink below its stated minimum silently drops
+    # characters mid-word with no visual marker at all (confirmed at width
+    # 80, the `env -i` fallback: "Live credential embedded in authentication
+    # header" rendered as "Live cre" + "embedded in authent" + "header",
+    # losing "dential" and "ication" with no "…" anywhere). A hard `width=`
+    # fixes that class of defect, but `no_wrap=True` on top of it is only
+    # correct for content with a genuinely fixed, small maximum length — the
+    # first version of this fix used `no_wrap=True` on "Category" and
+    # "Findings" too, and a follow-up regression test
+    # (tests/test_terminal_width.py) caught both at width 60: "Category"
+    # ("MCP01".."MCP10", always 5 chars) and "Findings" (an integer count
+    # that can exceed 1 digit at scale) both got squeezed below their
+    # declared width and lost characters *visibly* rather than *silently* —
+    # better than the original defect, but still not "correct." Every
+    # column here now uses `overflow="fold"` instead: "Worst finding" is a
+    # SIGNAL column with genuinely unbounded content (a real finding title);
+    # "Name" is a small closed enumeration (longest word 14 chars, fits
+    # within 16); "Category" and "Findings" are short but not immune to
+    # squeeze pressure from their siblings, and folding them costs nothing
+    # in the common case (they never wrap unless the table is already
+    # under width pressure) while guaranteeing they never lose a character.
+    table.add_column("Category", style="bold", overflow="fold", width=7)
+    table.add_column("Name", overflow="fold", width=16)
+    table.add_column("Findings", justify="right", overflow="fold", width=7)
+    table.add_column("Worst finding", overflow="fold", width=42)
+
+    for code, name in OWASP_MCP_TOP_10.items():
+        findings = category_findings.get(code, [])
+        n = len(findings)
+
+        if n == 0:
+            count_cell = "[green]✓ 0[/green]"
+            worst_cell = "[dim green]No findings[/dim green]"
+            row_style = "dim"
+        elif n <= 2:
+            count_cell = f"[yellow]{n}[/yellow]"
+            worst_cell = _worst_finding_summary(findings)
+            row_style = ""
+        else:
+            count_cell = f"[red bold]{n}[/red bold]"
+            worst_cell = _worst_finding_summary(findings)
+            row_style = ""
+
+        table.add_row(code, name, count_cell, worst_cell, style=row_style)
+
+    con.print(table)
+    con.print()
+
+    total_cats = len(OWASP_MCP_TOP_10)
+    con.print(
+        f"[bold]Coverage: {total_cats}/{total_cats}"
+        " OWASP MCP Top 10 categories checked[/bold]"
+    )
+
+
+def _build_custom_analyzers(
+    registry: Path | None,
+    offline_registry: bool,
+) -> list | None:
+    """Build a custom analyzer list when a registry override is requested.
+
+    The list is the default one (``scanner.get_default_analyzers``) with only
+    the registry swapped, config-hygiene included: without it ``--registry``,
+    ``--offline-registry`` and ``--bundle`` silently dropped the CFHYG, HOOK,
+    HARNESS, PERM and SANDBOX checks (Q-059).
+
+    Returns ``None`` when the default scanner analyzers should be used (i.e.
+    neither ``--registry`` nor ``--offline-registry`` was supplied).
+    """
+    if registry is None and not offline_registry:
+        return None
+    supply_chain = SupplyChainAnalyzer(
+        registry_path=registry,
+        offline_registry=offline_registry,
+    )
+    return [
+        PoisoningAnalyzer(),
+        CredentialsAnalyzer(),
+        TransportAnalyzer(registry=supply_chain.registry),
+        supply_chain,
+        ConfigHygieneAnalyzer(),
+        AuthAnalyzer(),
+    ]
+
+
+def _collect_extra_rules_dirs(
+    rules_dir: Path | None,
+    con: Console,
+) -> list[Path]:
+    """Collect extra rule directories for the scanner.
+
+    Includes ``--rules-dir`` and the user-local rules directory at
+    ``<user-config-dir>/mcp-audit/rules/`` when it exists.  Community rules ship
+    bundled and are loaded by the scanner regardless of this list.
+    """
+    extra: list[Path] = []
+    if rules_dir is not None:
+        if not rules_dir.is_dir():
+            con.print(f"[red]--rules-dir path is not a directory: {rules_dir}[/red]")
+            raise typer.Exit(2)
+        extra.append(rules_dir)
+
+    if _USER_RULES_DIR.is_dir():
+        extra.append(_USER_RULES_DIR)
+    return extra
+
+
+def _apply_hash_verification(
+    result: ScanResult,
+    registry: Path | None,
+    offline_registry: bool,
+    con: Console,
+) -> ScanResult:
+    """Download package tarballs and verify SHA-256 against registry pins.
+
+    Only called when ``--verify-hashes`` is active.  Returns the result
+    unchanged when there are no servers to verify.
+    """
+    if not result.servers:
+        return result
+
+    vh_registry = KnownServerRegistry(path=registry, offline=offline_registry)
+    hashable = [
+        s
+        for s in result.servers
+        if vh_registry.get(s.name) is not None and vh_registry.get(s.name).known_hashes  # type: ignore[union-attr]
+    ]
+    con.print(f"[dim]Hash verification: checking {len(hashable)} package(s)…[/dim]")
+    hash_findings = _attestation_verifier.verify_server_hashes(
+        result.servers, vh_registry
+    )
+    result.findings.extend(hash_findings)
+    return result
+
+
+def _apply_signature_verification(
+    result: ScanResult,
+    registry: Path | None,
+    offline_registry: bool,
+    strict: bool,
+    console: Console,
+) -> ScanResult:
+    """Verify Sigstore provenance attestations for all registry-known servers.
+
+    Only called when ``--verify-signatures`` is active.  Appends findings to
+    ``result.findings`` before scoring so attestation outcomes affect the grade.
+    Exits early with a user-friendly message when the ``[attestation]`` extra is
+    not installed.
+    """
+    try:
+        import sigstore  # noqa: F401
+    except ImportError:
+        console.print(
+            "[yellow]⚠  --verify-signatures requires the attestation extra.[/yellow]\n"
+            "   Install: [bold]pip install 'mcp-audit-scanner\\[attestation]'[/bold]"
+        )
+        return result
+
+    from mcp_audit.attestation.sigstore_findings import (  # noqa: PLC0415
+        verify_server_signatures,
+    )
+
+    sig_registry = KnownServerRegistry(path=registry, offline=offline_registry)
+    findings = verify_server_signatures(result.servers, sig_registry, strict=strict)
+    result.findings.extend(findings)
+    return result
+
+
+def _surface_user_path_errors(
+    result: ScanResult,
+    extra_paths: list[Path] | None,
+    con: Console,
+) -> None:
+    """Exit 2 when a user-specified ``--path`` failed to parse.
+
+    Auto-discovered configs that fail are recorded in ``result.errors`` and
+    surfaced through JSON output.  User-specified paths are stricter: the user
+    explicitly asked for that file and a clean exit would be misleading.
+    """
+    if not (extra_paths and result.errors):
+        return
+    resolved = {p.expanduser().resolve() for p in extra_paths}
+    user_errors = [e for e in result.errors if any(str(rp) in e for rp in resolved)]
+    if not user_errors:
+        return
+    for err in user_errors:
+        con.print(f"[red]Error:[/red] {err}")
+    raise typer.Exit(2)
+
+
+def _apply_baseline_drift(
+    result: ScanResult,
+    baseline_name: str | None,
+    con: Console,
+) -> ScanResult:
+    """Compute drift against the named baseline and inject drift findings.
+
+    Returns the result unchanged when ``baseline_name`` is ``None``.  A
+    malformed baseline is degraded to an INFO finding rather than crashing the
+    scan; a missing named baseline exits 2.
+    """
+    if baseline_name is None:
+        return result
+
+    mgr = BaselineManager()
+    try:
+        if baseline_name == "latest":
+            bl = mgr.load_latest()
+            if bl is None:
+                con.print(
+                    "[red]No baselines found.[/red]  "
+                    "Run [bold]mcp-audit baseline save[/bold] first."
+                )
+                raise typer.Exit(2)
+        else:
+            bl = mgr.load(baseline_name)
+    except FileNotFoundError as exc:
+        con.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from None
+    except Exception as exc:  # noqa: BLE001
+        # Malformed baseline file — surface as an INFO finding rather than
+        # crashing so the rest of the scan output is still usable.
+        con.print(
+            f"[yellow]Warning:[/yellow] Could not parse baseline "
+            f"{baseline_name!r}: {exc}. Drift detection skipped."
+        )
+        result.findings.append(
+            Finding(
+                id="BL-001",
+                severity=Severity.INFO,
+                analyzer="baselines",
+                client="",
+                server="",
+                title=f"Baseline {baseline_name!r} could not be parsed",
+                description=(
+                    f"The baseline file for {baseline_name!r} is malformed "
+                    f"and drift detection was skipped: {exc}"
+                ),
+                evidence=str(exc),
+                remediation=(
+                    "Delete the corrupted baseline with "
+                    "'mcp-audit baseline delete' and re-save with "
+                    "'mcp-audit baseline save'."
+                ),
+            )
+        )
+        return result
+
+    drift = mgr.compare(bl, result.servers)
+    if not drift:
+        con.print("[green]✓[/green] Baseline comparison: no drift detected.")
+    result.findings.extend(_drift_to_findings(drift))
+    return result
+
+
+def _apply_governance(
+    result: ScanResult,
+    policy: Path | None,
+    analyzers: list | None,
+    con: Console,
+    preloaded_policy: GovernancePolicy | None = None,
+) -> ScanResult:
+    """Evaluate governance policy and inject ``GOV-`` findings.
+
+    Resolves the policy via explicit ``--policy`` → cwd → repo root → user
+    config.  Returns the result unchanged when no policy is resolved.  If a
+    custom analyzer list was built with a shared ``SupplyChainAnalyzer``, its
+    registry is reused to avoid re-reading the JSON file.
+
+    When *preloaded_policy* is supplied (e.g. it was already loaded earlier in
+    the same scan to extract scoring weights), it is used directly and the disk
+    resolution step is skipped.
+    """
+    if preloaded_policy is not None:
+        resolved = preloaded_policy
+    else:
+        try:
+            resolved = load_policy(policy)
+        except ValueError as exc:
+            con.print(f"[red]Governance policy error:[/red] {exc}")
+            raise typer.Exit(2) from None
+
+        if resolved is None:
+            return result
+
+    gov_registry = None
+    if analyzers is not None:
+        for a in analyzers:
+            if isinstance(a, SupplyChainAnalyzer):
+                gov_registry = a.registry
+                break
+
+    gov_findings = evaluate_governance(
+        servers=result.servers,
+        policy=resolved,
+        registry=gov_registry,
+        scan_result=result,
+    )
+    result.findings.extend(gov_findings)
+    return result
+
+
+def _apply_sast(
+    result: ScanResult,
+    sast_path: Path,
+    con: Console,
+) -> ScanResult:
+    """Run Semgrep-based SAST analysis and inject findings.
+
+    Only called when ``--sast`` is active active.  A semgrep
+    launch failure is surfaced as a yellow warning and the scan continues.
+    """
+    con.print(f"[dim]SAST: scanning {sast_path} with Semgrep rules…[/dim]")
+    sast_result = _sast_runner.run_semgrep(target_path=sast_path)
+    if sast_result.error:
+        con.print(
+            f"[yellow]SAST warning:[/yellow] {sast_result.error}",
+            err=True,
+        )
+    else:
+        result.findings.extend(sast_result.findings)
+        con.print(
+            f"[dim]SAST: scanned {sast_result.files_scanned} file(s), "
+            f"found {len(sast_result.findings)} issue(s)[/dim]"
+        )
+    return result
+
+
+def _apply_vuln_check(
+    result: ScanResult,
+    registry: Path | None,
+    offline_registry: bool,
+    vuln_registry_url: str | None,
+    console: Console,
+) -> ScanResult:
+    """Check for known CVEs in server dependencies via deps.dev + OSV.dev.
+
+    Only called when ``--check-vulns`` is active.  Lookups that could not run
+    are reported as VULN-UNRESOLVED findings and lines in ``result.errors``.
+    """
+    from mcp_audit.vulnerability.scanner import check_vulnerabilities  # noqa: PLC0415
+
+    vuln_registry_obj = KnownServerRegistry(path=registry, offline=offline_registry)
+    findings = check_vulnerabilities(
+        result.servers,
+        vuln_registry_obj,
+        vuln_registry_url=vuln_registry_url,
+        errors=result.errors,
+    )
+    result.findings.extend(findings)
+    return result
+
+
+def _apply_extensions(
+    result: ScanResult,
+    con: Console,
+) -> ScanResult:
+    """Run extension security analysis and inject findings.
+
+    Only called when ``--include-extensions`` is active.
+    """
+    ext_list = _extensions_discovery.discover_extensions()
+    ext_findings = _extensions_analyzer.analyze_extensions(ext_list)
+    result.findings.extend(ext_findings)
+    con.print(
+        f"[dim]Extensions: {len(ext_list)} extension(s) scanned, "
+        f"{len(ext_findings)} issue(s) found[/dim]"
+    )
+    return result
+
+
+def _apply_agent_files(
+    result: ScanResult,
+    project_root: Path | None,
+    con: Console,
+) -> ScanResult:
+    """Run agent-file security analysis and inject findings.
+
+    Only called when ``--include-agent-files`` is active.  Scans user-global
+    agent instruction and memory files, plus any project-tree files when
+    ``project_root`` is not ``None``.
+
+    Args:
+        result: Mutable scan result to extend with new findings.
+        project_root: Optional resolved project directory for project-level file
+            discovery.  ``None`` restricts discovery to user-global paths only.
+        con: Rich ``Console`` for status messages.
+
+    Returns:
+        The same ``result`` object with agent-file findings appended.
+    """
+    from mcp_audit.agent_files import analyzer as _af_analyzer  # noqa: PLC0415
+    from mcp_audit.agent_files import discovery as _af_discovery  # noqa: PLC0415
+    from mcp_audit.agent_files import reach as _af_reach  # noqa: PLC0415
+
+    af_skip_findings: list[Finding] = []
+    af_list = _af_discovery.discover_agent_files(
+        project_root=project_root, skip_findings=af_skip_findings, errors=result.errors
+    )
+    # Subagent definitions' frontmatter checks (AGENT-001..004, HOOK-001/002)
+    # already come from default discovery (user-global and cwd) and from
+    # --project, so only their body text is scanned here (STORY-0094). A
+    # symlink default discovery or the skill pass (STORY-0095) already
+    # reported is not reported twice, nor is a MEM-003/MEM-004 the default
+    # scan's cwd pass already reported (STORY-0098).
+    already_links = {
+        (f.id, f.finding_path)
+        for f in result.findings
+        if f.id in ("TRUST-002", "TRUST-004", "TRUST-005")
+    }
+    followed_findings, followed_links = _followed_skill_agent_files(
+        result, project_root
+    )
+    # A symlinked skill folder the skill pass followed (decision 2026-10-26) is
+    # read, so the agent-file walk's TRUST-005 for it would be untrue.
+    already_links |= {("TRUST-005", link) for link in followed_links}
+    already = {_af_reach.finding_key(f) for f in result.findings}
+    new_links = [
+        f for f in af_skip_findings if (f.id, f.finding_path) not in already_links
+    ]
+    candidates = (
+        _af_analyzer.analyze_agent_files(af_list, include_definitions=False)
+        + followed_findings
+        + new_links
+    )
+    af_findings = [f for f in candidates if _af_reach.finding_key(f) not in already]
+    af_findings += _skill_bundled_code(result, af_findings, project_root)
+    result.findings.extend(af_findings)
+    con.print(
+        f"[dim]Agent files: {len(af_list)} file(s) scanned, "
+        f"{len(af_findings)} issue(s) found[/dim]"
+    )
+    return result
+
+
+def _followed_skill_agent_files(
+    result: ScanResult, project_root: Path | None
+) -> tuple[list[Finding], set[str]]:
+    """Agent-file rules for skills reached through a followed symlink.
+
+    The agent-file walk does not follow symlinked directories; the skill pass
+    follows one directly under a skills directory (decision 2026-10-26).  This
+    runs SKILL-001..004 and the sidecar pass on those skills' ``SKILL.md``.
+
+    Returns:
+        ``(findings, links)``: the findings, and the followed link paths.
+    """
+    from mcp_audit.agent_files import analyzer as _af_analyzer  # noqa: PLC0415
+    from mcp_audit.agent_files import skill_package  # noqa: PLC0415
+
+    # The skill passes before this one already recorded these walks' errors
+    # and symlink findings.
+    seen_errors: list[str] = []
+    seen_findings: list[Finding] = []
+    packages = skill_package.default_skill_packages(
+        errors=seen_errors, findings=seen_findings
+    )
+    if project_root is not None:
+        packages += skill_package.project_skill_packages(
+            project_root, errors=seen_errors, findings=seen_findings
+        )
+    followed = [p for p in packages if p.link is not None]
+    try:
+        files = skill_package.followed_agent_files(followed, result.errors)
+        findings = _af_analyzer.analyze_agent_files(files)
+    except Exception as exc:  # noqa: BLE001 — never crash the scan
+        result.errors.append(f"skill package: followed skills: {exc}")
+        findings = []
+    return findings, {str(p.link) for p in followed}
+
+
+def _skill_bundled_code(
+    result: ScanResult, new_findings: list[Finding], project_root: Path | None
+) -> list[Finding]:
+    """SKILL-008 that only the agent-file rules can trigger (STORY-0095).
+
+    ``--include-agent-files`` adds SKILL-001 and sidecar findings the default
+    scan's skill pass could not see; a skill that bundles code and now has one
+    of those gets SKILL-008, unless it already has it.
+    """
+    from mcp_audit.agent_files import skill_package  # noqa: PLC0415
+
+    # The skill passes before this one already recorded these walks' errors.
+    seen_errors: list[str] = []
+    packages = skill_package.default_skill_packages(errors=seen_errors)
+    if project_root is not None:
+        packages += skill_package.project_skill_packages(
+            project_root, errors=seen_errors
+        )
+    try:
+        return skill_package.bundled_code_findings(
+            packages, result.findings + new_findings
+        )
+    except Exception as exc:  # noqa: BLE001 — never crash the scan
+        result.errors.append(f"skill package: SKILL-008: {exc}")
+        return []
+
+
+def _apply_project_instruction_reach(
+    result: ScanResult, project_dir: Path, con: Console
+) -> ScanResult:
+    """MEM-003 / MEM-004 across the ``--project`` tree (STORY-0098).
+
+    Called when ``--project`` is supplied.  Walks *project_dir* for the
+    instruction files Claude Code expands ``@path`` imports in and for
+    ``HEARTBEAT.md`` files, follows the imports, and appends MEM-003 (an
+    import that leaves the folder or is ``.gitignore``'d), MEM-004 (heartbeat
+    output suppression) and TRUST-002 HIGH (a symlink on the way that leaves
+    the folder).  Findings already reported by the default scan's cwd pass or
+    by ``--include-agent-files`` are not repeated.  Problems go to
+    ``result.errors``; never raises.  Appended post-score, like the rest of
+    the ``--project`` findings.
+    """
+    from mcp_audit.agent_files import reach as _af_reach  # noqa: PLC0415
+
+    already = {_af_reach.finding_key(f) for f in result.findings}
+    new = [
+        f
+        for f in _af_reach.project_scan_findings(project_dir, result.errors)
+        if _af_reach.finding_key(f) not in already
+    ]
+    result.findings.extend(new)
+    if new:
+        con.print(f"[dim]Instruction files: {len(new)} import/heartbeat issue(s)[/dim]")
+    return result
+
+
+def _apply_plugin_agent_files(result: ScanResult, con: Console) -> ScanResult:
+    """Scan the skills and commands that installed Claude Code plugins ship.
+
+    Called when ``--include-agent-files`` is active and ``--no-plugins`` is
+    not, so plugin skills follow the same opt-in as the user's own skills.
+    Plugin MCP servers and the PLUGIN-001/002 pin checks are not handled here:
+    ``run_scan()`` covers both by default during auto-discovery.
+
+    Args:
+        result: Mutable scan result to extend with new findings.
+        con: Rich ``Console`` for status messages.
+
+    Returns:
+        The same ``result`` object with plugin agent-file findings appended.
+    """
+    from mcp_audit.agent_files import analyzer as _af_analyzer  # noqa: PLC0415
+    from mcp_audit.plugins import discovery as _plugin_discovery  # noqa: PLC0415
+
+    plugins = _plugin_discovery.discover_installed_plugins()
+    if not plugins:
+        return result
+    from mcp_audit.agent_files import skill_package  # noqa: PLC0415
+
+    files = _plugin_discovery.plugin_agent_files(plugins)
+    findings = _af_analyzer.analyze_agent_files(files)
+    # Every file in each plugin skill, not only its SKILL.md (STORY-0095).
+    findings += skill_package.analyze_skill_packages(
+        skill_package.packages_for_agent_files(files),
+        prior=result.findings + findings,
+        errors=result.errors,
+    )
+    result.findings.extend(findings)
+    con.print(
+        f"[dim]Plugin agent files: {len(files)} skill/command file(s) from"
+        f" {len({p.plugin_id for p in plugins})} plugin(s) scanned,"
+        f" {len(findings)} issue(s) found[/dim]"
+    )
+    return result
+
+
+def _count_advisory_matches(result: ScanResult, index: dict) -> int:
+    """Count findings whose rule ID appears in the feed. Does not mutate findings."""
+    rule_ids: set[str] = set()
+    for entry in index.get("advisories") or []:
+        if not isinstance(entry, dict):
+            continue
+        for affected in entry.get("affected") or []:
+            if not isinstance(affected, dict):
+                continue
+            specific = affected.get("database_specific") or {}
+            if not isinstance(specific, dict):
+                continue
+            rule_id = specific.get("mcp_audit_rule_id")
+            if isinstance(rule_id, str) and rule_id:
+                rule_ids.add(rule_id)
+    return sum(1 for finding in result.findings if finding.id in rule_ids)
+
+
+def _apply_advisory_feed(
+    result: ScanResult,
+    feed_dir: Path | None,
+    con: Console,
+) -> ScanResult:
+    """Attach ``feed_status`` and optionally correlate findings against a feed.
+
+    Always called. When *feed_dir* is omitted the status is ``absent`` and the
+    scan is unchanged. An expired or unusable feed skips matching and still
+    completes — ``feed verify`` is the command that hard-fails on expiry.
+    """
+    from mcp_audit.advisory.freshness import (  # noqa: PLC0415
+        FreshnessError,
+        age_days,
+        check_expiry,
+        parse_freshness,
+        parse_utc,
+    )
+    from mcp_audit.advisory.sign import (  # noqa: PLC0415
+        SigningError,
+        canonical_bytes_for,
+    )
+    from mcp_audit.models import FeedStatus  # noqa: PLC0415
+
+    if feed_dir is None:
+        result.feed_status = FeedStatus()
+        return result
+
+    resolved = feed_dir.resolve()
+    if not resolved.exists():
+        con.print(f"[red]Error:[/red] Advisory feed not found: {feed_dir}")
+        raise typer.Exit(2)
+    index_path = resolved / "index.json"
+    if not index_path.is_file():
+        con.print(f"[red]Error:[/red] index.json not found in {feed_dir}")
+        raise typer.Exit(2)
+
+    now = datetime.now(UTC)
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, RecursionError, json.JSONDecodeError) as exc:
+        con.print(f"[red]Error:[/red] Cannot read advisory feed: {exc}")
+        raise typer.Exit(2) from None
+
+    try:
+        freshness = parse_freshness(index)
+    except FreshnessError:
+        con.print(
+            "[yellow]Advisory feed is missing freshness fields; "
+            "known-CVE matching was skipped.[/yellow]"
+        )
+        result.feed_status = FeedStatus(state="absent")
+        return result
+
+    fields = {
+        "published_at": freshness.published_at,
+        "expires": freshness.expires,
+        "age_days": age_days(freshness.published_at, now),
+    }
+
+    try:
+        check_expiry(freshness, now)
+    except FreshnessError:
+        stale = max(0, (now - parse_utc(freshness.expires, field="expires")).days)
+        con.print(
+            f"[yellow]Advisory data expired {freshness.expires[:10]}, "
+            f"{stale} days stale, known-CVE matching was skipped.[/yellow]"
+        )
+        result.feed_status = FeedStatus(state="expired", **fields)
+        return result
+
+    for entry in index.get("advisories") or []:
+        if not isinstance(entry, dict):
+            continue
+        rel = entry.get("path") or f"advisories/{entry.get('id')}.json"
+        expected = entry.get("canonical_sha256")
+        try:
+            actual = hashlib.sha256(canonical_bytes_for(resolved / rel)).hexdigest()
+        except SigningError:
+            con.print(
+                "[yellow]Advisory feed failed integrity checks; "
+                "known-CVE matching was skipped.[/yellow]"
+            )
+            result.feed_status = FeedStatus(state="absent", **fields)
+            return result
+        if expected and actual != expected:
+            con.print(
+                "[yellow]Advisory feed failed integrity checks; "
+                "known-CVE matching was skipped.[/yellow]"
+            )
+            result.feed_status = FeedStatus(state="absent", **fields)
+            return result
+
+    matched = _count_advisory_matches(result, index)
+    con.print(
+        f"[dim]Advisory feed: matched {matched} finding(s) "
+        f"(published {freshness.published_at[:10]}, "
+        f"{fields['age_days']} days old)[/dim]"
+    )
+    result.feed_status = FeedStatus(state="fresh", **fields)
+    return result
+
+
+def _apply_severity_threshold(
+    result: ScanResult,
+    severity_threshold: str,
+    con: Console,
+) -> ScanResult:
+    """Filter ``result.findings`` to those at or above the threshold.
+
+    ``severity_threshold`` is the raw string from the CLI; validation happens
+    here so invalid values produce a clean exit 2.  The score is NOT
+    recomputed — it reflects the pre-filter finding set.
+    """
+    try:
+        threshold = Severity(severity_threshold.upper())
+    except ValueError:
+        con.print(f"[red]Invalid severity: {severity_threshold}[/red]")
+        raise typer.Exit(2) from None
+
+    threshold_idx = _SEVERITY_ORDER.index(threshold)
+    below = [
+        f for f in result.findings if _SEVERITY_ORDER.index(f.severity) > threshold_idx
+    ]
+    result.findings_below_threshold = len(below)
+    result.active_severity_threshold = threshold.value
+    result.findings = [
+        f for f in result.findings if _SEVERITY_ORDER.index(f.severity) <= threshold_idx
+    ]
+    return result
+
+
+def _autoexec_finding_key(finding: Finding) -> tuple[str, str, str, str]:
+    """Identity of an autoexec finding: ID, resolved file, title and evidence.
+
+    The path is resolved so the cwd pass (``Path.cwd() / rel``) and the
+    ``--project`` walk (``project_dir / rel``) agree on the same file.
+    """
+    path = finding.finding_path or ""
+    if path:
+        with contextlib.suppress(OSError, RuntimeError):
+            path = str(Path(path).resolve())
+    return (finding.id, path, finding.title, finding.evidence)
+
+
+def _perm007_key(finding: Finding) -> tuple[str, str]:
+    """(settings file, server) identity of a PERM-007 finding, path resolved."""
+    path = finding.finding_path or ""
+    try:
+        return str(Path(path).resolve()), finding.server
+    except OSError:
+        return path, finding.server
+
+
+def _cross_scope_flagged_allows(
+    result: ScanResult,
+    project_configs: list,
+    project_servers: list,
+    extra_paths: list[Path] | None,
+) -> list[Finding]:
+    """PERM-007 for a settings file in one scan and a server in the other.
+
+    The default scan pairs its own settings files (``~/.claude/settings.json``,
+    the cwd's ``.claude/settings*.json``) with its own servers, and the
+    project pipeline does the same for the repository.  A user-settings allow
+    on a repository's server, or a repository allow on a user-scope server,
+    is seen only here.  The default scan's settings files are found again the
+    way it found them (same *extra_paths*, no plugins) and read with
+    ``parse_config``.  A pair already reported (same settings file and server
+    name, so ``scan --project .`` adds nothing) is skipped.
+    """
+    from mcp_audit.analyzers.permissions import (  # noqa: PLC0415
+        analyze_flagged_server_allows,
+        is_claude_code_settings_file,
+    )
+    from mcp_audit.config_parser import parse_config  # noqa: PLC0415
+
+    default_settings = []
+    for config in _cli.discover_configs(
+        extra_paths=extra_paths,
+        skip_auto_discovery=bool(extra_paths),
+        include_plugins=False,
+    ):
+        if not is_claude_code_settings_file(config.path):
+            continue
+        try:
+            parse_config(config)  # fills config.raw, as the default scan did
+        except ValueError:
+            continue
+        default_settings.append(config)
+
+    findings = list(result.findings)
+    cross = [
+        *analyze_flagged_server_allows(default_settings, project_servers, findings),
+        *analyze_flagged_server_allows(project_configs, result.servers, findings),
+    ]
+    seen = {_perm007_key(f) for f in findings if f.id == "PERM-007"}
+    out: list[Finding] = []
+    for finding in cross:
+        key = _perm007_key(finding)
+        if key not in seen:
+            seen.add(key)
+            out.append(finding)
+    return out
+
+
+def _apply_project_skills(
+    result: ScanResult,
+    project_dir: Path,
+    skip_findings: list[Finding],
+    project_configs: list,
+) -> list:
+    """Skill packages under every ``.claude/skills`` in *project_dir*.
+
+    Called from :func:`_apply_project_scan`.  Appends SKILL-005..008 (and the
+    routed CRED-*/HOOK-*/TRUST-* findings) to *result*, TRUST-005 for
+    symlinked directories to *skip_findings*, and filesystem errors to
+    ``result.errors``.  Findings the default scan already produced for the
+    same files (``scan --project .``) are not repeated.
+
+    Returns:
+        *project_configs* with the MCP configs of the repository's
+        skills-directory plugins under their plugin identity (client
+        ``claude-code-plugin``, project-scoped): the ``--project`` walk's copy
+        of a plugin's ``.mcp.json`` is replaced by it, and a plugin's inline
+        ``plugin.json`` servers are added.  Each server is then listed once.
+    """
+    from mcp_audit.agent_files import skill_package  # noqa: PLC0415
+
+    packages = skill_package.project_skill_packages(
+        project_dir, errors=result.errors, findings=skip_findings
+    )
+    result.findings.extend(
+        skill_package.analyze_skill_packages(
+            packages, prior=result.findings, errors=result.errors
+        )
+    )
+    plugin_configs: dict[str, object] = {}
+    for config in skill_package.skills_dir_plugin_mcp_configs(packages):
+        resolved = _resolved_str(config.path)
+        if resolved:
+            plugin_configs.setdefault(resolved, config)
+    # The --project walk reads every .mcp.json in the tree, a plugin's too;
+    # that copy is replaced so the server keeps one (plugin) identity.
+    out = [c for c in project_configs if _resolved_str(c.path) not in plugin_configs]
+    out.extend(plugin_configs.values())
+    return out
+
+
+def _resolved_str(path: Path) -> str:
+    """``str(path.resolve())``, or ``""`` when it cannot be resolved."""
+    try:
+        return str(path.resolve())
+    except (OSError, RuntimeError):
+        return ""
+
+
+def _apply_project_scan(
+    result: ScanResult,
+    project_dir: Path,
+    analyzers: list | None,
+    extra_rules_dirs: list[Path] | None,
+    con: Console,
+    *,
+    extra_paths: list[Path] | None = None,
+) -> ScanResult:
+    """Discover project-level MCP configs, emit TRUST-001, and run full pipeline.
+
+    Called when ``--project`` is supplied.  *project_dir* must already be
+    resolved.  Does not touch or modify the default scan behaviour.
+
+    Pipeline:
+    0. Walk *project_dir* for non-MCP auto-execution files
+       (``.vscode/tasks.json``, ``.vscode/settings.json``: TRUST-003; Gemini
+       CLI, Codex and Claude Code auto-run files: TRUST-008) and emit findings
+       for any that auto-run a command. These files are never parsed into
+       ``ServerConfig`` objects. Findings the default scan's cwd-root pass
+       already produced for the same file are not repeated.
+       Then read the GitHub Actions workflows of *project_dir* and of nested
+       repository roots under it and emit WORKFLOW-001..003 for AI agent
+       steps (STORY-0091).
+    0b. Walk *project_dir* for git surfaces (each ``.git`` entry and any
+       nested bare repository) and emit TRUST-006/TRUST-007 for git
+       configuration and hooks that make git run a command (STORY-0089).
+       Only config files are read and hooks listed; git is never run.
+       Findings already produced by the default scan's current-directory
+       check (same ID, path and evidence) are not added twice.
+    1. Walk *project_dir* for known project-level config file patterns.
+    2. Emit TRUST-001 (HIGH) for every MCP server found — fires on *origin*
+       (project-scoped), not content.
+    3. Run the full static analysis pipeline over the discovered configs and
+       servers, unconditionally (even when zero servers were found). Step 0
+       of that pipeline (config-level checks — CFHYG-005, HOOK-001/002)
+       fires per config file independent of server count, so a hooks-only
+       file with no ``mcpServers`` key (the exact shape TRUST-003's anchor
+       incidents plant) still surfaces its config-level findings. Credentials,
+       poisoning, transport, supply-chain, and auth findings are also
+       surfaced when servers are present.
+
+    A config or autoexec-file candidate that is itself a symlink is scanned
+    normally (coverage is unaffected — the OS follows the link transparently)
+    and additionally gets a TRUST-002 finding (HIGH outside *project_dir*,
+    MEDIUM inside, INFO if broken). A symlinked directory encountered during
+    either walk is still never traversed, but now emits a TRUST-005 (LOW)
+    finding naming it instead of vanishing silently; both walkers' skip lists
+    are deduplicated by ``(id, finding_path)`` before appending. See
+    ``humans/decisions/2026-09-08-trust-002-symlink-sites.md`` (marcus repo).
+
+    4. PERM-007 across scopes (STORY-0092): an allow rule in one scan's
+       Claude Code settings on a flagged server from the other scan (for
+       example a user-settings ``mcp__gh__*`` and a repository's typosquatted
+       ``gh``); see :func:`_cross_scope_flagged_allows`.  *extra_paths* is the
+       default scan's ``--path``, so its settings files are found the same way.
+
+    Findings from steps 0–4 are appended to *result.findings* so they flow
+    through all output formatters (terminal, JSON, SARIF, HTML dashboard).
+    The main scan score is *not* recomputed — project findings are appended
+    post-score, consistent with ``_apply_governance``, ``_apply_baseline_drift``,
+    and ``_apply_sast``.
+    """
+    from mcp_audit.agent_files.skill_package import (  # noqa: PLC0415
+        SKILLS_DIR_PLUGIN_CLIENT,
+    )
+    from mcp_audit.analyzers.config_hygiene import (
+        ConfigHygieneAnalyzer,  # noqa: PLC0415
+    )
+    from mcp_audit.config_parser import parse_config  # noqa: PLC0415
+    from mcp_audit.models import ScanResult as _ProjectScanResult  # noqa: PLC0415
+    from mcp_audit.scanner import (  # noqa: PLC0415
+        _run_static_pipeline,
+        get_default_analyzers,
+    )
+
+    skip_findings: list[Finding] = []
+
+    # ── TRUST-003 / TRUST-008: repo-planted auto-execution files ────────────
+    # ── TRUST-002: a discovered autoexec candidate that is itself a symlink ──
+    # A default scan run from inside *project_dir* has already reported the
+    # TRUST-003/TRUST-008 files at its root (scanner._cwd_autoexec_findings);
+    # those are not reported twice.
+    already_reported = {_autoexec_finding_key(f) for f in result.findings}
+    hygiene_analyzer = ConfigHygieneAnalyzer()
+    for autoexec_file in discover_project_autoexec_files(
+        project_dir, skip_findings=skip_findings
+    ):
+        if autoexec_file.is_symlink:
+            new_findings = [
+                build_project_symlink_finding(
+                    autoexec_file.path, autoexec_file.client, autoexec_file.symlink_root
+                )
+            ]
+        else:
+            new_findings = hygiene_analyzer.analyze_autoexec_file(
+                kind=autoexec_file.kind,
+                config_path=autoexec_file.path,
+                client=autoexec_file.client,
+                project_root=project_dir,
+            )
+        linked = {f.finding_path for f in result.findings if f.id == "TRUST-002"}
+        result.findings.extend(
+            f
+            for f in new_findings
+            if _autoexec_finding_key(f) not in already_reported
+            # One TRUST-002 per linked file, whichever pass saw it (STORY-0110).
+            and not (f.id == "TRUST-002" and f.finding_path in linked)
+        )
+
+    # ── TRUST-006/007: git configuration that runs commands (STORY-0089) ────
+    seen_git = {
+        (f.id, f.finding_path, f.evidence)
+        for f in result.findings
+        if f.id in _git_exec.GIT_FINDING_IDS
+    }
+    try:
+        git_findings = _git_exec.scan_git_surfaces(
+            discover_project_git_surfaces(project_dir, skip_findings=skip_findings),
+            scan_root=project_dir,
+        )
+    except Exception as e:  # noqa: BLE001 — reported, never fatal
+        git_findings = []
+        result.errors.append(f"git config check error: {type(e).__name__}: {e}")
+    for finding in git_findings:
+        git_key = (finding.id, finding.finding_path, finding.evidence)
+        if git_key not in seen_git:
+            seen_git.add(git_key)
+            result.findings.append(finding)
+
+    # ── CRED-005: secrets in permission rules git history still holds ───────
+    # --project reads the project's own repository (STORY-0153). Never raises.
+    from mcp_audit.analyzers import rule_secret_history as _history  # noqa: PLC0415
+
+    seen_history = {
+        (f.id, f.finding_path, f.evidence)
+        for f in result.findings
+        if f.id == _history.FINDING_ID
+    }
+    # A default scan (no --path) already read the cwd's repository.
+    try:
+        cwd_repo = None if extra_paths else _history.find_repository(Path.cwd())
+    except OSError:
+        cwd_repo = None
+    project_repo = _history.find_repository(project_dir)
+    project_history = (
+        _history.history_rule_secret_findings(*project_repo, result.errors)
+        if project_repo is not None and project_repo != cwd_repo
+        else []
+    )
+    for finding in project_history:
+        history_key = (finding.id, finding.finding_path, finding.evidence)
+        if history_key not in seen_history:
+            seen_history.add(history_key)
+            result.findings.append(finding)
+
+    # ── WORKFLOW-001..003: AI agent steps in GitHub Actions workflows ───────
+    # The default scan already read <cwd>/.github/workflows; when cwd is the
+    # project root the same findings would arrive twice, so keep one copy.
+    from mcp_audit.ci_workflows import scan_workflows  # noqa: PLC0415
+
+    seen_workflow = {
+        (f.id, f.finding_path, f.server, f.tool)
+        for f in result.findings
+        if f.id.startswith("WORKFLOW-")
+    }
+    workflow_errors: list[str] = []
+    try:
+        workflow_findings = scan_workflows(
+            project_dir, walk=True, errors=workflow_errors
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail the scan over CI files
+        workflow_errors.append(f"ci_workflows: workflow scan failed: {exc}")
+        workflow_findings = []
+    result.errors.extend(e for e in workflow_errors if e not in result.errors)
+    for finding in workflow_findings:
+        key = (finding.id, finding.finding_path, finding.server, finding.tool)
+        if key not in seen_workflow:
+            seen_workflow.add(key)
+            result.findings.append(finding)
+
+    # MCP gateway project configs (.mcptoon.json/.toml, .mcphub/servers.json;
+    # STORY-0111) join this walk; `mcp-audit lock` walks without them.
+    project_configs = discover_project_configs(
+        project_dir, skip_findings=skip_findings, include_gateways=True
+    )
+
+    # ── SKILL-005..008: skill packages in the repository (STORY-0095) ───────
+    # Every file in each .claude/skills/<skill>/ is read.  A skills-directory
+    # plugin's MCP servers (.claude/skills/<name>/.mcp.json, and inline
+    # plugin.json servers) are listed once, under client claude-code-plugin,
+    # and get TRUST-001 below.  `mcp-audit lock` records the .mcp.json ones
+    # (its project walk reads every .mcp.json); lock auto-verification checks
+    # them against that entry (lock/auto_verify.py).
+    project_configs = _apply_project_skills(
+        result, project_dir, skip_findings, project_configs
+    )
+
+    # ── GUARD-001/002: guardrail drift in the project tree (STORY-0143) ──────
+    # The default scan's step 5c2 covered the user's files and the cwd root;
+    # this reads every settings file the project walk found.  A file both
+    # passes saw is compared once (the first pass updates its record).
+    from mcp_audit import guardrails as _guardrails  # noqa: PLC0415
+
+    result.findings.extend(
+        _guardrails.guardrail_drift_findings(
+            _guardrails.project_guardrail_files(
+                project_dir, result.errors, _guardrails.state_path_for(None)
+            ),
+            _guardrails.state_path_for(None),
+            result.errors,
+        )
+    )
+
+    # ── TRUST-002: a discovered MCP config candidate that is itself a symlink ─
+    # A Codex/Gemini CLI file is also an auto-run file (STORY-0110), so the
+    # auto-run pass above may have reported the same link already.
+    reported_links = {f.finding_path for f in result.findings if f.id == "TRUST-002"}
+    for config in project_configs:
+        if config.is_symlink and str(config.path) not in reported_links:
+            result.findings.append(
+                build_project_symlink_finding(
+                    config.path, config.client_name, config.symlink_root
+                )
+            )
+
+    # Subagent definitions (STORY-0094): their frontmatter is checked at step 0
+    # of the pipeline below (AGENT-001..004, HOOK-001/002) and their inline
+    # servers get TRUST-001 like any project-scoped server. Kept out of
+    # discover_project_configs() so `mcp-audit lock` never records them.
+    # A symlinked agent file reports TRUST-002 through skip_findings, and the
+    # definitions past the per-scan budget their pre-screen AGENT findings.
+    # The default scan may already have read the cwd's agents directory, so
+    # an error it already recorded (e.g. a file over 1 MiB) is not repeated.
+    agent_errors: list[str] = []
+    project_configs += discover_project_agent_configs(
+        project_dir, skip_findings=skip_findings, errors=agent_errors
+    )
+    result.errors.extend(
+        e for e in dict.fromkeys(agent_errors) if e not in result.errors
+    )
+
+    # ── TRUST-005: symlinked directories not traversed by either walk above ──
+    # Seeded with what earlier stages (default discovery, --include-agent-files)
+    # already reported, so a symlink under an agents directory is named once.
+    seen_skip: set[tuple[str | None, ...]] = {
+        _skip_finding_key(f)
+        for f in result.findings
+        if f.id in ("TRUST-002", "TRUST-004", "TRUST-005") or f.id.startswith("AGENT-")
+    }
+    for finding in skip_findings:
+        key = _skip_finding_key(finding)
+        if key in seen_skip:
+            continue
+        seen_skip.add(key)
+        result.findings.append(finding)
+
+    if not project_configs:
+        con.print(f"[dim]No project MCP configs found under {project_dir}[/dim]")
+        return result
+
+    # Parse all servers from the discovered project configs. A symlinked
+    # config's real content is still read normally — Path.read_text() follows
+    # the link transparently — so its servers are surfaced here too.
+    project_servers: list = []
+    for config in project_configs:
+        try:
+            project_servers.extend(parse_config(config))
+        except ValueError as e:
+            result.errors.append(str(e))
+        result.errors.extend(w for w in config.parse_warnings if w not in result.errors)
+
+    con.print(
+        f"[dim]Project scan: {len(project_configs)} config file(s),"
+        f" {len(project_servers)} server(s) found[/dim]"
+    )
+
+    # ── MANAGED-002/004: managed MCP policy vs the repository's servers ──────
+    # Machine-level MANAGED-001/003/005 came from the default scan; the
+    # repository adds servers the policy may block and settings files that
+    # may broaden an unlocked allowlist (STORY-0112).  Same server and file
+    # reported once across the default scan and this walk.
+    from mcp_audit.analyzers import managed_policy as _managed  # noqa: PLC0415
+
+    seen_managed = {
+        _managed.finding_key(f) for f in result.findings if f.id.startswith("MANAGED-")
+    }
+    for finding in _managed.managed_policy_findings(
+        project_servers,
+        project_configs,
+        project_dir,
+        result.errors,
+        machine_findings=False,
+    ):
+        managed_key = _managed.finding_key(finding)
+        if managed_key not in seen_managed:
+            seen_managed.add(managed_key)
+            result.findings.append(finding)
+
+    # ── Cursor project hooks.json (STORY-0156): HOOK-001/002/004/005 ──────────
+    from mcp_audit.analyzers import hook_runnable as _hook_runnable  # noqa: PLC0415
+
+    seen_hooks = {
+        (f.id, f.finding_path)
+        for f in result.findings
+        if f.id.startswith("HOOK-") and f.client == "cursor"
+    }
+    for hook_finding in _hook_runnable.cursor_hook_findings(
+        result.errors, project=project_dir, user=False
+    ):
+        hook_key = (hook_finding.id, hook_finding.finding_path)
+        if hook_key not in seen_hooks:
+            seen_hooks.add(hook_key)
+            result.findings.append(hook_finding)
+
+    # ── TRUST-001: fires for every project-scoped server ───────────────────────
+    # Logic is deliberately dumb — origin (is_project_scoped) is the only
+    # criterion.  Content-based analysis runs separately below.
+    for server in project_servers:
+        if server.client in GATEWAY_UPSTREAM_CLIENTS:
+            # Same origin-based finding; the gateway, not the editor, starts
+            # it (STORY-0111).
+            spawn = gateway_spawn_text(server)
+        elif server.client == AGENT_DEFINITION_CLIENT:
+            # Same origin-based finding; the launch moment differs (STORY-0094).
+            spawn = (
+                f"Server '{server.name}' is declared inline in"
+                f" '{server.config_path.name}', a project subagent definition"
+                " that is likely committed to version control."
+                " Once a developer trusts this repository in Claude Code, this"
+                " MCP server starts with their full OS privileges whenever"
+                " Claude delegates to that subagent."
+            )
+        else:
+            spawn = (
+                f"Server '{server.name}' is defined in"
+                f" '{server.config_path.name}', a project-level config file"
+                " that is likely committed to version control."
+                " When a developer opens this repository in an AI editor"
+                " and clicks 'Trust this folder', this MCP server spawns"
+                " automatically with their full OS privileges before any"
+                " project code runs."
+            )
+        result.findings.append(
+            Finding(
+                id="TRUST-001",
+                severity=Severity.HIGH,
+                analyzer="trust",
+                client=server.client,
+                server=server.name,
+                title="MCP server defined in project-level config (TrustFall risk)",
+                description=(
+                    spawn + " A supply-chain attacker, malicious contributor, or"
+                    " typosquatted package can backdoor every developer who"
+                    " trusts the repo (Adversa TrustFall, May 2026;"
+                    " corroborated by CVE-2026-30615)."
+                    " OWASP MCP09."
+                ),
+                evidence=(
+                    f"File: {server.config_path}"
+                    f" | Server: {server.name}"
+                    " | Origin: project-level config"
+                ),
+                remediation=(
+                    "Review this server definition before trusting the project."
+                    " Verify the command/URL matches what the project"
+                    " documentation describes. Check the file's commit history"
+                    " for unexpected modifications."
+                    " Never trust a project that adds unexpected MCP servers."
+                ),
+                cwe="CWE-829",
+                owasp_mcp_top_10=["MCP09"],
+                finding_path=str(server.config_path),
+            )
+        )
+
+    # Run the full static pipeline over the discovered project configs —
+    # unconditionally, even when project_servers is empty. Step 0 of
+    # _run_static_pipeline (config-level checks, e.g. CFHYG-005/HOOK-001/002)
+    # runs once per config file independent of server count, mirroring the
+    # default (non-project) scan pipeline's documented behaviour. A config
+    # file that defines only a `hooks` section and no `mcpServers` (e.g.
+    # `.claude/settings.json` planted by TRUST-003's anchor incidents) must
+    # still surface its config-level findings.
+    # skip_rug_pull=True: project-level servers have no persistent user
+    # baseline; rug-pull state would always show "first seen".
+    effective_analyzers = (
+        analyzers if analyzers is not None else get_default_analyzers()
+    )
+    # A skills-directory plugin's config the default scan already analysed
+    # (`scan --project .` from the repository root: default discovery loads
+    # the cwd's skills-dir plugins) gets TRUST-001 above but is not analysed
+    # a second time.
+    # The same holds for a gateway project config in the working directory
+    # (STORY-0111): default discovery already analysed it, project-scoped.
+    once_clients = GATEWAY_UPSTREAM_CLIENTS | {SKILLS_DIR_PLUGIN_CLIENT}
+    analysed = {
+        _resolved_str(s.config_path)
+        for s in result.servers
+        if s.client in once_clients and s.is_project_scoped
+    } - {""}
+    pipeline_configs = [
+        c
+        for c in project_configs
+        if not (c.client_name in once_clients and _resolved_str(c.path) in analysed)
+    ]
+    pipeline_servers = [
+        s
+        for s in project_servers
+        if not (s.client in once_clients and _resolved_str(s.config_path) in analysed)
+    ]
+    pipeline_result = _run_static_pipeline(
+        result=_ProjectScanResult(),
+        all_servers=pipeline_servers,
+        configs=pipeline_configs,
+        analyzers=effective_analyzers,
+        skip_rug_pull=True,
+        extra_rules_dirs=extra_rules_dirs,
+    )
+    # Merge pipeline findings only — score and registry_stats stay with
+    # the main result.
+    result.findings.extend(pipeline_result.findings)
+    # Errors a pipeline step reports (SANDBOX-005's unreadable ignore files,
+    # PERM-007, the rules engine) would otherwise be lost (STORY-0093).
+    for error in pipeline_result.errors:
+        if error not in result.errors:
+            result.errors.append(error)
+
+    # ── PERM-007 across the default and project scans (STORY-0092) ─────────
+    if any(isinstance(a, ConfigHygieneAnalyzer) for a in effective_analyzers):
+        result.findings.extend(
+            _cross_scope_flagged_allows(
+                result, project_configs, project_servers, extra_paths
+            )
+        )
+
+    return result
+
+
+def _skip_finding_key(finding: Finding) -> tuple[str | None, ...]:
+    """Dedupe key for discovery-time findings merged by ``_apply_project_scan``.
+
+    A TRUST-002/004/005 is one per path. The AGENT findings for subagent
+    definitions past the per-scan budget can be several per path (one per
+    security key), so the title is part of their key.
+    """
+    if finding.id.startswith("AGENT-"):
+        return (finding.id, finding.finding_path, finding.title)
+    return (finding.id, finding.finding_path)
+
+
+def _apply_lock_verification(
+    result: ScanResult,
+    no_lock: bool,
+    con: Console,
+    scoring_weights: object | None = None,
+    scoring_weights_source: str = "default",
+) -> ScanResult:
+    """Auto-verify ``mcp-lock.json`` when one exists for the scanned servers.
+
+    Called unconditionally (unless *no_lock* is set) — STORY-0070. Always
+    offline: this never resolves a floating version over the network; that
+    stays an explicit opt-in on ``mcp-audit lock --verify --resolve``.
+
+    Contract: when no ``mcp-lock.json`` is discoverable for any scanned
+    server, ``result`` is returned unchanged (``lock_status.present`` stays
+    ``False``) — adding a lock file to a project must not silently change an
+    existing scan's output, and a project with none must see zero behaviour
+    change from this feature existing at all.
+
+    Deliberate deviation from every other post-score ``_apply_*`` stage
+    (baseline/governance/SAST/extensions/agent-files/project, all of which
+    are appended *after* ``calculate_score`` already ran and do not affect
+    ``result.score``): STORY-0070's acceptance criteria require LOCK findings
+    to affect the grade, so this stage recomputes ``result.score`` with the
+    same scoring weights already resolved for the main pipeline (from a
+    governance policy, when one is loaded) after appending LOCK-* findings.
+    """
+    from mcp_audit.models import LockStatus  # noqa: PLC0415
+
+    if no_lock:
+        result.lock_status = LockStatus()
+        return result
+
+    lock_findings, status = _lock_auto_verify(result.servers)
+    result.lock_status = status
+    if not status.present:
+        return result
+
+    if status.unresolved_entries:
+        con.print(
+            f"[yellow]Lock:[/yellow] {len(status.unresolved_entries)} entr"
+            f"{'y' if len(status.unresolved_entries) == 1 else 'ies'} unresolved "
+            f"(locked offline; version/hash not confirmed): "
+            f"{', '.join(status.unresolved_entries)}"
+        )
+    if status.outside_root:
+        con.print(
+            "[yellow]WARN[/yellow] config(s) outside the lock root were "
+            "skipped (no LOCK findings)"
+        )
+    if status.not_covered:
+        con.print(
+            f"[yellow]WARN[/yellow] {len(status.not_covered)} MCP server(s) from"
+            " subagent definitions, skill folders or MCP gateway configs not"
+            " covered by mcp-lock.json (AGENT-004, SKILL-006): "
+            + ", ".join(status.not_covered)
+        )
+    if lock_findings:
+        con.print(
+            f"[dim]Lock: {status.findings} finding(s) across "
+            f"{status.checked_servers} locked server(s)[/dim]"
+        )
+    else:
+        con.print(f"[dim]Lock: verified ({status.checked_servers} servers)[/dim]")
+
+    result.findings.extend(lock_findings)
+    result.score = calculate_score(
+        result.findings,
+        weights=scoring_weights,
+        weights_source=scoring_weights_source,
+    )
+    return result
+
+
+def _write_formatted_output(
+    result: ScanResult,
+    fmt: str,
+    output: Path | None,
+    asset_prefix: str | None,
+    no_score: bool,
+    con: Console,
+) -> None:
+    """Dispatch to the appropriate formatter and emit output.
+
+    Handles both ``--output-file`` (writes to disk) and stdout cases.  Raises
+    ``typer.Exit(2)`` for unknown formats and ``typer.Exit(0)`` when the
+    ``nucleus`` formatter declines to produce output.
+    """
+    if fmt == "json":
+        out = result.model_dump_json(indent=2, by_alias=True)
+        if output:
+            _write_output(output, out)
+        else:
+            typer.echo(out)
+    elif fmt == "nucleus":
+        nucleus_out = format_nucleus(result, asset_prefix=asset_prefix, console=con)
+        if nucleus_out is None:
+            raise typer.Exit(0)
+        if output:
+            _write_output(output, nucleus_out)
+        else:
+            typer.echo(nucleus_out)
+    elif fmt == "sarif":
+        sarif_out = format_sarif(result, asset_prefix=asset_prefix)
+        if output:
+            _write_output(output, sarif_out)
+        else:
+            typer.echo(sarif_out)
+    elif fmt == "terminal":
+        print_results(result, console=con, show_score=not no_score)
+    else:
+        con.print(
+            "[red]Unknown format: "
+            f"{fmt!r}. Choose terminal, json, nucleus, or sarif.[/red]"
+        )
+        raise typer.Exit(2)
+
+
+# ── scan ──────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def scan(
+    configs: list[Path] | None = typer.Argument(  # noqa: B008
+        default=None,
+        help=(
+            "Config file to scan (single path only; "
+            "for multiple configs use --path or 'mcp-audit discover')"
+        ),
+    ),
+    path: Path | None = typer.Option(  # noqa: B008
+        None, "--path", "-p", help="Scan a specific config file or directory"
+    ),
+    output_format: str = typer.Option(  # noqa: B008
+        "terminal",
+        "--format",
+        "-f",
+        help=(
+            "Output format: terminal, json, sarif, nucleus. "
+            "HTML output is available via 'mcp-audit dashboard'."
+        ),
+    ),
+    output: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--output",
+        "--output-file",
+        "-o",
+        help="Write results to file (--output-file is an alias)",
+    ),
+    severity_threshold: str = typer.Option(  # noqa: B008
+        "INFO",
+        "--severity-threshold",
+        "-s",
+        help=(
+            "Minimum severity to report. "
+            "Exit code 1 if findings at or above this level exist. "
+            "Accepted: critical, high, medium, low, info"
+        ),
+    ),
+    offline: bool = typer.Option(  # noqa: B008
+        False,
+        "--offline",
+        help=(
+            "Accepted for future compatibility. "
+            "Prevents combining with --verify-hashes, --verify-signatures, "
+            "--check-vulns, and --connect (exit code 2 if combined). "
+            "A plain scan already makes no network calls, so this flag is "
+            "currently a no-op for default usage."
+        ),
+    ),
+    json_flag: bool = typer.Option(  # noqa: B008
+        False, "--json", help="Shortcut for --format json"
+    ),
+    connect: bool = typer.Option(  # noqa: B008
+        False,
+        "--connect",
+        help=(
+            "Connect to running MCP servers via the protocol handshake and "
+            "analyze live tool descriptions "
+            "(requires: pip install 'mcp-audit-scanner\\[mcp]')"
+        ),
+    ),
+    connect_token: str | None = typer.Option(  # noqa: B008
+        None,
+        "--connect-token",
+        help=(
+            "Bearer token for SSE/HTTP MCP servers that require authentication. "
+            "Passed as 'Authorization: Bearer <token>'. "
+            "Silently ignored for stdio servers. Never stored or logged."
+        ),
+    ),
+    verbose: bool = typer.Option(  # noqa: B008
+        False,
+        "--verbose",
+        "-v",
+        help=(
+            "Print captured server stderr output after the scan. "
+            "Only applies when --connect is used."
+        ),
+    ),
+    reset_state: bool = typer.Option(  # noqa: B008
+        False,
+        "--reset-state",
+        help=(
+            "Delete the scoped rug-pull baseline before scanning, "
+            "giving a clean slate without manual file removal."
+        ),
+    ),
+    asset_prefix: str | None = typer.Option(  # noqa: B008
+        None,
+        "--asset-prefix",
+        help=(
+            "Override the hostname prefix used in Nucleus and SARIF output. "
+            "Useful when the hostname is not meaningful (e.g. 'MacBookAir') "
+            "and the team prefers an asset tag or employee ID."
+        ),
+    ),
+    no_score: bool = typer.Option(  # noqa: B008
+        False,
+        "--no-score",
+        help="Suppress the score/grade panel in terminal output.",
+    ),
+    registry: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--registry",
+        help="Custom registry file path (overrides user cache and bundled registry)",
+    ),
+    baseline_name: str | None = typer.Option(  # noqa: B008
+        None,
+        "--baseline",
+        help=(
+            "Compare scan results against a named baseline. "
+            "Use 'latest' to select the most recent baseline automatically."
+        ),
+    ),
+    rules_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--rules-dir",
+        help="Load additional detection rules from this directory.",
+    ),
+    offline_registry: bool = typer.Option(  # noqa: B008
+        False,
+        "--offline-registry",
+        help="Use bundled registry only, skip user cache",
+    ),
+    policy: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--policy",
+        help=(
+            "Path to a governance policy file (.mcp-audit-policy.yml). "
+            "When omitted, auto-discovery checks cwd → repo root → "
+            f"{_cli._USER_CONFIG_DIR / 'policy.yml'}."
+        ),
+    ),
+    verify_hashes: bool = typer.Option(  # noqa: B008
+        False,
+        "--verify-hashes",
+        help=(
+            "Download and verify package hashes against registry "
+            "(requires network access)."
+        ),
+    ),
+    verify_signatures: bool = typer.Option(  # noqa: B008
+        False,
+        "--verify-signatures",
+        help=(
+            "Verify Sigstore provenance attestations for registry-known packages "
+            "(requires network access)."
+        ),
+    ),
+    strict_signatures: bool = typer.Option(  # noqa: B008
+        False,
+        "--strict-signatures",
+        help=(
+            "Raise 'no attestation' findings to MEDIUM severity "
+            "(use with --verify-signatures)."
+        ),
+    ),
+    check_vulns: bool = typer.Option(  # noqa: B008
+        False,
+        "--check-vulns",
+        help=(
+            "Check server dependencies for known CVEs via deps.dev + OSV.dev "
+            "(requires network access)."
+        ),
+    ),
+    live: bool = typer.Option(  # noqa: B008
+        False,
+        "--live",
+        help=(
+            "Refresh CISA KEV, FIRST EPSS and OSV public-PoC data for the CVEs "
+            "in this scan at run time (network). Without it the bundled data "
+            "is used and its date is printed. Cannot be combined with --offline."
+        ),
+    ),
+    bundle: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--bundle",
+        help=(
+            "Read the registry, known-malicious list, research records and exploit "
+            "signals from this signed bundle directory instead of the installed "
+            "copies (no network). The bundle is verified like `feed verify` "
+            "(signed, unexpired, not rolled back) or the scan stops. See "
+            "docs/air-gapped.md."
+        ),
+    ),
+    bundle_key: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--bundle-key",
+        help=(
+            "Minisign public key for --bundle (default: mcp-audit's project key, "
+            "or $MCP_AUDIT_SIGNING_PUBKEY)."
+        ),
+    ),
+    vex: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--vex",
+        help=(
+            "Write an OpenVEX document to this path: for every bundled advisory "
+            "on a package a discovered server runs, affected, fixed, "
+            "not_affected (transport-tagged advisories on stdio servers) or "
+            "under_investigation. Offline."
+        ),
+    ),
+    vuln_registry: str | None = typer.Option(  # noqa: B008
+        None,
+        "--vuln-registry",
+        help="Custom OSV-compatible API endpoint (for air-gapped deployments).",
+    ),
+    sast: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--sast",
+        help=(
+            "Path to MCP server source code to scan with Semgrep SAST rules. "
+            "Requires semgrep (pip install semgrep)."
+        ),
+    ),
+    include_extensions: bool = typer.Option(  # noqa: B008
+        False,
+        "--include-extensions",
+        help="Also scan installed IDE extensions for security issues.",
+    ),
+    include_agent_files: bool = typer.Option(  # noqa: B008
+        False,
+        "--include-agent-files",
+        help=(
+            "Also scan agent instruction and memory files (skills, subagent"
+            " prompts, Cursor rules, Copilot instructions, CLAUDE.md tiers) for"
+            " security issues."
+        ),
+    ),
+    no_plugins: bool = typer.Option(  # noqa: B008
+        False,
+        "--no-plugins",
+        help=(
+            "Skip installed Claude Code plugins. By default a scan without --path"
+            " includes their MCP servers and pin checks (PLUGIN-001/002);"
+            " --include-agent-files adds the skills and commands they ship."
+        ),
+    ),
+    advisory_feed: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--advisory-feed",
+        help=(
+            "Correlate findings against a local advisory feed directory. "
+            "An expired feed skips matching and still completes the scan."
+        ),
+    ),
+    owasp_report: bool = typer.Option(  # noqa: B008
+        False,
+        "--owasp-report",
+        help=(
+            "Print an OWASP MCP Top 10 category summary after the normal scan output. "
+            "Shows how many findings map to each MCP01–MCP10 category."
+        ),
+    ),
+    report: str | None = typer.Option(  # noqa: B008
+        None,
+        "--report",
+        help=(
+            "Generate a compliance report in the given format. "
+            "Currently supported: pdf. "
+            "Output path is controlled by --output-file."
+        ),
+    ),
+    org: str | None = typer.Option(  # noqa: B008
+        None,
+        "--org",
+        help=(
+            "Organisation name printed in the PDF report header. "
+            "Falls back to the registered org name, then 'Not specified'."
+        ),
+    ),
+    project: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--project",
+        help=(
+            "Walk this directory for project-level MCP config files"
+            " (.mcp.json, .cursor/mcp.json, .vscode/mcp.json, etc.) and"
+            " emit TRUST-001 (HIGH) for every server found."
+            " Use after cloning a repo, before opening it in an AI editor."
+            " Runs the full analyzer pipeline over project-scoped servers too."
+        ),
+    ),
+    no_lock: bool = typer.Option(  # noqa: B008
+        False,
+        "--no-lock",
+        help=(
+            "Skip automatic mcp-lock.json verification. "
+            "By default, scan auto-verifies the nearest ancestor lock file "
+            "for each scanned server, if one exists; a project with no lock "
+            "file sees no change in behaviour either way."
+        ),
+    ),
+) -> None:
+    """Scan MCP configurations for security issues."""
+    fmt = "json" if json_flag else output_format
+    con = _status_console(fmt)
+    if configs and len(configs) > 1:
+        con.print(
+            "[red]Error:[/red] scan accepts a single config path. "
+            "For multiple configs use 'mcp-audit discover' or run scan once per config."
+        )
+        raise typer.Exit(2)
+    config = configs[0] if configs else None
+    path = config or path
+    extra_paths = [path] if path else None
+
+    # Validate --project early so the user gets a clean error before any scan work.
+    resolved_project: Path | None = None
+    if project is not None:
+        resolved_project = project.resolve()
+        if not resolved_project.exists():
+            con.print(f"[red]Error:[/red] --project path not found: {project}")
+            raise typer.Exit(2)
+        if not resolved_project.is_dir():
+            con.print(f"[red]Error:[/red] --project must be a directory: {project}")
+            raise typer.Exit(2)
+
+    if reset_state:
+        _reset_scoped_state(extra_paths, con)
+
+    _preflight_checks(
+        offline,
+        verify_hashes,
+        registry,
+        sast,
+        con,
+        path=path,
+        verify_signatures=verify_signatures,
+        check_vulns=check_vulns,
+        connect=connect,
+        vuln_registry=vuln_registry,
+        live=live,
+    )
+
+    if bundle is not None:
+        if registry is not None:
+            con.print(
+                "[red]Error:[/red] --bundle supplies the registry; drop --registry."
+            )
+            raise typer.Exit(2)
+        if live or check_vulns or verify_hashes or verify_signatures or connect:
+            con.print(
+                "[red]Error:[/red] --bundle reads no network; it cannot be combined "
+                "with --live, --check-vulns, --verify-hashes, --verify-signatures "
+                "or --connect."
+            )
+            raise typer.Exit(2)
+        registry = open_bundle(bundle, bundle_key, con).path("known-servers.json")
+
+    analyzers = _build_custom_analyzers(registry, offline_registry)
+    extra_rules_dirs = _collect_extra_rules_dirs(rules_dir, con)
+
+    # Load the governance policy early so we can extract custom scoring weights
+    # before run_scan calls calculate_score inside _run_static_pipeline.
+    preloaded_policy: GovernancePolicy | None = None
+    scoring_weights = None
+    scoring_weights_source = "default"
+    try:
+        preloaded_policy = load_policy(policy)
+    except ValueError as exc:
+        con.print(f"[red]Governance policy error:[/red] {exc}")
+        raise typer.Exit(2) from None
+    if preloaded_policy is not None and preloaded_policy.scoring is not None:
+        scoring_weights = preloaded_policy.scoring
+        if policy is not None:
+            resolved_policy_path = policy.resolve()
+        else:
+            resolved_policy_path = Path(".mcp-audit-policy.yml").resolve()
+        scoring_weights_source = f"policy:{resolved_policy_path}"
+
+    try:
+        result = _cli.run_scan(
+            extra_paths=extra_paths,
+            analyzers=analyzers,
+            connect=connect,
+            offline=offline,
+            extra_rules_dirs=extra_rules_dirs if extra_rules_dirs else None,
+            auth_token=connect_token,
+            scoring_weights=scoring_weights,
+            scoring_weights_source=scoring_weights_source,
+            include_plugins=not no_plugins,
+            guardrail_drift=True,
+        )
+    except RegistryLoadError as exc:
+        con.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    if asset_prefix:
+        result.machine.asset_id = asset_prefix
+
+    if verify_hashes:
+        result = _apply_hash_verification(result, registry, offline_registry, con)
+
+    if verify_signatures:
+        result = _apply_signature_verification(
+            result,
+            registry,
+            offline_registry,
+            strict=strict_signatures,
+            console=con,
+        )
+
+    if check_vulns:
+        result = _apply_vuln_check(
+            result, registry, offline_registry, vuln_registry, con
+        )
+
+    _surface_user_path_errors(result, extra_paths, con)
+
+    result = _apply_baseline_drift(result, baseline_name, con)
+    result = _apply_governance(
+        result, policy, analyzers, con, preloaded_policy=preloaded_policy
+    )
+
+    if sast is not None:
+        result = _apply_sast(result, sast, con)
+
+    if include_extensions:
+        result = _apply_extensions(result, con)
+
+    if include_agent_files:
+        result = _apply_agent_files(result, resolved_project, con)
+
+    if include_agent_files and not no_plugins:
+        result = _apply_plugin_agent_files(result, con)
+
+    if resolved_project is not None:
+        result = _apply_project_scan(
+            result,
+            resolved_project,
+            analyzers,
+            extra_rules_dirs or None,
+            con,
+            extra_paths=extra_paths,
+        )
+
+    if resolved_project is not None:
+        result = _apply_project_instruction_reach(result, resolved_project, console)
+
+    result = _apply_lock_verification(
+        result,
+        no_lock,
+        con,
+        scoring_weights=scoring_weights,
+        scoring_weights_source=scoring_weights_source,
+    )
+
+    # Every CVE finding is in by now (extensions and project scans add some):
+    # attach KEV/EPSS/PoC once, from live data when asked.
+    result = (
+        apply_live_signals(result, con) if live else _annotate_exploit_signals(result)
+    )
+
+    if vex is not None:
+        _write_vex(result, vex, con, registry, offline_registry)
+
+    result = _apply_severity_threshold(result, severity_threshold, con)
+    if result.exploit_data and not any(f.cve for f in result.findings):
+        result.exploit_data = None  # no CVE finding left to date
+    result = _apply_advisory_feed(result, advisory_feed, con)
+
+    # Suppress score for formatters when --no-score is requested.  The scanner
+    # always calculates the score; suppression is a presentation-layer decision
+    # applied here, after scanning, before any formatter is called.
+    if no_score:
+        result.score = None
+
+    _write_formatted_output(result, fmt, output, asset_prefix, no_score, con)
+
+    if report is not None:
+        from mcp_audit.cli.check import _write_pdf_report  # noqa: PLC0415
+
+        report_lower = report.strip().lower()
+        if report_lower != "pdf":
+            con.print(
+                f"[red]Unknown report format:[/red] {report!r}. "
+                "Currently supported: pdf"
+            )
+            raise typer.Exit(2)
+        _write_pdf_report(result, output, org, con)
+
+    if verbose and result.server_logs:
+        con.print()
+        con.print("[bold dim]Server output (captured stderr):[/bold dim]")
+        for entry in result.server_logs:
+            con.print(f"[dim]{entry}[/dim]")
+
+    if owasp_report:
+        _print_owasp_report(result, con)
+
+    if result.has_findings:
+        raise typer.Exit(1)
+
+
+# ── discover ──────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def discover(
+    path: Path | None = typer.Option(  # noqa: B008
+        None, "--path", "-p", help="Additional path to check"
+    ),
+    json_flag: bool = typer.Option(False, "--json", help="Output as JSON"),  # noqa: B008
+) -> None:
+    """List all detected MCP clients and server configurations."""
+    extra_paths = [path] if path else None
+    configs = _cli.discover_configs(
+        extra_paths=extra_paths,
+        skip_auto_discovery=bool(extra_paths),
+    )
+
+    if json_flag:
+        data = [{"client": c.client_name, "path": str(c.path)} for c in configs]
+        typer.echo(json.dumps(data, indent=2))
+        return
+
+    if not configs:
+        console.print("[yellow]No MCP configurations found on this machine.[/yellow]")
+        return
+
+    console.print(f"\n[bold]Found {len(configs)} MCP configuration(s):[/bold]\n")
+    for config in configs:
+        console.print(f"  [cyan]{config.client_name}[/cyan]  {config.path}")
+    console.print()
+
+
+# ── pin ───────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def pin(
+    config: Path | None = typer.Argument(  # noqa: B008
+        None, help="Config file to pin (positional shorthand for --path/-p)"
+    ),
+    path: Path | None = typer.Option(  # noqa: B008
+        None, "--path", "-p", help="Additional path to check"
+    ),
+) -> None:
+    """Record current MCP server configurations as the trusted baseline.
+
+    Overwrites any existing baseline.  Preserves the original ``first_seen``
+    timestamp for servers already tracked.
+    """
+    path = config or path
+    if path is not None and not path.resolve().exists():
+        console.print(f"[red]Error:[/red] Config path not found: {path}")
+        raise typer.Exit(2)
+    extra_paths = [path] if path else None
+    configs = _cli.discover_configs(extra_paths=extra_paths)
+
+    all_servers = []
+    for config in configs:
+        try:
+            all_servers.extend(_cli.parse_config(config))
+        except ValueError as e:
+            console.print(f"[yellow]Warning: {e}[/yellow]")
+
+    if not all_servers:
+        if not configs:
+            console.print(
+                "[yellow]No MCP config files found — nothing to pin.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[yellow]Found {len(configs)} MCP config file(s) but no servers "
+                "are configured in them — nothing to pin.[/yellow]"
+            )
+        return
+
+    scoped_path = derive_state_path(configs)
+
+    # Load existing state so we can preserve first_seen timestamps.
+    existing = load_state(scoped_path)
+    stored = existing.get("servers", {})
+
+    now = datetime.now(UTC).isoformat()
+    for srv in all_servers:
+        key = server_key(srv)
+        first_seen = stored.get(key, {}).get("first_seen", now)
+        stored[key] = build_state_entry(srv, first_seen=first_seen)
+
+    save_state({"version": 1, "servers": stored}, scoped_path)
+
+    console.print(
+        f"\n[bold green]Pinned baseline for {len(all_servers)} server(s).[/bold green]"
+        f"  (state → {scoped_path.name})\n"
+    )
+    for srv in all_servers:
+        console.print(f"  [cyan]{server_key(srv)}[/cyan]  {srv.config_path}")
+    console.print()
+
+
+# ── watch ─────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def watch(
+    path: Path | None = typer.Option(  # noqa: B008
+        None, "--path", "-p", help="Additional config file or directory to watch"
+    ),
+    severity_threshold: str = typer.Option(  # noqa: B008
+        "INFO",
+        "--severity-threshold",
+        "-s",
+        help="Minimum severity to report",
+    ),
+    output_format: str = typer.Option(  # noqa: B008
+        "terminal",
+        "--format",
+        "-f",
+        help="Output format: terminal, json, nucleus, sarif",
+    ),
+    connect: bool = typer.Option(  # noqa: B008
+        False,
+        "--connect",
+        help="Connect to live MCP servers during each re-scan",
+    ),
+    rules_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--rules-dir",
+        help="Additional YAML rules directory per re-scan",
+    ),
+) -> None:
+    """Continuously monitor MCP configs and scan on changes."""
+    extra_paths = [path] if path else None
+
+    extra_rules_dirs = _collect_extra_rules_dirs(rules_dir, console)
+    watch_extra_rules = extra_rules_dirs if extra_rules_dirs else None
+
+    try:
+        threshold = Severity(severity_threshold.upper())
+    except ValueError:
+        console.print(f"[red]Invalid severity: {severity_threshold}[/red]")
+        raise typer.Exit(2) from None
+
+    threshold_idx = _SEVERITY_ORDER.index(threshold)
+
+    def _run_and_print(label: str) -> None:
+        """Execute a full scan and emit results with the configured formatter."""
+        try:
+            result = _cli.run_scan(
+                extra_paths=extra_paths,
+                connect=connect,
+                extra_rules_dirs=watch_extra_rules,
+                guardrail_drift=True,
+            )
+        except RegistryLoadError as exc:
+            # For the initial (pre-loop) call this runs on the main thread and
+            # typer.Exit(2) exits watch cleanly, matching every other command's
+            # behaviour on a corrupt registry. For a rescan triggered from
+            # _on_change (a watchdog background thread) typer.Exit cannot stop
+            # the process from there — this at minimum still replaces a raw
+            # traceback with the same clean, actionable message.
+            console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(2) from exc
+        result.findings = [
+            f
+            for f in result.findings
+            if _SEVERITY_ORDER.index(f.severity) <= threshold_idx
+        ]
+
+        console.print()
+        console.print(Rule(f"[dim]{label}[/dim]"))
+
+        if output_format == "terminal":
+            print_results(result, console=console)
+        elif output_format == "json":
+            typer.echo(result.model_dump_json(indent=2))
+        elif output_format == "nucleus":
+            out = format_nucleus(result, console=console)
+            if out is not None:
+                typer.echo(out)
+        elif output_format == "sarif":
+            typer.echo(format_sarif(result))
+        else:
+            console.print(
+                f"[red]Unknown format: {output_format!r}. "
+                "Choose terminal, json, nucleus, or sarif.[/red]"
+            )
+
+        console.print()
+        console.print("[dim]Watching for changes…[/dim]")
+
+    def _on_change(changed_path: Path, event_type: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")  # noqa: DTZ005
+        console.print(
+            f"\n[bold cyan][{ts}][/bold cyan] "
+            f"Config {event_type}: [cyan]{changed_path}[/cyan]"
+        )
+        _run_and_print(f"{ts} — triggered by {event_type}: {changed_path.name}")
+
+    watcher = ConfigWatcher(
+        on_change_callback=_on_change,
+        extra_paths=extra_paths,
+    )
+
+    n = len(watcher.watchable_dirs)
+    console.print(
+        f"\n[bold cyan]Watching {n} config location(s) for changes…"
+        "  (Ctrl+C to stop)[/bold cyan]\n"
+    )
+    for d in watcher.watchable_dirs:
+        console.print(f"  [green]✓[/green] {d}")
+    for d in watcher.skipped_dirs:
+        console.print(f"  [dim]✗ {d}  (not found — will watch if created)[/dim]")
+    console.print()
+
+    # Start the observer before the initial scan so that any file changes made
+    # immediately after the scan completes are not missed due to a race between
+    # the "Watching for changes…" banner and the observer registration.
+    watcher.start()
+
+    _run_and_print("initial scan")
+    stop_event = threading.Event()
+    try:
+        while not stop_event.wait(timeout=1.0):
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        watcher.stop()
+        console.print("\n[dim]Stopped watching.[/dim]")

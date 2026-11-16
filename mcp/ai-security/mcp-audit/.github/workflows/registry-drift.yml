@@ -1,0 +1,106 @@
+# Weekly read-only audit of registry/known-servers.json against live npm/PyPI.
+#
+# The 2026-04 batch wrote 85 entries nobody verified; 44 of them were wrong.
+# Automation that writes what it has not proven is how that happened. This
+# job therefore never invokes --stamp, never opens a PR, and never writes
+# registry/known-servers.json. --stamp stays a human act.
+#
+# Failures (the registry is lying):
+#   - MISSING — we vouch for a name that no longer exists.
+#   - attestation_expected + NO_PROVENANCE — every scan of that package
+#     gets a MEDIUM finding for a condition that is not true.
+# Not failures: THIN (e.g. @playwright/mcp at 0.0.79) and stale last_verified.
+# Staleness is not drift; failing on it would pressure someone to auto-stamp.
+#
+# Counts from every run (pass or fail) are uploaded as an artifact. That
+# series is the provenance-adoption / disappearance corpus. Do not commit
+# the report and do not publish it to mcp-audit.dev from this workflow.
+
+name: Registry drift
+
+on:
+  schedule:
+    # Monday 14:00 UTC — weekly, not nightly. Package disappearance is not
+    # an hourly event; a noisy check gets muted, which is worse than none.
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+  # A PR that edits registry/known-servers.json is audited against live
+  # npm and PyPI before merge. That is the check that would have caught
+  # the 2026-04 batch at review time instead of four months later.
+  # Path-filtered, so unrelated PRs pay nothing. pull_request, not
+  # pull_request_target: fork PRs run read-only with no secrets.
+  # Do not delete this trigger.
+  pull_request:
+    paths:
+      - "registry/known-servers.json"
+      - "scripts/audit_registry.py"
+      - "scripts/check_registry_drift.py"
+      - ".github/workflows/registry-drift.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registry-drift
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Read-only registry audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # R34: the local capability checks (find_unknown_capabilities,
+      # find_undeclared_capabilities) import mcp_audit.analyzers.toxic_flow
+      # to reuse the real Capability enum and keyword heuristics rather than
+      # forking a copy that could drift. This is the only reason this
+      # workflow now installs the package it is checking out — no third-party
+      # code beyond what pyproject.toml already declares, no secrets, same
+      # "read-only, fork-safe" trust model as before.
+      - name: Install mcp-audit (for capability checks only)
+        run: pip install --quiet -e .
+
+      - name: Hash registry before the audit
+        run: sha256sum registry/known-servers.json | tee "${RUNNER_TEMP}/registry.before"
+
+      - name: Audit (report-only, never --stamp)
+        run: |
+          python scripts/audit_registry.py --refresh \
+            --out "${RUNNER_TEMP}/registry-audit-raw.json"
+
+      - name: Assert the registry file was not mutated
+        run: |
+          sha256sum registry/known-servers.json | tee "${RUNNER_TEMP}/registry.after"
+          if ! cmp -s "${RUNNER_TEMP}/registry.before" "${RUNNER_TEMP}/registry.after"; then
+            echo "MUTATION: registry/known-servers.json changed during a read-only audit."
+            echo "The 2026-04 batch wrote 85 entries nobody verified; 44 were wrong."
+            echo "This job must never write the registry. --stamp is a human act."
+            exit 1
+          fi
+          echo "registry/known-servers.json is byte-identical before and after."
+
+      - name: Gate on MISSING / false attestation_expected
+        id: gate
+        run: |
+          python scripts/check_registry_drift.py \
+            --raw "${RUNNER_TEMP}/registry-audit-raw.json" \
+            --report "${RUNNER_TEMP}/registry-drift-report.json"
+
+      - name: Upload drift report
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-drift-report
+          path: |
+            ${{ runner.temp }}/registry-drift-report.json
+          if-no-files-found: error
+          retention-days: 90

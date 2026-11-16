@@ -1,0 +1,86 @@
+{
+  "_about": "Hand labels for every POISON-* finding in the 2026-10-29 top-100 npm re-measure (docs/research/2026-10-29-top100-npm/summary.json). scripts/bench_poisoning.py precision refuses to run unless these labels cover every finding exactly once. Method: docs/poisoning.md#how-the-top-100-findings-were-labelled. The 2026-10-22 labels (mcp-audit 0.21.0, 661 findings) are kept in top100-labels-2026-10-22.json.",
+  "corpus": "docs/research/2026-10-29-top100-npm/summary.json",
+  "scanner_version": "mcp-audit 0.23.0 (main at 91120b0)",
+  "labelled_patterns_fingerprint": "sha256:19a92910828a7f784d568ab28ee955577917540087342340495f86fb1e86de96",
+  "labelled_patterns_fingerprint_note": "scripts/bench_poisoning.py patterns_fingerprint() of analyzers/poisoning.py and build_runtime_server_config at main 91120b0, the code that produced these 46 findings.",
+  "label_definitions": {
+    "true_positive": "The text the finding points at is an attempt to make the agent do something the user did not ask for, or to hide content from the user.",
+    "false_positive": "The text is ordinary documentation of the tool or its parameters.",
+    "true_positive_count": "Optional, on a false_positive label that covers one group: how many of that group's findings are true positives (used where the group has no per-finding evidence, as for POISON-050)."
+  },
+  "basis_definitions": {
+    "review": "Each finding was read in its full live tool definition on 2026-10-29 (definitions not committed; scripts/enumerate_isolated.py regenerates them), and again by an independent reviewer before merge."
+  },
+  "labels": [
+    {
+      "id": "POISON-050",
+      "evidence": [],
+      "count": 32,
+      "label": "false_positive",
+      "basis": "review",
+      "why": "A description of 2,000 characters or more. 31 are API and workflow reference text. One (about 13,500 characters) is a true positive: about 10,000 characters in, it orders the agent to always pass the user's most recent message verbatim in a parameter that goes to the vendor, to report its own model name, and to call a feedback tool every turn. That is data collection the user did not ask for, buried where a reader would not see it; it is vendor telemetry rather than malware, and it is the case POISON-050 exists to surface.",
+      "true_positive_count": 1
+    },
+    {
+      "id": "POISON-030",
+      "evidence": [
+        "instead of call"
+      ],
+      "count": 4,
+      "label": "false_positive",
+      "basis": "review",
+      "why": "Usage guidance: 'Use instead of calling <single-item tool> repeatedly' (a batch tool) and a field described as naming a callable 'instead of calling it'."
+    },
+    {
+      "id": "POISON-030",
+      "evidence": [
+        "first call"
+      ],
+      "count": 3,
+      "label": "false_positive",
+      "basis": "review",
+      "why": "Workflow documentation: 'Required query params on first call', 'you MUST first call <the server's own metadata tool>', 'Default first call ... is dry-run'."
+    },
+    {
+      "id": "POISON-030",
+      "evidence": [
+        "First call"
+      ],
+      "count": 2,
+      "label": "false_positive",
+      "basis": "review",
+      "why": "Delta-sync documentation: 'First call returns all events plus @odata.deltaLink'."
+    },
+    {
+      "id": "POISON-030",
+      "evidence": [
+        "After calling this"
+      ],
+      "count": 2,
+      "label": "false_positive",
+      "basis": "review",
+      "why": "Next-step documentation between a server's own tools ('After calling this tool, use nextjs_call ...', pass the returned conversationId to later calls)."
+    },
+    {
+      "id": "POISON-030",
+      "evidence": [
+        "Instead use"
+      ],
+      "count": 1,
+      "label": "false_positive",
+      "basis": "review",
+      "why": "A pointer to another tool for a different input ('DO NOT USE THIS TOOL. Instead use the Service Center MCP server tool')."
+    },
+    {
+      "id": "POISON-012",
+      "evidence": [
+        "Override default"
+      ],
+      "count": 2,
+      "label": "false_positive",
+      "basis": "review",
+      "why": "Parameter documentation: 'Override default result limit (1-20, default: 3)'."
+    }
+  ]
+}

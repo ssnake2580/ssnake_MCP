@@ -1,0 +1,249 @@
+"""baseline sub-app: save / list / compare / delete / export."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import typer
+from rich.table import Table
+
+from mcp_audit import cli as _cli
+from mcp_audit._fs import atomic_write
+from mcp_audit.cli import baseline_app, console
+
+# ── baseline save ─────────────────────────────────────────────────────────────
+
+
+@baseline_app.command(name="save")
+def baseline_save(
+    name: str | None = typer.Argument(  # noqa: B008
+        None, help="Baseline label (auto-generated if omitted)"
+    ),
+    path: Path | None = typer.Option(  # noqa: B008
+        None, "--path", "-p", help="Scan a specific config file or directory"
+    ),
+) -> None:
+    """Capture a baseline snapshot of the current MCP configuration."""
+    from mcp_audit.baselines.manager import BaselineManager  # noqa: PLC0415
+
+    extra_paths = [path] if path else None
+    result = _cli.run_scan(extra_paths=extra_paths)
+
+    config_paths = sorted({str(s.config_path) for s in result.servers})
+    mgr = BaselineManager()
+    baseline = mgr.save(
+        result.servers,
+        config_paths,
+        name=name,
+        finding_count=len(result.findings),
+    )
+    console.print(
+        f"[bold green]Baseline saved:[/bold green] {baseline.name} "
+        f"({baseline.server_count} server(s), "
+        f"{baseline.finding_count} finding(s) captured)"
+    )
+
+
+# ── baseline list ─────────────────────────────────────────────────────────────
+
+
+@baseline_app.command(name="list")
+def baseline_list() -> None:
+    """List all saved baselines."""
+    from mcp_audit.baselines.manager import BaselineManager  # noqa: PLC0415
+
+    mgr = BaselineManager()
+    baselines = mgr.list()
+
+    for filename, exc in mgr.load_errors:
+        console.print(
+            f"[yellow]Warning:[/yellow] Skipping malformed baseline file "
+            f"[bold]{filename}[/bold]: {exc}"
+        )
+
+    if not baselines:
+        console.print(
+            "No baselines saved. "
+            "Run [bold]mcp-audit baseline save[/bold] to create one."
+        )
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    # R55: Name is the identifier `baseline compare NAME` takes — it must
+    # never lose characters. A bare (no-width) column that Rich forces below
+    # its natural content size can silently drop characters mid-word with no
+    # visual marker; an explicit width + overflow="fold" instead wraps within
+    # the cell, preserving every character. See tests/test_terminal_width.py.
+    table.add_column("Name", style="cyan", overflow="fold", width=24)
+    table.add_column("Created")
+    table.add_column("Findings", justify="right")
+    table.add_column("Scanner Version")
+
+    for bl in baselines:
+        created = bl.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        findings_cell = str(bl.finding_count) if bl.finding_count is not None else "-"
+        table.add_row(bl.name, created, findings_cell, bl.scanner_version)
+
+    console.print(table)
+
+
+# ── baseline compare ──────────────────────────────────────────────────────────
+
+
+@baseline_app.command(name="compare")
+def baseline_compare(
+    baseline_name: str | None = typer.Argument(  # noqa: B008
+        None,
+        help="Baseline name to compare against (defaults to latest)",
+    ),
+    path: Path | None = typer.Option(  # noqa: B008
+        None, "--path", "-p", help="Scan a specific config file or directory"
+    ),
+) -> None:
+    """Compare the current MCP configuration against a saved baseline."""
+    from mcp_audit.baselines.manager import BaselineManager  # noqa: PLC0415
+
+    mgr = BaselineManager()
+
+    if baseline_name is not None:
+        try:
+            bl = mgr.load(baseline_name)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            console.print(f"[red]Cannot load baseline {baseline_name!r}:[/red] {exc}")
+            raise typer.Exit(2)  # noqa: B904
+    else:
+        bl = mgr.load_latest()
+        if bl is None:
+            console.print(
+                "[red]No baselines found.[/red]  "
+                "Run [bold]mcp-audit baseline save[/bold] to create one."
+            )
+            raise typer.Exit(2)  # noqa: B904
+
+    extra_paths = [path] if path else None
+    configs = _cli.discover_configs(extra_paths=extra_paths)
+    all_servers = []
+    for config in configs:
+        try:
+            all_servers.extend(_cli.parse_config(config))
+        except ValueError as exc:
+            console.print(f"[yellow]Warning: {exc}[/yellow]")
+
+    drift = mgr.compare(bl, all_servers)
+
+    if not drift:
+        console.print(
+            f"[green]No drift detected[/green] — configuration matches "
+            f"baseline [bold]{bl.name!r}[/bold]"
+        )
+        return
+
+    _SEV_STYLE = {  # noqa: N806
+        "CRITICAL": "[bold red]CRITICAL[/bold red]",
+        "HIGH": "[red]HIGH[/red]",
+        "MEDIUM": "[yellow]MEDIUM[/yellow]",
+        "LOW": "[blue]LOW[/blue]",
+        "INFO": "[dim]INFO[/dim]",
+    }
+
+    table = Table(show_header=True, header_style="bold")
+    # R55: every column gets an explicit hard `width=` so none of the five
+    # can be squeezed to zero width by its neighbours (observed: pinning
+    # only some columns starves the rest to nothing at width 80). Severity,
+    # Type, and Client are drawn from small known enumerations, so their
+    # width is each field's longest current real value ("CRITICAL",
+    # "command_changed", "claude-code-project") — they never need to wrap.
+    # Server and Detail are unbounded (user-chosen names, arbitrary command
+    # lines/paths) and get overflow="fold" so a long value wraps within the
+    # cell — taller rows, but never a lost character. See
+    # tests/test_terminal_width.py.
+    table.add_column("Severity", no_wrap=True, width=8)
+    table.add_column("Type", no_wrap=True, width=15)
+    table.add_column("Client", style="cyan", no_wrap=True, width=19)
+    table.add_column("Server", style="cyan", overflow="fold", width=10)
+    table.add_column("Detail", overflow="fold", width=12)
+
+    for df in drift:
+        sev_display = _SEV_STYLE.get(df.severity.value, df.severity.value)
+        detail = ""
+        if df.baseline_value is not None and df.current_value is not None:
+            detail = f"{df.baseline_value!r} → {df.current_value!r}"
+        elif df.baseline_value is not None:
+            detail = f"was: {df.baseline_value!r}"
+        elif df.current_value is not None:
+            detail = f"now: {df.current_value!r}"
+
+        table.add_row(
+            sev_display,
+            df.drift_type.value,
+            df.client,
+            df.server_name,
+            detail,
+        )
+
+    console.print(
+        f"\n[bold]Drift against baseline [cyan]{bl.name!r}[/cyan][/bold] "
+        f"(created {bl.created_at.strftime('%Y-%m-%d %H:%M UTC')})\n"
+    )
+    console.print(table)
+    console.print(f"\n[bold]{len(drift)} drift finding(s) detected.[/bold]\n")
+    raise typer.Exit(1)
+
+
+# ── baseline delete ───────────────────────────────────────────────────────────
+
+
+@baseline_app.command(name="delete")
+def baseline_delete(
+    name: str = typer.Argument(help="Name of the baseline to delete"),  # noqa: B008
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),  # noqa: B008
+) -> None:
+    """Delete a saved baseline."""
+    from mcp_audit.baselines.manager import BaselineManager  # noqa: PLC0415
+
+    mgr = BaselineManager()
+
+    if not mgr.exists(name):
+        console.print(f"[red]Error:[/red] No baseline named {name!r} found.")
+        raise typer.Exit(2)  # noqa: B904
+
+    if not yes:
+        confirmed = typer.confirm(f"Delete baseline {name!r}?", default=False)
+        if not confirmed:
+            console.print("[dim]Cancelled.[/dim]")
+            raise typer.Exit(0)  # noqa: B904
+
+    mgr.delete(name)
+    console.print(f"[green]Baseline {name!r} deleted.[/green]")
+
+
+# ── baseline export ───────────────────────────────────────────────────────────
+
+
+@baseline_app.command(name="export")
+def baseline_export(
+    name: str = typer.Argument(help="Name of the baseline to export"),  # noqa: B008
+    output_file: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--output-file",
+        "-o",
+        help="Write export to file instead of stdout",
+    ),
+) -> None:
+    """Write a baseline as raw JSON to stdout (pipeable) or a file."""
+    from mcp_audit.baselines.manager import BaselineManager  # noqa: PLC0415
+
+    mgr = BaselineManager()
+    try:
+        raw = mgr.export(name)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2)  # noqa: B904
+
+    if output_file is not None:
+        dest = Path(output_file).resolve()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(dest, raw)
+        console.print(f"[green]Baseline exported to[/green] {dest}")
+    else:
+        typer.echo(raw)

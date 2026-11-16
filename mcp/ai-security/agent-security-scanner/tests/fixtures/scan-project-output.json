@@ -1,0 +1,52 @@
+{
+  "directory": "/tmp/test-project",
+  "files_scanned": 5,
+  "issues_count": 4,
+  "grade": "C",
+  "by_severity": {
+    "error": 2,
+    "warning": 1,
+    "info": 1
+  },
+  "by_category": {
+    "injection": 2,
+    "crypto": 1,
+    "info-exposure": 1
+  },
+  "cross_file_issues": 0,
+  "policy_passed": true,
+  "policy_violations": [],
+  "issues": [
+    {
+      "file": "app.py",
+      "line": 12,
+      "ruleId": "python.injection.sql-injection",
+      "severity": "error",
+      "message": "SQL injection: user input concatenated into query string",
+      "confidence": "HIGH"
+    },
+    {
+      "file": "app.py",
+      "line": 25,
+      "ruleId": "python.injection.command-injection",
+      "severity": "error",
+      "message": "Command injection: os.system() called with user input",
+      "confidence": "HIGH"
+    },
+    {
+      "file": "utils.py",
+      "line": 8,
+      "ruleId": "python.crypto.weak-hash",
+      "severity": "warning",
+      "message": "Weak hash algorithm: MD5 used for security-sensitive operation",
+      "confidence": "MEDIUM"
+    },
+    {
+      "file": "config.py",
+      "line": 3,
+      "ruleId": "python.info.debug-enabled",
+      "severity": "info",
+      "message": "Debug mode enabled in configuration"
+    }
+  ]
+}

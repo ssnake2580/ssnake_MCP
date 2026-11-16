@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command:*)",
+      "Bash(find:*)",
+      "Bash(xargs du:*)",
+      "Bash(du:*)",
+      "Bash(tar czf:*)",
+      "Bash(git count-objects:*)",
+      "Bash(gh run list:*)",
+      "Bash(clawhub inspect:*)",
+      "Bash(gh pr view:*)",
+      "Bash(npm test:*)",
+      "Bash(npx vitest:*)"
+    ]
+  }
+}

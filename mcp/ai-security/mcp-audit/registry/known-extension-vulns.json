@@ -1,0 +1,67 @@
+{
+  "schema_version": "1",
+  "last_updated": "2026-10-30",
+  "entries": [
+    {
+      "extension_id": "ritwickdey.liveserver",
+      "affected_versions": "*",
+      "cve": "CVE-2025-65717",
+      "severity": "high",
+      "title": "Live Server: Remote Unauthenticated File Exfiltration",
+      "description": "Live Server (72M+ downloads) allows remote unauthenticated access to files served by the extension. Affects Cursor and Windsurf users. Update to latest version or disable the extension.",
+      "reference": "https://nvd.nist.gov/vuln/detail/CVE-2025-65717",
+      "reported_date": "2025-09-01"
+    },
+    {
+      "extension_id": "ms-python.python",
+      "affected_versions": "<2024.0.0",
+      "cve": null,
+      "severity": "medium",
+      "title": "Python Extension: Older versions lack workspace trust enforcement",
+      "description": "Python extension versions prior to 2024 may execute code in untrusted workspaces without prompting for trust. Update to 2024.0.0 or later.",
+      "reference": "https://github.com/microsoft/vscode-python/security",
+      "reported_date": "2024-01-15"
+    },
+    {
+      "extension_id": "streetsidesoftware.code-spell-checker",
+      "affected_versions": "<3.0.0",
+      "cve": null,
+      "severity": "low",
+      "title": "Code Spell Checker: Reads all workspace files including sensitive config",
+      "description": "Versions prior to 3.0.0 read all workspace files for spell checking, including .env and credential files. Update to 3.0.0+ which respects .gitignore and excludes config files.",
+      "reference": "https://github.com/streetsidesoftware/vscode-spell-checker/releases",
+      "reported_date": "2023-06-01"
+    },
+    {
+      "extension_id": "ms-vscode-remote.remote-ssh",
+      "affected_versions": "<0.107.0",
+      "cve": null,
+      "severity": "medium",
+      "title": "Remote SSH: Credential forwarding without explicit consent in older versions",
+      "description": "Remote SSH extension versions prior to 0.107.0 may forward SSH agent credentials to remote hosts without explicit per-connection consent.",
+      "reference": "https://github.com/microsoft/vscode-remote-release/issues",
+      "reported_date": "2024-03-01"
+    },
+    {
+      "extension_id": "vscodevim.vim",
+      "affected_versions": "<1.27.0",
+      "cve": null,
+      "severity": "low",
+      "title": "Vim Extension: Arbitrary command execution via modelines in older versions",
+      "description": "VSCodeVim versions prior to 1.27.0 may execute arbitrary commands via vim modelines in opened files.",
+      "reference": "https://github.com/VSCodeVim/Vim/security/advisories",
+      "reported_date": "2024-07-01"
+    },
+    {
+      "extension_id": "anthropic.claude-code",
+      "affected_versions": "2.1.313",
+      "cve": null,
+      "severity": "critical",
+      "title": "Claude Code extension 2.1.313: malicious build from Cursor's marketplace (SSH backdoor)",
+      "description": "A tampered build of Anthropic.claude-code 2.1.313 was served by Cursor's extension marketplace on 2026-10-29, about 09:27 to 20:35 UTC (darwin-arm64 and win32-x64 builds; Cursor estimates at most 5,000 users). Cursor says it was not developed by Anthropic; the Microsoft marketplace did not carry it. When the editor loads it, it adds an attacker SSH key with the comment svc-telemetry to authorized_keys, installs persistence (macOS LaunchAgent com.apple.sysmond, Windows scheduled task SysMon, a cron @reboot entry), opens a reverse SSH tunnel to 134.209.82[.]225 and reports host details and the names of credential-like environment variables. Uninstalling or updating the extension does not remove the backdoor.",
+      "reference": "https://cursor.com/blog/claude-code-extension-security-notice",
+      "reported_date": "2026-10-29",
+      "remediation": "Treat this machine as compromised. Check for the key: grep svc-telemetry ~/.ssh/authorized_keys (Windows: %USERPROFILE%\\.ssh\\authorized_keys and C:\\ProgramData\\ssh\\administrators_authorized_keys). Collect evidence, then remove the key and the persistence with Cursor's remediate-macos.sh or remediate-windows.ps1, update the extension to 2.1.314 or later, and rotate credentials reachable from this machine from a known-clean one. See: https://cursor.com/blog/claude-code-extension-security-notice"
+    }
+  ]
+}

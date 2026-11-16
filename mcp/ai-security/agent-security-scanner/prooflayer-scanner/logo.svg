@@ -1,0 +1,34 @@
+<svg width="400" height="100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#8b5cf6;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Shield icon -->
+  <g transform="translate(20, 20)">
+    <path d="M30 10 L30 5 L5 15 L5 35 Q5 50 30 60 Q55 50 55 35 L55 15 Z"
+          fill="url(#gradient)" opacity="0.2"/>
+    <path d="M30 10 L30 5 L5 15 L5 35 Q5 50 30 60 Q55 50 55 35 L55 15 Z"
+          fill="none" stroke="url(#gradient)" stroke-width="2.5"/>
+    <path d="M20 30 L27 37 L42 22" fill="none" stroke="url(#gradient)"
+          stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- ProofLayer text -->
+  <text x="90" y="45" font-family="system-ui, -apple-system, sans-serif"
+        font-size="32" font-weight="700" fill="#1e293b">
+    Proof
+  </text>
+  <text x="185" y="45" font-family="system-ui, -apple-system, sans-serif"
+        font-size="32" font-weight="700" fill="url(#gradient)">
+    Layer
+  </text>
+
+  <!-- Tagline -->
+  <text x="90" y="68" font-family="system-ui, -apple-system, sans-serif"
+        font-size="13" fill="#64748b" letter-spacing="0.5">
+    Security Scanner for AI Agents
+  </text>
+</svg>

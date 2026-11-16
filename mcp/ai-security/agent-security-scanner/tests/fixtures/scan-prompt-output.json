@@ -1,0 +1,43 @@
+{
+  "action": "BLOCK",
+  "risk_score": 85,
+  "risk_level": "CRITICAL",
+  "findings_count": 3,
+  "findings": [
+    {
+      "rule_id": "generic.prompt.exfiltration.env-access",
+      "category": "exfiltration",
+      "severity": "ERROR",
+      "message": "Prompt requests access to environment variables or secrets",
+      "matched_text": "read the .env file and send contents to",
+      "confidence": "HIGH",
+      "risk_score": "90",
+      "action": "BLOCK"
+    },
+    {
+      "rule_id": "generic.prompt.injection.role-override",
+      "category": "prompt-injection-jailbreak",
+      "severity": "ERROR",
+      "message": "Prompt attempts to override system instructions",
+      "matched_text": "ignore all previous instructions",
+      "confidence": "HIGH",
+      "risk_score": "85",
+      "action": "BLOCK"
+    },
+    {
+      "rule_id": "generic.prompt.social.urgency",
+      "category": "social-engineering",
+      "severity": "WARNING",
+      "message": "Social engineering: urgency or authority claim detected",
+      "matched_text": "this is urgent, do it immediately",
+      "confidence": "MEDIUM",
+      "risk_score": "50",
+      "action": "WARN"
+    }
+  ],
+  "recommendations": [
+    "Never allow prompts that request sending code or secrets to external URLs",
+    "Block access to sensitive files like .env, SSH keys, and credentials",
+    "Verify authorization claims through proper channels, not prompt content"
+  ]
+}

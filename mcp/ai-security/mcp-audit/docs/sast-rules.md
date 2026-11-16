@@ -1,0 +1,378 @@
+# SAST Rules Reference
+
+mcp-audit ships a curated pack of [Semgrep](https://semgrep.dev) rules that
+detect security vulnerabilities in MCP **server source code** — the Python and
+TypeScript implementations that handle tool calls from AI agents.
+
+This is complementary to mcp-audit's config scanning (which audits JSON
+client configurations). These rules scan the server implementation itself.
+
+---
+
+## Installation
+
+```bash
+pip install semgrep
+```
+
+Semgrep 1.0+ required.
+
+---
+
+## Usage Modes
+
+### Standalone (no mcp-audit required)
+
+Run the full rule pack against a directory or file:
+
+```bash
+semgrep --config semgrep-rules/ path/to/mcp-server/
+```
+
+Run only a subset by category:
+
+```bash
+semgrep --config semgrep-rules/python/injection/ path/to/server/
+semgrep --config semgrep-rules/python/credentials/ path/to/server/
+semgrep --config semgrep-rules/typescript/ path/to/server/
+```
+
+### Via mcp-audit
+
+Merge SAST findings into the unified scan output:
+
+```bash
+mcp-audit scan --sast path/to/mcp-server/
+mcp-audit scan --sast path/to/mcp-server/ --format json
+mcp-audit scan --sast path/to/mcp-server/ --format sarif --output results.sarif
+```
+
+Standalone SAST scan (no config scanning):
+
+```bash
+mcp-audit sast path/to/mcp-server/
+mcp-audit sast path/to/mcp-server/ --format json
+mcp-audit sast path/to/mcp-server/ --rules-dir /custom/rules/
+```
+
+---
+
+## Severity Mapping
+
+| Semgrep | mcp-audit |
+|---|---|
+| ERROR | CRITICAL |
+| WARNING | HIGH |
+| INFO | MEDIUM |
+
+---
+
+## Rule Catalog
+
+> **Note:** This catalog covers rules through v0.7.0. The v0.5.0 auth category
+> (6 Python + 2 TypeScript rules) and v0.9.0 additions (MCP Sampling injection,
+> SSRF validation-path, and SDK singleton transport rules) are not yet reflected
+> in the tables below. For the complete, authoritative rule list, run
+> `semgrep --config semgrep-rules/ --validate semgrep-rules/` or browse the
+> `semgrep-rules/` directory directly.
+
+### Python Rules (38 rules)
+
+#### `python/injection/` — 10 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-subprocess-string-cmd` | HIGH | CWE-78 | subprocess.run/Popen with string command in async function |
+| `mcp-os-system-call` | CRITICAL | CWE-78 | os.system() in async function |
+| `mcp-shell-true-injection` | HIGH | CWE-78 | subprocess called with shell=True |
+| `mcp-eval-tool-arg` | CRITICAL | CWE-95 | eval()/exec() with variable in async function |
+| `mcp-open-path-traversal` | HIGH | CWE-22 | open() with variable path in async function |
+| `mcp-pathlib-open-traversal` | HIGH | CWE-22 | Path($x).open/read_text/write_text with variable |
+| `mcp-requests-variable-url` | HIGH | CWE-918 | requests/httpx with variable URL — SSRF risk |
+| `mcp-aiohttp-variable-url` | HIGH | CWE-918 | aiohttp session with variable URL — SSRF risk |
+| `mcp-fstring-sql` | CRITICAL | CWE-89 | f-string SQL query in async function |
+| `mcp-string-concat-sql` | CRITICAL | CWE-89 | String-concatenated SQL query |
+
+#### `python/poisoning/` — 6 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-tool-description-injection-keywords` | CRITICAL | CWE-1336 | "ignore previous instructions" in tool description |
+| `mcp-tool-description-injection-keywords-2` | CRITICAL | CWE-1336 | Hidden action keywords in tool description |
+| `mcp-tool-description-exfiltration-keywords` | CRITICAL | CWE-1336 | Exfiltration keywords in tool description |
+| `mcp-description-contains-url` | HIGH | CWE-1336 | URL embedded in tool description |
+| `mcp-description-base64-content` | HIGH | CWE-1336 | Base64-encoded content in tool description |
+| `mcp-description-unicode-escape` | MEDIUM | CWE-1336 | Unicode escape sequences in tool description |
+
+#### `python/credentials/` — 5 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-hardcoded-api-key` | CRITICAL | CWE-798 | Hardcoded API key, token, or password assignment |
+| `mcp-hardcoded-connection-string` | CRITICAL | CWE-798 | Database connection string with embedded credentials |
+| `mcp-print-sensitive-var` | HIGH | CWE-532 | Sensitive variable printed in async handler |
+| `mcp-logging-sensitive-var` | HIGH | CWE-532 | Sensitive variable passed to logging call |
+| `mcp-env-var-not-used` | HIGH | CWE-798 | Credential hardcoded as default argument value |
+
+#### `python/protocol/` — 3 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-no-type-check-before-use` | MEDIUM | CWE-20 | arguments.get() result used without validation |
+| `mcp-traceback-in-return` | HIGH | CWE-209 | traceback.format_exc() returned from async function |
+| `mcp-bare-exception-return` | MEDIUM | CWE-209 | except E: return str(e) in async function |
+
+#### `python/transport/` — 4 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-fastapi-no-ssl` | HIGH | CWE-319 | uvicorn.run() without ssl_certfile/ssl_keyfile |
+| `mcp-flask-no-ssl` | HIGH | CWE-319 | app.run() without ssl_context |
+| `mcp-uvicorn-listen-all` | HIGH | CWE-605 | uvicorn.run() binding to 0.0.0.0 |
+| `mcp-fastapi-listen-all` | HIGH | CWE-605 | app.run(host="0.0.0.0") |
+
+### TypeScript Rules (35 rules)
+
+#### `typescript/injection/` — 10 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-ts-exec-injection` | CRITICAL | CWE-78 | child_process.exec() with variable command |
+| `mcp-ts-execsync-injection` | CRITICAL | CWE-78 | execSync() with variable command |
+| `mcp-ts-eval-variable` | CRITICAL | CWE-95 | eval() with variable argument |
+| `mcp-ts-fs-readfile-traversal` | HIGH | CWE-22 | fs.readFile/readFileSync with variable path — path traversal read risk |
+| `mcp-ts-fs-writefile-traversal` | HIGH | CWE-22 | fs.writeFile/appendFile with variable path — path traversal write risk |
+| `mcp-ts-path-join-traversal` | MEDIUM | CWE-22 | path.join() with variable component — boundary check required |
+| `mcp-ts-string-concat-sql` | CRITICAL | CWE-89 | String-concatenated SQL query in db.query/pool.query |
+| `mcp-ts-unsafe-query-variable` | HIGH | CWE-89 | Non-literal (template literal or variable) argument in SQL query function |
+| `mcp-ts-fetch-ssrf` | HIGH | CWE-918 | fetch()/axios with variable URL — SSRF risk |
+| `mcp-ts-http-request-ssrf` | HIGH | CWE-918 | https/http.request() with variable URL — SSRF risk |
+
+#### `typescript/poisoning/` — 6 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-ts-tool-description-injection` | CRITICAL | CWE-1336 | Injection keywords in TS tool description |
+| `mcp-ts-tool-description-injection-2` | CRITICAL | CWE-1336 | Hidden action keywords in TS tool description |
+| `mcp-ts-tool-description-exfiltration` | CRITICAL | CWE-1336 | Exfiltration keywords in TS tool description |
+| `mcp-ts-description-contains-url` | HIGH | CWE-1336 | HTTP/HTTPS URL embedded in tool description — exfiltration endpoint |
+| `mcp-ts-description-base64-content` | HIGH | CWE-1336 | Base64-encoded content in tool description — obfuscated instructions |
+| `mcp-ts-description-unicode-escape` | MEDIUM | CWE-1336 | Unicode escape sequences in tool description |
+
+#### `typescript/credentials/` — 5 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-ts-hardcoded-api-key` | CRITICAL | CWE-798 | Hardcoded credential in const declaration |
+| `mcp-ts-hardcoded-api-key-let` | CRITICAL | CWE-798 | Hardcoded credential in let declaration |
+| `mcp-ts-credential-default-param` | HIGH | CWE-798 | Hardcoded credential as default function parameter value |
+| `mcp-ts-console-log-sensitive` | HIGH | CWE-532 | Sensitive identifier passed to console.log/debug/warn |
+| `mcp-ts-console-error-sensitive` | HIGH | CWE-532 | Sensitive identifier passed to console.error |
+
+#### `typescript/protocol/` — 3 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-ts-no-type-check-before-use` | MEDIUM | CWE-20 | MCP tool argument used without typeof guard or schema validation |
+| `mcp-ts-error-stack-in-return` | HIGH | CWE-209 | err.stack returned from async handler — stack trace disclosure |
+| `mcp-ts-error-tostring-in-return` | MEDIUM | CWE-209 | String(err)/err.toString() returned — raw exception disclosure |
+
+#### `typescript/transport/` — 3 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-ts-express-no-https` | HIGH | CWE-319 | http.createServer() — plain HTTP, no TLS |
+| `mcp-ts-express-listen-all` | HIGH | CWE-605 | server.listen(port, "0.0.0.0") — binds to all interfaces |
+| `mcp-ts-http-listen-all` | HIGH | CWE-605 | listen({host: "0.0.0.0"}) — Fastify/HTTP binds to all interfaces |
+
+#### `typescript/auth/` — 2 rules
+
+| Rule ID | Severity | CWE | Description |
+|---|---|---|---|
+| `mcp-ts-route-missing-auth-middleware` | CRITICAL | CWE-306 | MCP route registered without auth middleware (MCPwn/CVE-2026-33032) |
+| `mcp-ts-auth-header-logged` | HIGH | CWE-532 | Request headers logged — bearer token exposure (n8n-MCP/CVE-2026-41495) |
+
+---
+
+## False Positive Guidance
+
+The following rules have elevated false positive rates due to their heuristic nature.
+
+### High FP Risk
+
+**`mcp-open-path-traversal`** and **`mcp-pathlib-open-traversal`**
+
+These fire on ANY `open()` or `Path().read_text()` call in an async function
+where the path is a variable. This includes well-written code that validates
+paths using `Path.is_relative_to()` or `os.path.commonpath()`.
+
+Suppress when path is validated:
+
+```python
+async def read_file(user_path: str) -> str:
+    full = (BASE_DIR / user_path).resolve()
+    if not full.is_relative_to(BASE_DIR):
+        raise ValueError("Path traversal blocked")
+    return full.read_text()  # nosemgrep: mcp-pathlib-open-traversal
+```
+
+**`mcp-no-type-check-before-use`**
+
+Fires when `arguments.get()` result is passed directly to a function call.
+The MCP SDK's own type validation for typed tool definitions handles this
+at the protocol level — suppress accordingly:
+
+```python
+value = arguments.get("name")  # nosemgrep: mcp-no-type-check-before-use
+```
+
+**`mcp-flask-no-ssl`**
+
+The pattern `$APP.run(...)` is broad. It excludes `subprocess.run` and
+`asyncio.run` but may fire on other `.run()` methods. Suppress when the
+server is behind a TLS-terminating proxy:
+
+```python
+app.run(port=5000)  # nosemgrep: mcp-flask-no-ssl — TLS terminated at nginx
+```
+
+### Medium FP Risk
+
+**`mcp-requests-variable-url`** and **`mcp-aiohttp-variable-url`**
+
+Fire on any HTTP request with a variable URL. Suppress when the URL is
+validated against an allowlist:
+
+```python
+resp = requests.get(url, ...)  # nosemgrep: mcp-requests-variable-url
+```
+
+**`mcp-hardcoded-api-key`**
+
+Fires when a variable named `api_key`, `token`, `secret` etc. is assigned
+a string of 20+ characters. May fire on test fixtures or placeholder values.
+Review each finding manually.
+
+### TypeScript FP Risk
+
+**`mcp-ts-fs-readfile-traversal`** and **`mcp-ts-fs-writefile-traversal`**
+
+Fire on any `fs.readFile()` / `fs.writeFile()` call where the path argument
+is a variable. Inline `path.resolve()` is excluded. Suppress when the path
+is validated with a boundary check:
+
+```typescript
+const resolved = path.resolve(BASE_DIR, userInput);
+if (!resolved.startsWith(BASE_DIR + path.sep)) throw new Error("blocked");
+fs.readFile(resolved, "utf8", callback); // nosemgrep: mcp-ts-fs-readfile-traversal
+```
+
+**`mcp-ts-path-join-traversal`** (INFO / MEDIUM)
+
+Fires when `path.join()` is called with any variable argument. This is a
+broad heuristic — many `path.join()` usages are safe when the result is
+subsequently validated. Suppress when a `startsWith(BASE_DIR)` guard follows:
+
+```typescript
+const p = path.join(base, userInput); // nosemgrep: mcp-ts-path-join-traversal
+```
+
+**`mcp-ts-fetch-ssrf`** and **`mcp-ts-http-request-ssrf`**
+
+Fire on any fetch/axios/https.request call where the URL is not a string
+literal. Suppress when the URL is validated against an allowlist:
+
+```typescript
+const response = await fetch(url); // nosemgrep: mcp-ts-fetch-ssrf
+```
+
+**`mcp-ssrf-ip-literal-only-guard`** and **`mcp-ts-ssrf-ip-literal-only-guard`**
+
+Fire on an SSRF guard that checks the host with `ipaddress.ip_address()` (Python)
+or `net.isIP()` / ipaddr.js (TypeScript) but never resolves hostnames, so a name
+pointing at an internal address passes (Wazuh MCP, GHSA-pw2j-pj4h-f5vg). A
+handler that raises, or a function that resolves the name first, is not flagged.
+Suppress when the guard's return value makes the caller refuse hostnames outright:
+
+```python
+ip = ipaddress.ip_address(host)  # nosemgrep: mcp-ssrf-ip-literal-only-guard
+```
+
+The fix is to resolve the name, reject it if any address is private, loopback,
+link-local or reserved, and connect to the address you checked so a DNS rebind
+can't swap it.
+
+**`mcp-ts-no-type-check-before-use`**
+
+Fires when `args[key]` is passed directly to a function without a `typeof` guard.
+Suppress when a Zod schema, Joi validator, or explicit `typeof` check has already
+validated the argument upstream:
+
+```typescript
+const val = args["query"]; // nosemgrep: mcp-ts-no-type-check-before-use
+```
+
+**`mcp-ts-console-log-sensitive`** and **`mcp-ts-console-error-sensitive`**
+
+Fire when a variable whose *name* matches a credential pattern is passed to a
+console method. Suppress when the variable name is credential-like but the value
+is not sensitive (e.g., a boolean `isTokenValid`, a count `authAttempts`):
+
+```typescript
+console.log(authAttempts); // nosemgrep: mcp-ts-console-log-sensitive
+```
+
+**`mcp-ts-error-tostring-in-return`**
+
+Fires on `return String(err)` or `return err.toString()` inside async functions.
+Suppress when the exception type is known not to contain sensitive data:
+
+```typescript
+return (err as TypeError).toString(); // nosemgrep: mcp-ts-error-tostring-in-return
+```
+
+> **Note:** Taint/dataflow analysis would eliminate most SSRF and path
+> traversal false positives by tracking data from MCP `arguments.get()` to
+> each sink. Pattern-only analysis is the current approach; taint analysis
+> is a future roadmap item (see Roadmap section).
+
+---
+
+## Suppressing Rules
+
+### Per-line suppression
+
+```python
+result = subprocess.run(cmd_list, ...)  # nosemgrep: mcp-subprocess-string-cmd
+```
+
+### Per-file suppression
+
+Add at the top of the file:
+
+```python
+# nosemgrep
+```
+
+### Per-rule suppression via semgrepignore
+
+Add to `.semgrepignore` in the target project root:
+
+```
+path/to/file/with/false/positives.py
+```
+
+---
+
+## Contributing New Rules
+
+See [contributing-sast-rules.md](contributing-sast-rules.md) for the full guide including
+rule structure reference, test fixture requirements, and PR checklist.
+
+---
+
+## Roadmap
+
+- Go language rules for MCP servers written in Go
+- Rust language rules
+- Taint analysis rules (track data flow from `arguments.get()` to sinks)
