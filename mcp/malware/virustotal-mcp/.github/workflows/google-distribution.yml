@@ -1,0 +1,42 @@
+# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+name: Google distribution
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: google-distribution
+  cancel-in-progress: false
+
+jobs:
+  public-distribution:
+    if: github.repository == 'VirusTotal/virustotal-mcp' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read public distribution metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_google_distribution.py --output "$RUNNER_TEMP/google-distribution.json"
+      - name: Retain the public observations, including failed checks
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: google-distribution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/google-distribution.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "virustotal": {
+      "serverUrl": "https://ai.virustotal.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${file:~/.config/vt-mcp/token}"
+      }
+    }
+  }
+}

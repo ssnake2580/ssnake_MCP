@@ -1,0 +1,8 @@
+{
+  "file": "attachment-100kb.txt",
+  "sha256": "3712659d522b260dee26d8abc8af61c22fe99e2ea3e2533637d1cb99992fa900",
+  "size_bytes": 102400,
+  "mime_type": "text/plain",
+  "publicly_shareable": true,
+  "purpose": "Harmless public fixture for authorized attachment download and standard VirusTotal submission checks."
+}

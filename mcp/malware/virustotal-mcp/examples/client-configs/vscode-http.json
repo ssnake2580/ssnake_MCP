@@ -1,0 +1,19 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "vtai-token",
+      "description": "VTAI Agent Token from https://ai.virustotal.com/connect/mcp",
+      "password": true
+    }
+  ],
+  "servers": {
+    "virustotal": {
+      "type": "http",
+      "url": "https://ai.virustotal.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:vtai-token}"
+      }
+    }
+  }
+}

@@ -1,0 +1,726 @@
+"""Unit tests for the Redis-based analysis cache component."""
+
+import json
+import sqlite3
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from reversecore_mcp.core.analysis_cache import (
+    _deserialize_result,
+    _serialize_result,
+    calculate_file_sha256,
+    get_cached_decompile,
+    set_cached_decompile,
+)
+from reversecore_mcp.core.result import failure, success
+
+
+def test_calculate_file_sha256(tmp_path):
+    # Test nonexistent file
+    assert calculate_file_sha256(tmp_path / "nonexistent") == ""
+
+    # Test valid file
+    test_file = tmp_path / "test.bin"
+    test_file.write_bytes(b"hello world")
+    expected_hash = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    assert calculate_file_sha256(test_file) == expected_hash
+
+
+def test_serialization_roundtrip():
+    # Test success result
+    suc = success("decompiled code", author="test", decompiler="ghidra")
+    serialized = _serialize_result(suc)
+    deserialized = _deserialize_result(serialized)
+    assert deserialized.status == "success"
+    assert deserialized.data == "decompiled code"
+    assert deserialized.metadata["author"] == "test"
+    assert deserialized.metadata["decompiler"] == "ghidra"
+
+    # Test failure result
+    fail = failure("ERR_CODE", "Something failed", hint="Try again", details_val="detail")
+    serialized = _serialize_result(fail)
+    deserialized = _deserialize_result(serialized)
+    assert deserialized.status == "error"
+    assert deserialized.error_code == "ERR_CODE"
+    assert deserialized.message == "Something failed"
+    assert deserialized.hint == "Try again"
+    assert deserialized.details["details_val"] == "detail"
+
+
+@pytest.mark.asyncio
+async def test_cache_operations_redis_disabled():
+    # Force get_redis_client to return None
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+        # get_cached_decompile should immediately return None
+        res = await get_cached_decompile("dummy_path", "main")
+        assert res is None
+
+        # set_cached_decompile should run without exception
+        suc = success("code")
+        await set_cached_decompile("dummy_path", "main", suc)
+
+
+@pytest.mark.asyncio
+async def test_cache_operations_success(tmp_path):
+    test_file = tmp_path / "target.bin"
+    test_file.write_bytes(b"target binary")
+    file_hash = calculate_file_sha256(test_file)
+
+    mock_redis = AsyncMock()
+    # Mock redis get and setex
+    cached_val = None
+
+    async def mock_get(key):
+        return cached_val
+
+    async def mock_setex(key, ttl, value):
+        nonlocal cached_val
+        cached_val = value
+
+    mock_redis.get.side_effect = mock_get
+    mock_redis.setex.side_effect = mock_setex
+
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=mock_redis):
+        # 1. Check cache miss
+        res = await get_cached_decompile(test_file, "main", use_ghidra=True)
+        assert res is None
+
+        # 2. Store in cache
+        suc = success("decompiled output", func="main")
+        await set_cached_decompile(test_file, "main", suc, use_ghidra=True)
+
+        # Verify key used in Redis
+        expected_key = f"ghidra:decompile:v2:{file_hash}:main:ghidra"
+        mock_redis.setex.assert_called_once()
+        assert mock_redis.setex.call_args[0][0] == expected_key
+
+        # 3. Check cache hit
+        res_hit = await get_cached_decompile(test_file, "main", use_ghidra=True)
+        assert res_hit is not None
+        assert res_hit.status == "success"
+        assert res_hit.data == "decompiled output"
+        assert res_hit.metadata["cache_hit"] is True
+
+
+@pytest.mark.asyncio
+async def test_cache_operations_sqlite_success(patched_config):
+    # Reuse the workspace configured by patched_config
+    workspace_dir = patched_config.workspace
+
+    test_file = workspace_dir / "target.bin"
+    test_file.write_bytes(b"target binary contents")
+
+    # Patch get_redis_client to return None so it falls back to SQLite
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+        # 1. Check cache miss
+        res = await get_cached_decompile(test_file, "main", use_ghidra=True)
+        assert res is None
+
+        # 2. Store in cache
+        suc = success("decompiled output from sqlite", func="main")
+        await set_cached_decompile(test_file, "main", suc, use_ghidra=True)
+
+        # Verify SQLite cache database file exists
+        db_path = workspace_dir / ".reversecore_cache.db"
+        assert db_path.exists()
+
+        # 3. Check cache hit
+        res_hit = await get_cached_decompile(test_file, "main", use_ghidra=True)
+        assert res_hit is not None
+        assert res_hit.status == "success"
+        assert res_hit.data == "decompiled output from sqlite"
+        assert res_hit.metadata["cache_hit"] is True
+
+        # 4. Invalidation check: query cache with a different file hash
+        other_file = workspace_dir / "other.bin"
+        other_file.write_bytes(b"different contents")
+
+        res_miss = await get_cached_decompile(other_file, "main", use_ghidra=True)
+        assert res_miss is None
+
+
+@pytest.mark.asyncio
+async def test_export_and_import_cache_data(patched_config):
+    from reversecore_mcp.core.analysis_cache import (
+        export_cache_by_hash,
+        import_cache_data,
+    )
+
+    workspace_dir = patched_config.workspace
+    test_file = workspace_dir / "export_target.bin"
+    test_file.write_bytes(b"export target data")
+    file_hash = calculate_file_sha256(test_file)
+
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+        # 1. Populate cache in SQLite
+        suc = success("int main() { return 42; }", func="main")
+        await set_cached_decompile(test_file, "0x401000", suc, use_ghidra=True)
+
+        # 2. Export cache
+        exported = await export_cache_by_hash(file_hash)
+        assert exported["format"] == "rcpack"
+        assert exported["file_hash"] == file_hash
+        assert len(exported["entries"]) == 1
+        assert exported["entries"][0]["function_address"] == "0x401000"
+
+        # 3. Import with a matching target, then verify the cached result keeps
+        # its external provenance through a normal cache lookup.
+        mock_redis = AsyncMock()
+        with patch(
+            "reversecore_mcp.core.analysis_cache.get_redis_client",
+            return_value=mock_redis,
+        ):
+            count = await import_cache_data(exported, target_file=test_file)
+            assert count == 1
+            mock_redis.setex.assert_called_once()
+
+        with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+            imported = await get_cached_decompile(test_file, "0x401000", use_ghidra=True)
+        assert imported is not None
+        assert imported.status == "success"
+        assert imported.data == "int main() { return 42; }"
+        assert imported.metadata["cache_provenance"] == "external_rcpack"
+        assert imported.metadata["cache_target_hash_verified"] is True
+
+        # Offline import remains available, but is explicitly marked unverified.
+        with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+            assert await import_cache_data(exported) == 1
+            offline_import = await get_cached_decompile(test_file, "0x401000", use_ghidra=True)
+        assert offline_import is not None
+        assert offline_import.metadata["cache_provenance"] == "external_rcpack"
+        assert offline_import.metadata["cache_target_hash_verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_cache_exports_close_sqlite_connections(tmp_path):
+    from reversecore_mcp.core import analysis_cache
+
+    db_path = tmp_path / "analysis-cache.db"
+    setup_conn = sqlite3.connect(db_path)
+    setup_conn.execute(
+        """
+        CREATE TABLE decompilation_cache (
+            file_hash TEXT,
+            function_address TEXT,
+            decompiler TEXT,
+            status TEXT,
+            data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            provenance TEXT NOT NULL DEFAULT 'legacy_unverified',
+            PRIMARY KEY (file_hash, function_address, decompiler)
+        )
+        """
+    )
+    file_hash = "a" * 64
+    setup_conn.execute(
+        """
+        INSERT INTO decompilation_cache
+            (file_hash, function_address, decompiler, status, data, provenance)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            file_hash,
+            "0x401000",
+            "ghidra",
+            "success",
+            _serialize_result(success("cached code")),
+            "local",
+        ),
+    )
+    setup_conn.commit()
+    setup_conn.close()
+
+    connections: list[sqlite3.Connection] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        closed_by_test: bool
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.closed_by_test = False
+
+        def close(self):
+            self.closed_by_test = True
+            super().close()
+
+    def connect_with_tracking(path):
+        conn = sqlite3.connect(path, timeout=30.0, factory=TrackingConnection)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        connections.append(conn)
+        return conn
+
+    with (
+        patch("reversecore_mcp.core.analysis_cache._init_sqlite_db", return_value=db_path),
+        patch(
+            "reversecore_mcp.core.analysis_cache._get_sqlite_conn",
+            side_effect=connect_with_tracking,
+        ),
+    ):
+        for _ in range(10):
+            exported = await analysis_cache.export_cache_by_hash(file_hash)
+            assert len(exported["entries"]) == 1
+
+    assert len(connections) == 10
+    assert all(conn.closed_by_test for conn in connections)
+
+
+@pytest.mark.asyncio
+async def test_failed_cache_import_closes_connection_and_rolls_back(tmp_path):
+    from reversecore_mcp.core import analysis_cache
+
+    db_path = tmp_path / "analysis-cache.db"
+    setup_conn = sqlite3.connect(db_path)
+    setup_conn.execute(
+        """
+        CREATE TABLE decompilation_cache (
+            file_hash TEXT,
+            function_address TEXT,
+            decompiler TEXT,
+            status TEXT,
+            data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            provenance TEXT NOT NULL DEFAULT 'legacy_unverified',
+            PRIMARY KEY (file_hash, function_address, decompiler)
+        )
+        """
+    )
+    setup_conn.execute(
+        """
+        CREATE TRIGGER fail_second_cache_insert
+        BEFORE INSERT ON decompilation_cache
+        WHEN NEW.function_address = '0x401004'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected import failure');
+        END;
+        """
+    )
+    setup_conn.commit()
+    setup_conn.close()
+
+    connections: list[sqlite3.Connection] = []
+    rollbacks: list[bool] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        closed_by_test: bool
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.closed_by_test = False
+
+        def rollback(self):
+            rollbacks.append(True)
+            super().rollback()
+
+        def close(self):
+            self.closed_by_test = True
+            super().close()
+
+    def connect_with_tracking(path):
+        conn = sqlite3.connect(path, timeout=30.0, factory=TrackingConnection)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        connections.append(conn)
+        return conn
+
+    file_hash = "b" * 64
+    payload = {
+        "format": "rcpack",
+        "version": "1.0",
+        "file_hash": file_hash,
+        "entries": [
+            {
+                "function_address": address,
+                "decompiler": "ghidra",
+                "status": "success",
+                "data": _serialize_result(success(f"code at {address}")),
+            }
+            for address in ("0x401000", "0x401004")
+        ],
+    }
+
+    with (
+        patch("reversecore_mcp.core.analysis_cache._init_sqlite_db", return_value=db_path),
+        patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None),
+        patch(
+            "reversecore_mcp.core.analysis_cache._get_sqlite_conn",
+            side_effect=connect_with_tracking,
+        ),
+    ):
+        assert await analysis_cache.import_cache_data(payload) == 0
+
+    assert len(connections) == 1
+    assert connections[0].closed_by_test
+    assert rollbacks == [True]
+    read_conn = sqlite3.connect(db_path)
+    try:
+        assert read_conn.execute("SELECT COUNT(*) FROM decompilation_cache").fetchone()[0] == 0
+    finally:
+        read_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_import_cache_data_rejects_target_hash_mismatch(tmp_path):
+    from reversecore_mcp.core.analysis_cache import import_cache_data
+
+    target_file = tmp_path / "target.bin"
+    target_file.write_bytes(b"real target")
+    payload = {
+        "format": "rcpack",
+        "version": "1.0",
+        "file_hash": "0" * 64,
+        "entries": [
+            {
+                "function_address": "0x401000",
+                "decompiler": "ghidra",
+                "status": "success",
+                "data": _serialize_result(success("attacker-controlled output")),
+            }
+        ],
+    }
+
+    with (
+        patch("reversecore_mcp.core.analysis_cache._init_sqlite_db") as init_db,
+        patch("reversecore_mcp.core.analysis_cache.get_redis_client") as redis_client,
+        pytest.raises(ValueError, match="does not match the supplied target file"),
+    ):
+        await import_cache_data(payload, target_file=target_file)
+
+    init_db.assert_not_called()
+    redis_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_entry",
+    [
+        {
+            "function_address": "0x401000",
+            "decompiler": "unknown",
+            "status": "success",
+            "data": _serialize_result(success("code")),
+        },
+        {
+            "function_address": "0x401000",
+            "decompiler": "ghidra",
+            "status": "success",
+            "data": "{not json",
+        },
+        {
+            "function_address": "0x401000",
+            "decompiler": "ghidra",
+            "status": "success",
+            "data": _serialize_result(success({"full_pseudo_c": ["not source text"]})),
+        },
+        {
+            "function_address": "0x401000",
+            "decompiler": "radare2",
+            "status": "success",
+            "data": _serialize_result(success({"unrelated": "not a structure result"})),
+        },
+    ],
+)
+async def test_import_cache_data_validates_all_entries_before_writing(invalid_entry):
+    from reversecore_mcp.core.analysis_cache import import_cache_data
+
+    payload = {
+        "format": "rcpack",
+        "version": "1.0",
+        "file_hash": "a" * 64,
+        "entries": [
+            {
+                "function_address": "0x401000",
+                "decompiler": "ghidra",
+                "status": "success",
+                "data": _serialize_result(success("valid first entry")),
+            },
+            invalid_entry,
+        ],
+    }
+
+    with (
+        patch("reversecore_mcp.core.analysis_cache._init_sqlite_db") as init_db,
+        patch("reversecore_mcp.core.analysis_cache.get_redis_client") as redis_client,
+        pytest.raises(ValueError),
+    ):
+        await import_cache_data(payload)
+
+    init_db.assert_not_called()
+    redis_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserved_key", ["data", "pagination", "hints"])
+async def test_import_cache_data_rejects_reserved_metadata_keys_before_writing(reserved_key):
+    from reversecore_mcp.core.analysis_cache import import_cache_data
+
+    serialized = json.loads(_serialize_result(success("cached code")))
+    serialized["metadata"] = {reserved_key: "attacker-controlled value"}
+    payload = {
+        "format": "rcpack",
+        "version": "1.0",
+        "file_hash": "a" * 64,
+        "entries": [
+            {
+                "function_address": "0x401000",
+                "decompiler": "ghidra",
+                "status": "success",
+                "data": json.dumps(serialized),
+            }
+        ],
+    }
+
+    with (
+        patch("reversecore_mcp.core.analysis_cache._init_sqlite_db") as init_db,
+        patch("reversecore_mcp.core.analysis_cache.get_redis_client") as redis_client,
+        pytest.raises(ValueError, match="reserved ToolSuccess keys"),
+    ):
+        await import_cache_data(payload)
+
+    init_db.assert_not_called()
+    redis_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_existing_sqlite_cache_rows_are_marked_legacy_unverified(patched_config):
+    from reversecore_mcp.core import analysis_cache
+
+    target_file = patched_config.workspace / "legacy_target.bin"
+    target_file.write_bytes(b"legacy target")
+    file_hash = calculate_file_sha256(target_file)
+    db_path = patched_config.workspace / ".reversecore_cache.db"
+    legacy_result = json.loads(_serialize_result(success("legacy pseudo C")))
+    legacy_result["metadata"] = {
+        "cache_provenance": "local",
+        "cache_target_hash_verified": True,
+        "pagination": {"forged": True},
+        "hints": ["forged"],
+        "data": "forged",
+    }
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE decompilation_cache (
+            file_hash TEXT,
+            function_address TEXT,
+            decompiler TEXT,
+            status TEXT,
+            data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (file_hash, function_address, decompiler)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO decompilation_cache
+            (file_hash, function_address, decompiler, status, data)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            file_hash,
+            "0x401000",
+            "ghidra",
+            "success",
+            json.dumps(legacy_result),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO decompilation_cache
+            (file_hash, function_address, decompiler, status, data)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            file_hash,
+            "0x401001",
+            "radare2",
+            "success",
+            _serialize_result(success({"unrelated": "not a structure result"})),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+        result = await analysis_cache.get_cached_decompile(target_file, "0x401000")
+
+    assert result is not None
+    assert result.metadata["cache_provenance"] == "legacy_unverified"
+    assert result.metadata["cache_target_hash_verified"] is False
+    assert not {"data", "pagination", "hints"}.intersection(result.metadata)
+
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+        malformed_legacy = await analysis_cache.get_cached_decompile(
+            target_file, "0x401001", use_ghidra=False
+        )
+    assert malformed_legacy is None
+
+
+@pytest.mark.asyncio
+async def test_import_cache_data_invalid_format():
+    from reversecore_mcp.core.analysis_cache import import_cache_data
+
+    with pytest.raises(ValueError, match="Invalid cache data format"):
+        await import_cache_data({"format": "invalid"})
+
+
+@pytest.mark.asyncio
+async def test_import_cache_data_empty():
+    from reversecore_mcp.core.analysis_cache import import_cache_data
+
+    assert await import_cache_data({"format": "rcpack", "file_hash": ""}) == 0
+    assert await import_cache_data({"format": "rcpack", "file_hash": "abc", "entries": []}) == 0
+
+
+@pytest.mark.asyncio
+async def test_close_redis():
+    from reversecore_mcp.core import analysis_cache
+
+    mock_client = AsyncMock()
+    analysis_cache._redis_client = mock_client
+    await analysis_cache.close_redis()
+    mock_client.aclose.assert_called_once()
+    assert analysis_cache._redis_client is None
+
+    # Error handling during close
+    mock_client_err = AsyncMock()
+    mock_client_err.aclose.side_effect = RuntimeError("Close failed")
+    analysis_cache._redis_client = mock_client_err
+    await analysis_cache.close_redis()
+    assert analysis_cache._redis_client is None
+
+
+def test_deserialize_invalid_json():
+    assert _deserialize_result("invalid json content {") is None
+
+
+def test_calculate_file_sha256_read_exception(tmp_path):
+    test_file = tmp_path / "unreadable.bin"
+    test_file.write_bytes(b"data")
+    with patch("builtins.open", side_effect=PermissionError("Denied")):
+        assert calculate_file_sha256(test_file) == ""
+
+
+def test_sqlite_read_write_exceptions(tmp_path):
+    from reversecore_mcp.core.analysis_cache import (
+        _read_from_sqlite,
+        _write_to_sqlite,
+    )
+
+    db_path = tmp_path / "invalid_db.db"
+    db_path.write_bytes(b"not a valid sqlite database header")
+
+    # Should handle SQLite error gracefully and return None
+    assert _read_from_sqlite(db_path, "hash", "0x1000", "ghidra") is None
+
+    # Should handle SQLite write error gracefully
+    _write_to_sqlite(db_path, "hash", "0x1000", "ghidra", "success", "data")
+
+
+def test_get_redis_client_init_and_failure():
+    from reversecore_mcp.core import analysis_cache
+
+    # 1. Test redis disabled flag
+    analysis_cache._redis_enabled = False
+    analysis_cache._redis_client = None
+    assert analysis_cache.get_redis_client() is None
+
+    # 2. Test redis init exception
+    analysis_cache._redis_enabled = True
+    analysis_cache._redis_client = None
+    with patch("redis.asyncio.from_url", side_effect=Exception("Redis connection error")):
+        assert analysis_cache.get_redis_client() is None
+        assert analysis_cache._redis_enabled is False
+
+    # Reset
+    analysis_cache._redis_enabled = True
+    analysis_cache._redis_client = None
+
+
+@pytest.mark.asyncio
+async def test_get_cached_decompile_redis_error_fallback(patched_config):
+    from reversecore_mcp.core import analysis_cache
+
+    workspace_dir = patched_config.workspace
+    test_file = workspace_dir / "fallback_target.bin"
+    test_file.write_bytes(b"fallback binary data")
+
+    mock_redis = AsyncMock()
+    mock_redis.get.side_effect = Exception("Redis get failed")
+
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=mock_redis):
+        # Store in SQLite directly
+        suc = success("code in sqlite", func="main")
+        await analysis_cache.set_cached_decompile(test_file, "main", suc, use_ghidra=True)
+
+        # get_cached_decompile should catch redis error and fall back to SQLite hit
+        res = await analysis_cache.get_cached_decompile(test_file, "main", use_ghidra=True)
+        assert res is not None
+        assert res.data == "code in sqlite"
+
+
+@pytest.mark.asyncio
+async def test_set_cached_decompile_skips_failure(patched_config):
+    from reversecore_mcp.core import analysis_cache
+
+    workspace_dir = patched_config.workspace
+    test_file = workspace_dir / "fail_target.bin"
+    test_file.write_bytes(b"data")
+
+    # Should not cache failure results
+    fail = failure("ERROR", "Failed decompilation")
+    await analysis_cache.set_cached_decompile(test_file, "main", fail)
+
+    res = await analysis_cache.get_cached_decompile(test_file, "main")
+    assert res is None
+
+
+@pytest.mark.asyncio
+async def test_cache_errors_during_set_and_export(patched_config):
+    from reversecore_mcp.core import analysis_cache
+
+    workspace_dir = patched_config.workspace
+    test_file = workspace_dir / "err_target.bin"
+    test_file.write_bytes(b"data")
+
+    # Redis setex error
+    mock_redis = AsyncMock()
+    mock_redis.setex.side_effect = Exception("Redis setex error")
+    with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=mock_redis):
+        suc = success("code")
+        await analysis_cache.set_cached_decompile(test_file, "main", suc)
+
+    # SQLite error during export
+    with patch(
+        "reversecore_mcp.core.analysis_cache._init_sqlite_db",
+        side_effect=Exception("DB init failed"),
+    ):
+        exported = await analysis_cache.export_cache_by_hash("some_hash")
+        assert exported["entries"] == []
+
+    # SQLite error during import
+    with patch(
+        "reversecore_mcp.core.analysis_cache._init_sqlite_db",
+        side_effect=Exception("DB init failed"),
+    ):
+        with patch("reversecore_mcp.core.analysis_cache.get_redis_client", return_value=None):
+            count = await analysis_cache.import_cache_data(
+                {
+                    "format": "rcpack",
+                    "version": "1.0",
+                    "file_hash": "a" * 64,
+                    "entries": [
+                        {
+                            "function_address": "0x1000",
+                            "decompiler": "ghidra",
+                            "status": "success",
+                            "data": _serialize_result(success("code")),
+                        }
+                    ],
+                }
+            )
+        assert count == 0

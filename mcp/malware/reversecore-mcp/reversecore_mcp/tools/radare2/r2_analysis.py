@@ -1,0 +1,1113 @@
+"""Radare2-based analysis tools for binary analysis, cross-references, and execution tracing."""
+
+import os
+from pathlib import Path
+from typing import Any
+
+from async_lru import alru_cache
+from fastmcp import Context
+from fastmcp.utilities.types import Image
+
+# Use high-performance JSON implementation (3-5x faster)
+from reversecore_mcp.core import json_utils as json
+from reversecore_mcp.core.command_spec import ValidatedR2Command, validate_r2_command
+from reversecore_mcp.core.config import get_config
+from reversecore_mcp.core.decorators import log_execution
+from reversecore_mcp.core.error_handling import handle_tool_errors
+from reversecore_mcp.core.execution import (
+    execute_subprocess_async,
+)  # For test compatibility
+
+# Extension hook support (no-op when no extensions are registered)
+from reversecore_mcp.core.extension import R2CommandResult
+from reversecore_mcp.core.extension_registry import get_extension_registry
+from reversecore_mcp.core.metrics import track_metrics
+from reversecore_mcp.core.r2_helpers import (
+    build_r2_cmd as _build_r2_cmd,
+)
+
+# Import shared R2 helper functions from core (avoids circular dependencies)
+from reversecore_mcp.core.r2_helpers import (
+    calculate_dynamic_timeout,
+    remove_analysis_commands,
+)
+from reversecore_mcp.core.r2_helpers import (
+    escape_mermaid_chars as _escape_mermaid_chars,
+)
+from reversecore_mcp.core.r2_helpers import (
+    execute_r2_command as _execute_r2_command,
+)
+from reversecore_mcp.core.r2_helpers import (
+    parse_json_output as _parse_json_output,
+)
+from reversecore_mcp.core.r2_helpers import (
+    strip_address_prefixes as _strip_address_prefixes,
+)
+from reversecore_mcp.core.resilience import circuit_breaker
+from reversecore_mcp.core.result import PaginationMeta, ToolResult, failure, success
+from reversecore_mcp.core.security import validate_file_path
+from reversecore_mcp.core.validators import (
+    _ADDRESS_PATTERN,  # OPTIMIZATION: Import pre-compiled pattern instead of duplicating
+    validate_tool_parameters,
+)
+
+# Load default timeout from configuration
+DEFAULT_TIMEOUT = get_config().default_tool_timeout
+
+
+async def _apply_validated_r2_pre_hooks(file_path: str, command: str) -> tuple[str, str]:
+    """Run extension pre-hooks, then reapply core path and command validation."""
+    registry = get_extension_registry()
+    hooked_path, hooked_command = await registry.run_r2_pre_hooks(file_path, command)
+    return str(validate_file_path(hooked_path)), validate_r2_command(hooked_command)
+
+
+@log_execution(tool_name="run_radare2")
+@track_metrics("run_radare2")
+@circuit_breaker("run_radare2", failure_threshold=5, recovery_timeout=60)
+@handle_tool_errors
+async def run_radare2(
+    file_path: str,
+    r2_command: str,
+    max_output_size: int = 10_000_000,
+    timeout: int = DEFAULT_TIMEOUT,
+    ctx: Context | None = None,
+) -> ToolResult:
+    """Execute vetted radare2 commands for binary triage."""
+
+    validate_tool_parameters("run_radare2", {"r2_command": r2_command})
+    validated_path = validate_file_path(file_path)
+    validated_command = validate_r2_command(r2_command)
+
+    # Adaptive analysis logic based on command type and file size
+    # Use 'aa' for basic commands, 'aaa' for analysis-heavy commands on small files
+    analysis_level = "aa"
+
+    # Simple information commands don't need analysis
+    simple_commands = [
+        "i",
+        "iI",
+        "iz",
+        "izj",
+        "il",
+        "is",
+        "isj",
+        "ie",
+        "it",
+        "iS",
+        "iSj",
+    ]
+    if validated_command in simple_commands or validated_command.startswith("i "):
+        analysis_level = "-n"
+
+    # Function listing commands (afl, aflj) benefit from deeper analysis
+    # but only if file is small enough
+    function_commands = ["afl", "aflj", "afll", "afllj", "pdf", "pdr"]
+    if any(cmd in validated_command for cmd in function_commands):
+        try:
+            file_size_mb = os.path.getsize(validated_path) / (1024 * 1024)
+            if file_size_mb < 10:  # For files under 10MB, use deeper analysis
+                analysis_level = "aaa"
+        except OSError:
+            pass
+
+    # Use helper function to execute radare2 command
+    try:
+        # ── Extension pre-hooks (may transform file_path / command) ──────────
+        _registry = get_extension_registry()
+        hooked_path, hooked_command = await _apply_validated_r2_pre_hooks(
+            str(validated_path), validated_command
+        )
+        validated_path = Path(hooked_path)
+        validated_command = ValidatedR2Command(hooked_command)
+
+        # If user explicitly requested analysis, handle it via caching
+        if "aaa" in validated_command or "aa" in validated_command:
+            analysis_level = "aaa"
+            # Remove explicit analysis commands as they are handled by _build_r2_cmd
+            cleaned_command = remove_analysis_commands(validated_command)
+        else:
+            cleaned_command = validated_command
+
+        r2_cmds = [cleaned_command] if cleaned_command else []
+
+        output, bytes_read = await _execute_r2_command(
+            validated_path,
+            r2_cmds,
+            analysis_level=analysis_level,
+            max_output_size=max_output_size,
+            base_timeout=timeout,
+        )
+
+        # ── Extension post-hooks (may enrich result with metadata) ───────────
+        result_obj = R2CommandResult(
+            file_path=str(validated_path),
+            command=validated_command,
+            raw_output=output,
+        )
+        result_obj = await _registry.run_r2_post_hooks(result_obj)
+
+        # Merge extension metadata into the success response
+        return success(
+            result_obj.parsed if result_obj.parsed is not None else output,
+            bytes_read=bytes_read,
+            analysis_level=analysis_level,
+            **result_obj.metadata,
+        )
+    except Exception as e:
+        # Log error to client if context is available
+        if ctx:
+            await ctx.error(f"radare2 command '{validated_command}' failed: {str(e)}")
+        raise
+
+
+# Note: R2AnalysisPlugin has been removed.
+# All tools (run_radare2, trace_execution_path, generate_function_graph, analyze_xrefs)
+# are now registered via Radare2ToolsPlugin in radare2_mcp_tools.py for unified management.
+
+
+# Dangerous sink APIs for prioritized path tracing
+_DANGEROUS_SINKS = frozenset(
+    {
+        # Command execution
+        "system",
+        "execve",
+        "execl",
+        "execlp",
+        "execle",
+        "execv",
+        "execvp",
+        "execvpe",
+        "popen",
+        "_popen",
+        "ShellExecute",
+        "ShellExecuteEx",
+        "CreateProcess",
+        "WinExec",
+        "spawn",
+        "fork",
+        # Memory corruption
+        "strcpy",
+        "strcat",
+        "sprintf",
+        "vsprintf",
+        "gets",
+        "scanf",
+        "memcpy",
+        "memmove",
+        "strncpy",
+        # File operations
+        "fopen",
+        "open",
+        "CreateFile",
+        "DeleteFile",
+        "WriteFile",
+        # Network
+        "connect",
+        "send",
+        "recv",
+        "socket",
+        "bind",
+        "listen",
+        # Registry (Windows)
+        "RegSetValue",
+        "RegCreateKey",
+        "RegDeleteKey",
+    }
+)
+
+# Pre-lowercased version for case-insensitive matching without per-call .lower()
+_DANGEROUS_SINKS_LOWER = frozenset(s.lower() for s in _DANGEROUS_SINKS)
+
+# =============================================================================
+# Symbol Alias Database for Enhanced Matching
+# =============================================================================
+# Maps common API names to their variants (Windows A/W suffixes, safety variants, etc.)
+_SYMBOL_ALIASES: dict[str, list[str]] = {
+    # Windows Process APIs
+    "createprocess": [
+        "CreateProcessA",
+        "CreateProcessW",
+        "CreateProcessAsUserA",
+        "CreateProcessAsUserW",
+    ],
+    "shellexecute": [
+        "ShellExecuteA",
+        "ShellExecuteW",
+        "ShellExecuteExA",
+        "ShellExecuteExW",
+    ],
+    "winexec": ["WinExec"],
+    # Windows File APIs
+    "createfile": ["CreateFileA", "CreateFileW", "CreateFile2"],
+    "deletefile": ["DeleteFileA", "DeleteFileW"],
+    "writefile": ["WriteFile", "WriteFileEx"],
+    "readfile": ["ReadFile", "ReadFileEx"],
+    "copyfile": ["CopyFileA", "CopyFileW", "CopyFileExA", "CopyFileExW"],
+    # Windows Registry APIs
+    "regsetvalue": ["RegSetValueA", "RegSetValueW", "RegSetValueExA", "RegSetValueExW"],
+    "regcreatekey": [
+        "RegCreateKeyA",
+        "RegCreateKeyW",
+        "RegCreateKeyExA",
+        "RegCreateKeyExW",
+    ],
+    "regopenkey": ["RegOpenKeyA", "RegOpenKeyW", "RegOpenKeyExA", "RegOpenKeyExW"],
+    "regdeletekey": [
+        "RegDeleteKeyA",
+        "RegDeleteKeyW",
+        "RegDeleteKeyExA",
+        "RegDeleteKeyExW",
+    ],
+    # Windows Message APIs
+    "messagebox": ["MessageBoxA", "MessageBoxW", "MessageBoxExA", "MessageBoxExW"],
+    # Windows Service APIs
+    "createservice": ["CreateServiceA", "CreateServiceW"],
+    "openservice": ["OpenServiceA", "OpenServiceW"],
+    "startservice": ["StartServiceA", "StartServiceW"],
+    # Windows Network APIs
+    "internetopen": ["InternetOpenA", "InternetOpenW"],
+    "internetconnect": ["InternetConnectA", "InternetConnectW"],
+    "httpopen": ["HttpOpenRequestA", "HttpOpenRequestW"],
+    # C Runtime String Functions
+    "strcpy": ["strcpy", "strcpy_s", "__strcpy_chk", "wcscpy", "lstrcpyA", "lstrcpyW"],
+    "strcat": ["strcat", "strcat_s", "__strcat_chk", "wcscat", "lstrcatA", "lstrcatW"],
+    "sprintf": [
+        "sprintf",
+        "sprintf_s",
+        "swprintf",
+        "wsprintfA",
+        "wsprintfW",
+        "_snprintf",
+    ],
+    "printf": ["printf", "wprintf", "_printf_l"],
+    "scanf": ["scanf", "scanf_s", "wscanf", "sscanf", "fscanf"],
+    # C Runtime Memory Functions
+    "malloc": ["malloc", "_malloc", "calloc", "realloc"],
+    "free": ["free", "_free"],
+    "memcpy": ["memcpy", "memcpy_s", "memmove", "memmove_s", "wmemcpy"],
+    # System/Exec Functions
+    "system": ["system", "_system", "msvcrt.system", "_wsystem"],
+    "popen": ["popen", "_popen", "_wpopen"],
+    "execve": ["execve", "execv", "execl", "execvp", "execlp"],
+    # Network Functions
+    "socket": ["socket", "WSASocket", "WSASocketA", "WSASocketW"],
+    "connect": ["connect", "WSAConnect"],
+    "send": ["send", "sendto", "WSASend", "WSASendTo"],
+    "recv": ["recv", "recvfrom", "WSARecv", "WSARecvFrom"],
+    # Crypto Functions
+    "cryptencrypt": ["CryptEncrypt", "CryptDecrypt"],
+    "cryptgenkey": ["CryptGenKey", "CryptDeriveKey"],
+    "cryptacquirecontext": ["CryptAcquireContextA", "CryptAcquireContextW"],
+}
+
+# Pre-compute reverse lookup for O(1) alias checking
+_ALIAS_REVERSE_LOOKUP: dict[str, str] = {}
+for _base, _aliases in _SYMBOL_ALIASES.items():
+    for _alias in _aliases:
+        _ALIAS_REVERSE_LOOKUP[_alias.lower()] = _base
+
+
+def _clean_symbol_name(name: str) -> str:
+    """Remove common prefixes and normalize symbol name."""
+    if not name:
+        return ""
+    # Remove common radare2/binary prefixes.
+    # OPTIMIZATION: compute .lower() once instead of inside each loop iteration.
+    # `name_lower` is safe to use throughout because `break` exits after the
+    # first (and only) match, so `clean` is never modified more than once.
+    clean = name
+    name_lower = name.lower()
+    for prefix in ["sym.imp.", "sym.", "imp.", "fcn.", "sub_", "loc_"]:
+        if name_lower.startswith(prefix):
+            clean = clean[len(prefix) :]
+            break
+    # Remove leading/trailing underscores
+    return clean.strip("_").lower()
+
+
+def _fuzzy_match_symbol(target: str, symbol: str) -> tuple[float, str]:
+    """
+    Calculate fuzzy match score between target and symbol.
+
+    Returns:
+        Tuple of (score, match_method) where score is 0.0-1.0
+    """
+    target_clean = _clean_symbol_name(target)
+    symbol_clean = _clean_symbol_name(symbol)
+
+    if not target_clean or not symbol_clean:
+        return (0.0, "none")
+
+    # Exact match (after cleaning)
+    if target_clean == symbol_clean:
+        return (1.0, "exact")
+
+    # Check alias database
+    if target_clean in _SYMBOL_ALIASES:
+        for alias in _SYMBOL_ALIASES[target_clean]:
+            if alias.lower() == symbol_clean or symbol_clean.endswith(alias.lower()):
+                return (0.95, "alias")
+
+    # Reverse alias check
+    if symbol_clean in _ALIAS_REVERSE_LOOKUP:
+        base = _ALIAS_REVERSE_LOOKUP[symbol_clean]
+        if base == target_clean:
+            return (0.95, "alias_reverse")
+
+    # Suffix match (e.g., "system" matches "msvcrt.system")
+    if symbol_clean.endswith(target_clean):
+        return (0.85, "suffix")
+
+    # Prefix match
+    if symbol_clean.startswith(target_clean):
+        return (0.75, "prefix")
+
+    # Contains match
+    if target_clean in symbol_clean:
+        return (0.65, "contains")
+
+    # Reverse contains (symbol in target)
+    if symbol_clean in target_clean:
+        return (0.55, "contains_reverse")
+
+    return (0.0, "none")
+
+
+def _find_best_symbol_match(target: str, symbols: list[dict]) -> tuple[dict | None, float, str]:
+    """
+    Find the best matching symbol from a list.
+
+    Args:
+        target: Target function name to find
+        symbols: List of symbol dicts with 'name' field
+
+    Returns:
+        Tuple of (best_match_dict, score, match_method)
+    """
+    best_match = None
+    best_score = 0.0
+    best_method = "none"
+
+    for sym_item in symbols:
+        sym: Any = sym_item
+        if not isinstance(sym, dict):
+            continue
+
+        # Check both 'name' and 'realname' fields
+        for name_field in ["name", "realname"]:
+            name = sym.get(name_field, "")
+            if not name:
+                continue
+
+            score, method = _fuzzy_match_symbol(target, name)
+            if score > best_score:
+                best_score = score
+                best_match = sym
+                best_method = method
+
+    return (best_match, best_score, best_method)
+
+
+# OPTIMIZATION: Pre-define translation table for faster function name cleaning
+# Use empty second argument to delete characters
+_FUNC_NAME_CLEAN_TABLE = str.maketrans("", "", "_")
+
+
+@log_execution(tool_name="trace_execution_path")
+@track_metrics("trace_execution_path")
+@handle_tool_errors
+async def trace_execution_path(
+    file_path: str,
+    target_function: str,
+    max_depth: int = 5,
+    max_paths: int = 5,
+    timeout: int | None = None,
+    prioritize_sinks: bool = True,
+) -> ToolResult:
+    """
+    Trace function calls backwards from a target function (Sink) to find potential execution paths.
+
+    This tool helps identify "Exploit Paths" by finding which functions call a dangerous
+    target function (like 'system', 'strcpy', 'execve'). It performs a recursive
+    cross-reference analysis (backtrace) to map out how execution reaches the target.
+
+    **Use Cases:**
+    - **Vulnerability Analysis**: Check if user input (main/recv) reaches 'system'
+    - **Reachability Analysis**: Verify if a vulnerable function is actually called
+    - **Taint Analysis Helper**: Provide the path for AI to perform manual taint checking
+
+    **Performance Optimizations (v3.0):**
+    - Reduced default depth (3→2) for faster analysis
+    - Sink-aware pruning: prioritizes paths through dangerous APIs
+    - Dynamic timeout based on file size
+
+    Args:
+        file_path: Path to the binary file
+        target_function: Name or address of the target function (e.g., 'sym.imp.system', '0x401000')
+        max_depth: Maximum depth of backtrace (default: 2, reduce for speed)
+        max_paths: Maximum number of paths to return (default: 5)
+        timeout: Execution timeout in seconds (uses dynamic timeout if None)
+        prioritize_sinks: Prioritize paths through dangerous sink APIs (default: True)
+
+    Returns:
+        ToolResult with a list of execution paths (call chains).
+    """
+    validated_path = validate_file_path(file_path)
+
+    # Calculate dynamic timeout based on file size
+    effective_timeout = (
+        timeout if timeout else calculate_dynamic_timeout(str(validated_path), base_timeout=30)
+    )
+
+    # Helper to check if a function name is a dangerous sink
+    def is_dangerous_sink(func_name: str) -> bool:
+        """Check if function name matches any dangerous sink API."""
+        if not func_name:
+            return False
+        # OPTIMIZATION: Use str.translate() for faster prefix removal
+        # Remove common prefixes first
+        clean_name = func_name.replace("sym.imp.", "").replace("sym.", "")
+        # Then remove underscores using translate (faster than replace)
+        clean_name = clean_name.translate(_FUNC_NAME_CLEAN_TABLE)
+        # OPTIMIZATION: compute .lower() once and compare against pre-lowercased set
+        clean_name_lower = clean_name.lower()
+        return any(sink in clean_name_lower for sink in _DANGEROUS_SINKS_LOWER)
+
+    # Enhanced symbol resolution with fuzzy matching
+    match_info = {"score": 0.0, "method": "none", "resolved_name": None}
+
+    async def resolve_symbol_address(func_name: str) -> int | None:
+        """Enhanced symbol resolution with fuzzy matching and multi-source lookup."""
+        nonlocal match_info
+
+        # If already an address, return as-is
+        if func_name.startswith("0x"):
+            try:
+                match_info = {
+                    "score": 1.0,
+                    "method": "direct_address",
+                    "resolved_name": func_name,
+                }
+                return int(func_name, 16)
+            except ValueError:
+                return None
+
+        # Multi-source lookup: symbols, functions, imports
+        cmd = _build_r2_cmd(str(validated_path), ["isj", "aflj", "iij"], "aaa")
+        out, _ = await execute_subprocess_async(cmd, timeout=effective_timeout)
+
+        lines = [line.strip() for line in out.strip().split("\n") if line.strip()]
+        if not lines:
+            return None
+
+        all_symbols = []
+
+        # Parse all sources
+        for line in lines:
+            try:
+                parsed = _parse_json_output(line)
+                if isinstance(parsed, list):
+                    all_symbols.extend(parsed)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        if not all_symbols:
+            return None
+
+        # Use fuzzy matching to find best match
+        best_match, score, method = _find_best_symbol_match(func_name, all_symbols)
+
+        if best_match and score >= 0.5:  # Minimum confidence threshold
+            match_info = {
+                "score": score,
+                "method": method,
+                "resolved_name": best_match.get("name") or best_match.get("realname"),
+            }
+            # Get address from match (different fields for symbols vs functions)
+            addr = best_match.get("vaddr") or best_match.get("offset") or best_match.get("plt")
+            return addr
+
+        return None
+
+    # Resolve target address
+    target_addr = target_function
+    resolved_addr = await resolve_symbol_address(target_function)
+    if resolved_addr:
+        target_addr = hex(resolved_addr)
+    # If we can't resolve it, use the original name (might work as r2 symbol)
+
+    paths: list[list[dict[str, Any]]] = []
+    visited: set[str] = set()
+
+    async def recursive_backtrace(current_addr, current_path, depth):
+        if depth >= max_depth or len(paths) >= max_paths:
+            return
+
+        # OPTIMIZATION: Pre-compute addresses in current path to avoid repeated list comprehensions
+        current_path_addrs = {p["addr"] for p in current_path}
+
+        if current_addr in visited and current_addr not in current_path_addrs:
+            # Allow revisiting if it's a different path, but prevent cycles in current path
+            pass
+        elif current_addr in current_path_addrs:
+            return  # Cycle detected
+
+        # Get xrefs TO this address
+        cmd = _build_r2_cmd(str(validated_path), [f"axtj @ {current_addr}"], "aaa")
+        out, _ = await execute_subprocess_async(cmd, timeout=effective_timeout)
+
+        try:
+            xrefs = _parse_json_output(out)
+        except (json.JSONDecodeError, TypeError):
+            xrefs = []
+
+        if not xrefs:
+            # End of chain (root caller found or no xrefs)
+            if len(current_path) > 1:
+                paths.append(current_path)
+            return
+
+        # OPTIMIZATION v3.0: Prioritize xrefs through dangerous sink APIs
+        # This implements "Sink-aware pruning" - explore high-value paths first
+        if prioritize_sinks and len(xrefs) > 1:
+            xrefs = sorted(
+                xrefs,
+                key=lambda x: (
+                    # Priority 1: main/entry functions (complete paths)
+                    -2
+                    if any(k in x.get("fcn_name", "").lower() for k in ["main", "entry"])
+                    # Priority 2: Dangerous sink APIs
+                    else (
+                        -1
+                        if is_dangerous_sink(x.get("fcn_name", ""))
+                        # Priority 3: Everything else
+                        else 0
+                    )
+                ),
+            )
+
+        for xref in xrefs:
+            if len(paths) >= max_paths:
+                break
+
+            caller_addr = hex(xref.get("fcn_addr", 0))
+            caller_name = xref.get("fcn_name", "unknown")
+            type_ref = xref.get("type", "call")
+
+            if type_ref not in ["call", "jump"]:
+                continue
+
+            new_node = {"addr": caller_addr, "name": caller_name, "type": type_ref}
+
+            # If we reached main or entry, this is a complete path
+            if "main" in caller_name or "entry" in caller_name:
+                paths.append(current_path + [new_node])
+            else:
+                await recursive_backtrace(caller_addr, current_path + [new_node], depth + 1)
+
+    # Start trace
+    root_node = {"addr": target_addr, "name": target_function, "type": "target"}
+    await recursive_backtrace(target_addr, [root_node], 0)
+
+    # Format results
+    # OPTIMIZATION: Use list comprehension with generator expression in join
+    # This reduces memory by avoiding intermediate list creation in the join
+    formatted_paths = [" -> ".join(f"{n['name']} ({n['addr']})" for n in p[::-1]) for p in paths]
+
+    return success(
+        {"paths": formatted_paths, "raw_paths": paths},
+        path_count=len(paths),
+        target=target_function,
+        resolved_address=target_addr,
+        match_confidence=match_info["score"],
+        match_method=match_info["method"],
+        resolved_name=match_info["resolved_name"],
+        description=f"Found {len(paths)} execution paths to {target_function} (match: {match_info['method']}, confidence: {match_info['score']:.0%})",
+    )
+
+
+def _radare2_json_to_mermaid(json_str: str) -> str:
+    """
+    Convert Radare2 'agfj' JSON output to Mermaid Flowchart syntax.
+    Optimized for LLM context efficiency.
+
+    Args:
+        json_str: JSON output from radare2 agfj command
+
+    Returns:
+        Mermaid flowchart syntax string
+    """
+    # Maximum nodes before switching to summary mode (browser Mermaid limit)
+    MAX_MERMAID_NODES = 100
+
+    try:
+        graph_data = json.loads(json_str)
+        if not graph_data:
+            return "graph TD;\n    Error[No graph data found]"
+
+        # agfj returns list format for function graph
+        blocks = (
+            graph_data[0].get("blocks", [])
+            if isinstance(graph_data, list)
+            else graph_data.get("blocks", [])
+        )
+
+        # Check node count limit to prevent browser rendering crashes
+        if len(blocks) > MAX_MERMAID_NODES:
+            return (
+                f"graph TD;\n"
+                f'    Warning["Graph too complex: {len(blocks)} nodes"]'
+                f'\n    Warning --> Hint["Use PNG export or reduce scope"]'
+            )
+
+        mermaid_lines = ["graph TD"]
+
+        for block in blocks:
+            # 1. Generate node ID from offset
+            node_id = f"N_{hex(block.get('offset', 0))}"
+
+            # 2. Generate node label from assembly opcodes
+            ops = block.get("ops", [])
+            # OPTIMIZATION: Use enumerate with early break to avoid processing all ops
+            # For token efficiency, we limit to 5 instructions per block
+            op_codes = []
+            has_more = False
+            for i, op in enumerate(ops):
+                if i < 5:
+                    op_codes.append(op.get("opcode", ""))
+                elif i == 5:
+                    has_more = True
+                    break
+
+            if has_more:
+                op_codes.append("...")
+
+            # Escape Mermaid special characters using optimized function
+            label_content = _escape_mermaid_chars("\\n".join(op_codes))
+
+            # Define node
+            mermaid_lines.append(f'    {node_id}["{label_content}"]')
+
+            # 3. Create edges
+            # True branch (jump)
+            if "jump" in block:
+                target_id = f"N_{hex(block['jump'])}"
+                mermaid_lines.append(f"    {node_id} -->|True| {target_id}")
+
+            # False branch (fail)
+            if "fail" in block:
+                target_id = f"N_{hex(block['fail'])}"
+                mermaid_lines.append(f"    {node_id} -.->|False| {target_id}")
+
+        return "\n".join(mermaid_lines)
+
+    except Exception as e:
+        return f"graph TD;\n    Error[Parse Error: {str(e)}]"
+
+
+@alru_cache(maxsize=32)
+@log_execution(tool_name="generate_function_graph")
+@track_metrics("generate_function_graph")
+@handle_tool_errors
+async def _generate_function_graph_impl(
+    file_path: str,
+    function_address: str,
+    format: str = "mermaid",
+    timeout: int = DEFAULT_TIMEOUT,
+) -> ToolResult:
+    """
+    Internal implementation of generate_function_graph with caching.
+    """
+    # 1. Parameter validation
+    validate_tool_parameters(
+        "generate_function_graph",
+        {"function_address": function_address, "format": format},
+    )
+    validated_path = validate_file_path(file_path)
+
+    # 2. Security check for function address (prevent shell injection)
+    from reversecore_mcp.core.exceptions import ValidationError
+    from reversecore_mcp.core.validators import validate_address_format
+
+    try:
+        validate_address_format(function_address, "function_address")
+    except ValidationError as e:
+        return failure("VALIDATION_ERROR", str(e))
+
+    # 3. Build radare2 command
+    r2_cmd_str = f"agfj @ {function_address}"
+
+    # 4. Execute subprocess asynchronously using helper
+    # Large graphs need higher output limit
+    output, bytes_read = await _execute_r2_command(
+        validated_path,
+        [r2_cmd_str],
+        analysis_level="aaa",
+        max_output_size=50_000_000,
+        base_timeout=timeout,
+    )
+
+    # Add timestamp for cache visibility
+    import time
+
+    timestamp = time.time()
+
+    # 5. Format conversion and return
+    if format.lower() == "json":
+        return success(output, bytes_read=bytes_read, format="json", timestamp=timestamp)
+
+    elif format.lower() == "mermaid":
+        mermaid_code = _radare2_json_to_mermaid(output)
+        return success(
+            mermaid_code,
+            bytes_read=bytes_read,
+            format="mermaid",
+            description="Render this using Mermaid to see the control flow.",
+            timestamp=timestamp,
+        )
+
+    elif format.lower() == "dot":
+        # For DOT format, call radare2 with agfd command
+        # NOTE: This is a separate call from agfj above, but this is optimal because:
+        # - DOT format requires a different command (agfd vs agfj)
+        # - Batching both would waste resources since we only need one format
+        # - DOT format is rarely used (mermaid and json are preferred)
+        dot_cmd_str = f"agfd @ {function_address}"
+
+        dot_output, dot_bytes = await _execute_r2_command(
+            validated_path,
+            [dot_cmd_str],
+            analysis_level="aaa",
+            max_output_size=50_000_000,
+            base_timeout=timeout,
+        )
+        return success(dot_output, bytes_read=dot_bytes, format="dot")
+
+    return failure("INVALID_FORMAT", f"Unsupported format: {format}")
+
+
+async def generate_function_graph(
+    file_path: str,
+    function_address: str,
+    format: str = "mermaid",
+    timeout: int = DEFAULT_TIMEOUT,
+) -> ToolResult | Image:
+    """
+    Generate a Control Flow Graph (CFG) for a specific function.
+
+    This tool uses radare2 to analyze the function structure and returns
+    a visualization code (Mermaid by default) or PNG image that helps AI understand
+    the code flow without reading thousands of lines of assembly.
+
+    Args:
+        file_path: Path to the binary file (must be in workspace)
+        function_address: Function address (e.g., 'main', '0x140001000', 'sym.foo')
+        format: Output format ('mermaid', 'json', 'dot', or 'png'). Default is 'mermaid'.
+        timeout: Execution timeout in seconds
+
+    Returns:
+        ToolResult with CFG visualization, JSON data, or PNG image
+    """
+    import time
+
+    # If PNG format requested, generate DOT first then convert
+    if format.lower() == "png":
+        # Get DOT format first
+        dot_result: ToolResult = await _generate_function_graph_impl(
+            file_path, function_address, "dot", timeout
+        )
+
+        if dot_result.status == "error":
+            return dot_result
+
+        # Convert DOT to PNG using graphviz
+        try:
+            import tempfile
+            from pathlib import Path as PathlibPath
+
+            # Get DOT content from result
+            dot_content = dot_result.data if isinstance(dot_result.data, str) else ""
+
+            # Create temp files
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".dot", delete=False) as dot_file:
+                dot_file.write(dot_content)
+                dot_path = PathlibPath(dot_file.name)
+
+            png_path = dot_path.with_suffix(".png")
+
+            try:
+                # Use async subprocess execution to avoid blocking the event loop
+                # This allows concurrent operations and better resource utilization
+                await execute_subprocess_async(
+                    ["dot", "-Tpng", str(dot_path), "-o", str(png_path)],
+                    max_output_size=1_000_000,  # 1MB for error messages
+                    timeout=30,
+                )
+
+                # Read PNG file
+                png_data = png_path.read_bytes()
+
+                # Return Image object
+                return Image(data=png_data, format="png")
+
+            finally:
+                # Cleanup temp files
+                try:
+                    dot_path.unlink()
+                    if png_path.exists():
+                        png_path.unlink()
+                except (OSError, FileNotFoundError):
+                    pass
+
+        except Exception as e:
+            return failure(
+                "IMAGE_GENERATION_ERROR",
+                f"Failed to generate PNG image: {str(e)}",
+                hint="Ensure graphviz is installed in the container",
+            )
+
+    # For other formats, use existing implementation
+    other_result: ToolResult = await _generate_function_graph_impl(
+        file_path, function_address, format, timeout
+    )
+
+    # Check for cache hit
+    if other_result.status == "success" and other_result.metadata:
+        ts = other_result.metadata.get("timestamp")
+        if ts and (time.time() - ts > 1.0):
+            other_result.metadata["cache_hit"] = True
+            # Update description to indicate cached result
+            # Note: ToolSuccess has 'data' field, not 'content'
+
+    return other_result
+
+
+@log_execution(tool_name="analyze_xrefs")
+@track_metrics("analyze_xrefs")
+@handle_tool_errors
+async def analyze_xrefs(
+    file_path: str,
+    address: str,
+    xref_type: str = "all",
+    limit: int = 50,
+    timeout: int = DEFAULT_TIMEOUT,
+    ctx: Context | None = None,
+) -> ToolResult:
+    """
+    Analyze cross-references (xrefs) for a specific address using radare2.
+
+    Cross-references show the relationships between code blocks - who calls this
+    function (callers) and what it calls (callees). This is essential for:
+    - Understanding program flow
+    - Tracing data dependencies
+    - Identifying attack surfaces
+    - Reverse engineering malware C&C
+
+    **xref_type Options:**
+    - **"to"**: Show who references this address (callers/jumps TO here)
+    - **"from"**: Show what this address references (calls/jumps FROM here)
+    - **"all"**: Show both directions (complete relationship map)
+
+    Args:
+        file_path: Path to the binary file (must be in workspace)
+        address: Function or address to analyze (e.g., 'main', '0x401000', 'sym.decrypt')
+        xref_type: Type of cross-references to show: 'all', 'to', 'from' (default: 'all')
+        limit: Maximum number of xref entries to return per direction (default: 50)
+        timeout: Execution timeout in seconds (default: 300)
+        ctx: FastMCP Context for progress reporting (auto-injected)
+
+    Returns:
+        ToolResult with structured JSON containing xrefs data:
+        {
+            "address": "main",
+            "xref_type": "all",
+            "xrefs_to": [{"from": "0x401050", "type": "call", "fcn_name": "entry0"}],
+            "xrefs_from": [{"addr": "0x401100", "type": "call", "fcn_name": "printf"}],
+            "summary": "2 reference(s) TO this address (callers), 1 reference(s) FROM this address (callees)",
+            "total_refs_to": 2,
+            "total_refs_from": 1
+        }
+
+    Example:
+        # Find who calls the suspicious 'decrypt' function
+        analyze_xrefs("/app/workspace/malware.exe", "sym.decrypt", "to")
+
+        # Find what APIs a malware function uses
+        analyze_xrefs("/app/workspace/malware.exe", "0x401000", "from")
+
+        # Get complete relationship map
+        analyze_xrefs("/app/workspace/malware.exe", "main", "all")
+    """
+    # 1. Validate parameters
+    validated_path = validate_file_path(file_path)
+
+    if xref_type not in ["all", "to", "from"]:
+        return failure(
+            "VALIDATION_ERROR",
+            f"Invalid xref_type: {xref_type}",
+            hint="Valid options are: 'all', 'to', 'from'",
+        )
+
+    # 2. Validate address format
+    # OPTIMIZATION: Use pre-compiled pattern from validators module
+    if not _ADDRESS_PATTERN.match(
+        _strip_address_prefixes(address),
+    ):
+        return failure(
+            "VALIDATION_ERROR",
+            "Invalid address format",
+            hint="Address must contain only alphanumeric characters, dots, underscores, and prefixes like '0x', 'sym.', 'fcn.'",
+        )
+
+    # 3. Build radare2 commands to get xrefs
+    # axj = analyze xrefs in JSON format
+    commands = []
+
+    if xref_type in ["all", "to"]:
+        # axtj = xrefs TO this address (callers)
+        commands.append(f"axtj @ {address}")
+
+    if xref_type in ["all", "from"]:
+        # axfj = xrefs FROM this address (callees)
+        commands.append(f"axfj @ {address}")
+
+    # Build command string
+    r2_commands_str = "; ".join(commands)
+
+    if ctx:
+        await ctx.report_progress(10, 100)
+        await ctx.info(f"Analyzing xrefs for {address}...")
+
+    # 4. Execute analysis using helper
+    # Use 'aa' (basic analysis) as default to prevent timeouts on large/obfuscated binaries
+    # 'aaa' is much slower but more accurate - only use for small files
+
+    analysis_level = "aa"
+    try:
+        file_size_mb = os.path.getsize(validated_path) / (1024 * 1024)
+        if file_size_mb < 5:
+            analysis_level = "aaa"  # Full analysis for small files (<5MB)
+        if ctx and file_size_mb > 5:
+            await ctx.info(f"Large file ({file_size_mb:.1f}MB) detected, using basic analysis...")
+    except OSError:
+        pass
+
+    output, bytes_read = await _execute_r2_command(
+        validated_path,
+        [r2_commands_str],
+        analysis_level=analysis_level,
+        max_output_size=10_000_000,
+        base_timeout=timeout,
+    )
+
+    if ctx:
+        await ctx.report_progress(90, 100)
+
+    # 5. Parse JSON output
+    try:
+        # Output may contain multiple JSON arrays if both "to" and "from" were requested
+        # Split by lines and parse each JSON array
+        lines = [line.strip() for line in output.strip().split("\n") if line.strip()]
+
+        xrefs_to = []
+        xrefs_from = []
+
+        for line in lines:
+            # Robust JSON extraction from line
+            try:
+                refs = _parse_json_output(line)
+                if (
+                    isinstance(refs, list) and refs
+                ):  # OPTIMIZATION: Direct bool check instead of len() comparison
+                    # Determine if this is "to" or "from" based on field names
+                    first_ref = refs[0]
+                    if "from" in first_ref:
+                        # This is xrefs TO (callers)
+                        xrefs_to = refs
+                    elif "addr" in first_ref or "fcn_addr" in first_ref:
+                        # This is xrefs FROM (callees)
+                        xrefs_from = refs
+            except json.JSONDecodeError:
+                # Skip lines that don't contain valid JSON
+                continue
+
+        # Group callers by function
+        callers_by_function: dict[str, list[str]] = {}
+        for item in xrefs_to:
+            func_name = (
+                item.get("fcn_name")
+                or item.get("name")
+                or (
+                    hex(item["fcn_addr"])
+                    if isinstance(item.get("fcn_addr"), int)
+                    else item.get("fcn_addr")
+                )
+                or "unknown"
+            )
+            addr_from = (
+                hex(item["from"])
+                if isinstance(item.get("from"), int)
+                else (item.get("from") or item.get("addr") or "")
+            )
+            callers_by_function.setdefault(str(func_name), []).append(str(addr_from))
+
+        total_refs_to = len(xrefs_to)
+        total_refs_from = len(xrefs_from)
+        bounded_xrefs_to = xrefs_to[:limit] if (limit and limit > 0) else xrefs_to
+        bounded_xrefs_from = xrefs_from[:limit] if (limit and limit > 0) else xrefs_from
+        truncated = (total_refs_to > len(bounded_xrefs_to)) or (
+            total_refs_from > len(bounded_xrefs_from)
+        )
+
+        pagination = PaginationMeta(
+            has_more=truncated,
+            total_items=total_refs_to + total_refs_from,
+            page_size=limit if limit > 0 else (total_refs_to + total_refs_from),
+            truncated=truncated,
+        )
+
+        # 6. Format results
+        result = {
+            "address": address,
+            "xref_type": xref_type,
+            "xrefs_to": bounded_xrefs_to,
+            "xrefs_from": bounded_xrefs_from,
+            "callers_by_function": callers_by_function,
+            "total_refs_to": total_refs_to,
+            "total_refs_from": total_refs_from,
+            "limit": limit,
+            "truncated": truncated,
+        }
+
+        # Add human-readable summary
+        summary_parts = []
+        if xrefs_to:
+            summary_parts.append(f"{len(xrefs_to)} reference(s) TO this address (callers)")
+        if xrefs_from:
+            summary_parts.append(f"{len(xrefs_from)} reference(s) FROM this address (callees)")
+
+        if not summary_parts:
+            summary = "No cross-references found"
+        else:
+            summary = ", ".join(summary_parts)
+
+        result["summary"] = summary
+
+        # 7. Return structured result
+        return success(
+            result,
+            pagination=pagination,
+            bytes_read=bytes_read,
+            address=address,
+            xref_type=xref_type,
+            total_refs=len(xrefs_to) + len(xrefs_from),
+            description=f"Cross-reference analysis for {address}: {summary}",
+        )
+
+    except Exception as e:
+        return failure(
+            "XREF_ANALYSIS_ERROR",
+            f"Failed to parse cross-reference data: {str(e)}",
+            hint="The address may not exist or the binary may not have been analyzed. Try running 'afl' first to see available functions.",
+        )

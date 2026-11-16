@@ -1,0 +1,16 @@
+{
+  "name": "virustotal",
+  "displayName": "VirusTotal",
+  "version": "0.1.1",
+  "description": "Investigate files, URLs, domains and IP addresses with VirusTotal threat intelligence, analysis and submission recovery.",
+  "author": {
+    "name": "VirusTotal",
+    "url": "https://www.virustotal.com"
+  },
+  "logo": "assets/virustotal-icon-512.png",
+  "suggestedPrompts": [
+    "Check a file I downloaded before I run it. Ask me for its local path, compute SHA-256 without executing it, and look up its existing VirusTotal report. Do not upload it.",
+    "Help me assess a suspicious link. Explain what a URL lookup shares before asking for it, then retrieve its existing VirusTotal report. Do not open the link or submit it for analysis.",
+    "Investigate an IP address from my logs. Ask for the IP and a brief description of the activity, retrieve its existing VirusTotal report, and explain the evidence and its limits. Do not request a new analysis."
+  ]
+}

@@ -1,0 +1,389 @@
+"""ARQ-based task queue integration for Reversecore MCP.
+
+Provides async job submission, background worker execution, result polling,
+and resilient fallback to in-process execution when Redis is unavailable.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from collections.abc import Callable, Coroutine
+from typing import Any, cast
+
+from arq import create_pool
+from arq.connections import RedisSettings
+from arq.jobs import Job, JobStatus
+
+from reversecore_mcp.core.config import get_config
+from reversecore_mcp.core.logging_config import get_logger
+from reversecore_mcp.core.result import ToolResult, failure, success
+
+logger = get_logger(__name__)
+
+# Global ARQ Redis connection pool state
+_arq_pool: Any = None
+_queue_enabled: bool = True
+_queue_administratively_disabled: bool = False
+_failure_count: int = 0
+_next_retry_time: float = 0.0
+_base_retry_backoff: float = 1.0
+_max_retry_backoff: float = 60.0
+_pool_init_lock: asyncio.Lock | None = None
+
+
+def _get_pool_init_lock() -> asyncio.Lock:
+    """Get or create the async lock for initializing the ARQ connection pool."""
+    global _pool_init_lock
+    if _pool_init_lock is None:
+        _pool_init_lock = asyncio.Lock()
+    return _pool_init_lock
+
+
+async def get_arq_pool() -> Any:
+    """Get or initialize the global ARQ Redis pool client with bounded retry.
+
+    Distinguishes between administratively disabled queues (never retries)
+    and transient connection outages (retries using bounded exponential backoff).
+    """
+    global \
+        _arq_pool, \
+        _queue_enabled, \
+        _queue_administratively_disabled, \
+        _failure_count, \
+        _next_retry_time
+    if not _queue_enabled or _queue_administratively_disabled:
+        return None
+
+    if _arq_pool is not None:
+        return _arq_pool
+
+    now = time.monotonic()
+    if now < _next_retry_time:
+        # Still in backoff window from a previous transient connection failure
+        return None
+
+    async with _get_pool_init_lock():
+        # Check configuration for administrative disable
+        config = get_config()
+        env_redis = os.environ.get("REVERSECORE_REDIS_URL", "").strip().lower()
+        redis_url = (config.redis_url or "").strip().lower()
+        if (
+            env_redis in ("none", "disabled", "null", "false", "0")
+            or not redis_url
+            or redis_url in ("none", "disabled", "null")
+        ):
+            logger.info("Task queue disabled by configuration (empty or disabled redis_url).")
+            _queue_administratively_disabled = True
+            _queue_enabled = False
+            return None
+
+        try:
+            redis_settings = RedisSettings.from_dsn(config.redis_url)
+            _arq_pool = await create_pool(redis_settings)
+            _failure_count = 0
+            _next_retry_time = 0.0
+            logger.info("Initialized ARQ Redis task queue pool client.")
+            return _arq_pool
+        except Exception as e:
+            _failure_count += 1
+            backoff = min(_max_retry_backoff, _base_retry_backoff * (2 ** (_failure_count - 1)))
+            _next_retry_time = time.monotonic() + backoff
+            logger.warning(
+                f"Failed to initialize ARQ task queue pool: {e}. "
+                f"Transient connection failure #{_failure_count}, will retry in {backoff:.1f}s (falling back to direct execution)."
+            )
+            # Keep _queue_enabled = True so future retries after backoff can succeed
+            return None
+
+
+async def close_arq_pool() -> None:
+    """Close the global ARQ Redis connection pool."""
+    global \
+        _arq_pool, \
+        _pool_init_lock, \
+        _queue_enabled, \
+        _queue_administratively_disabled, \
+        _failure_count, \
+        _next_retry_time
+    if _arq_pool is not None:
+        try:
+            await _arq_pool.close()
+            logger.info("Closed ARQ Redis pool.")
+        except Exception as e:
+            logger.debug(f"Error closing ARQ pool: {e}")
+        finally:
+            _arq_pool = None
+            _pool_init_lock = None
+    _queue_enabled = True
+    _queue_administratively_disabled = False
+    _failure_count = 0
+    _next_retry_time = 0.0
+
+
+def reset_task_queue() -> None:
+    """Reset the task queue state and re-enable reconnection attempts."""
+    global \
+        _arq_pool, \
+        _pool_init_lock, \
+        _queue_enabled, \
+        _queue_administratively_disabled, \
+        _failure_count, \
+        _next_retry_time
+    _arq_pool = None
+    _pool_init_lock = None
+    _queue_enabled = True
+    _queue_administratively_disabled = False
+    _failure_count = 0
+    _next_retry_time = 0.0
+
+
+async def run_task_or_fallback(
+    task_name: str,
+    fallback_func: Callable[..., Coroutine[Any, Any, ToolResult]],
+    *args: Any,
+    run_async: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Submit a task to the queue or fall back to direct execution.
+
+    Args:
+        task_name: The registered ARQ function name (e.g. 'task_run_yara').
+        fallback_func: The actual local implementation to run if queue is bypassed/unavailable.
+        run_async: If True, return job ID immediately instead of waiting for result.
+        timeout_seconds: Optional timeout for waiting for the job result.
+        args, kwargs: Arguments passed to the function.
+
+    Returns:
+        ToolResult from the task execution or fallback.
+    """
+    import inspect
+
+    sig = inspect.signature(fallback_func)
+    has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    has_bypass = "_bypass_queue" in sig.parameters
+
+    def get_fallback_kwargs(bypass: bool = False) -> dict[str, Any]:
+        fk = kwargs.copy()
+        if bypass:
+            fk["_bypass_queue"] = True
+        if not (has_kwargs or has_bypass):
+            fk.pop("_bypass_queue", None)
+        return fk
+
+    _bypass_queue = kwargs.get("_bypass_queue", False)
+    if _bypass_queue:
+        logger.debug(f"Bypassing queue for task '{task_name}' (executing directly in-process).")
+        return await fallback_func(*args, **get_fallback_kwargs(bypass=True))
+
+    pool = await get_arq_pool()
+    if pool is None:
+        logger.info(f"Task queue unavailable. Executing '{task_name}' directly in-process.")
+        return await fallback_func(*args, **get_fallback_kwargs(bypass=True))
+
+    try:
+        # Enqueue the job on ARQ
+        # Map arguments to worker task
+        job = await pool.enqueue_job(task_name, *args, **kwargs)
+        logger.info(f"Enqueued job {job.job_id} for task '{task_name}'.")
+
+        if run_async:
+            return success(
+                {
+                    "status": "queued",
+                    "job_id": job.job_id,
+                    "message": f"Job enqueued. Query status using 'get_job_result' tool with job ID: {job.job_id}",
+                }
+            )
+
+        # Wait for the job to complete and return its result
+        # Ensure we pass the configured default timeout or custom timeout
+        effective_timeout = timeout_seconds or get_config().default_tool_timeout or 300.0
+        try:
+            result = await job.result(timeout=effective_timeout)
+            return cast(ToolResult, result)
+        except asyncio.TimeoutError:
+            logger.error(f"Job {job.job_id} ({task_name}) timed out after {effective_timeout}s.")
+            return failure(
+                "TIMEOUT",
+                f"Task execution timed out after {effective_timeout} seconds on queue.",
+                timeout_seconds=int(effective_timeout),
+            )
+
+    except Exception as e:
+        logger.warning(
+            f"Queue submission failed for '{task_name}': {e}. Falling back to direct execution."
+        )
+        return await fallback_func(*args, **get_fallback_kwargs(bypass=True))
+
+
+# =============================================================================
+# ARQ Worker Task Definitions (Proxy handlers to avoid circular imports)
+# =============================================================================
+
+
+async def task_smart_decompile(
+    ctx: Any, file_path: str, function_address: str, timeout: int, use_ghidra: bool
+) -> ToolResult:
+    """ARQ Worker proxy for smart_decompile (now maps to r2_decompile)."""
+    logger.info(f"Worker executing task_smart_decompile for {function_address} in {file_path}")
+    from reversecore_mcp.tools.radare2.r2ghidra_tools import r2_decompile
+
+    return cast(
+        ToolResult,
+        await r2_decompile(
+            file_path=file_path,
+            function_address=function_address,
+            timeout=timeout,
+        ),
+    )
+
+
+async def task_run_yara(ctx: Any, file_path: str, rule_file: str, timeout: int) -> ToolResult:
+    """ARQ Worker proxy for run_yara."""
+    logger.info(f"Worker executing task_run_yara for {file_path}")
+    from reversecore_mcp.tools.malware.yara_tools import run_yara
+
+    # We call run_yara with _bypass_queue=True to execute the actual logic in the worker
+    return await run_yara(
+        file_path=file_path,
+        rule_file=rule_file,
+        timeout=timeout,
+        _bypass_queue=True,
+    )
+
+
+async def task_run_strings(
+    ctx: Any, file_path: str, min_length: int, max_output_size: int, timeout: int
+) -> ToolResult:
+    """ARQ Worker proxy for run_strings."""
+    logger.info(f"Worker executing task_run_strings for {file_path}")
+    from reversecore_mcp.tools.analysis.static_analysis import run_strings
+
+    return await run_strings(
+        file_path=file_path,
+        min_length=min_length,
+        max_output_size=max_output_size,
+        timeout=timeout,
+        _bypass_queue=True,
+    )
+
+
+async def task_vulnerability_hunter(
+    ctx: Any,
+    file_path: str,
+    max_depth: int,
+    severity_filter: str,
+    generate_yara: bool,
+    timeout: int,
+    use_symbolic_execution: bool = True,
+    auto_dynamic_verify: bool = True,
+    target_functions: list[str] | None = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """ARQ Worker proxy for vulnerability_hunter."""
+    logger.info(f"Worker executing task_vulnerability_hunter for {file_path}")
+    from reversecore_mcp.tools.malware.vulnerability_hunter import vulnerability_hunter
+
+    return await vulnerability_hunter(
+        file_path=file_path,
+        max_depth=max_depth,
+        severity_filter=severity_filter,
+        generate_yara=generate_yara,
+        timeout=timeout,
+        use_symbolic_execution=use_symbolic_execution,
+        auto_dynamic_verify=auto_dynamic_verify,
+        target_functions=target_functions,
+        _bypass_queue=True,
+    )
+
+
+# =============================================================================
+# ARQ WorkerSettings class for standalone worker execution
+# =============================================================================
+
+
+async def startup(ctx: Any) -> None:
+    """Worker startup handler."""
+    logger.info("ARQ Worker starting up...")
+
+
+async def shutdown(ctx: Any) -> None:
+    """Worker shutdown handler."""
+    logger.info("ARQ Worker shutting down...")
+
+
+class WorkerSettings:
+    """Settings class for ARQ Worker.
+
+    Run using: `arq reversecore_mcp.core.task_queue.WorkerSettings`
+    """
+
+    functions = [
+        task_smart_decompile,
+        task_run_yara,
+        task_run_strings,
+        task_vulnerability_hunter,
+    ]
+    # Dynamically grab the redis url from configuration
+    redis_settings = RedisSettings.from_dsn(get_config().redis_url)
+    on_startup = startup
+    on_shutdown = shutdown
+
+
+async def get_job_result(job_id: str) -> ToolResult:
+    """Retrieve the status and result of a background job from the task queue.
+
+    Args:
+        job_id: The ID of the queued job to check.
+
+    Returns:
+        ToolResult containing status details or the job output if finished.
+    """
+    pool = await get_arq_pool()
+    if pool is None:
+        return failure("QUEUE_UNAVAILABLE", "ARQ task queue Redis pool is not connected.")
+
+    try:
+        job = Job(job_id, pool)
+        status = await job.status()
+
+        if status == JobStatus.not_found:
+            return failure("JOB_NOT_FOUND", f"Job with ID '{job_id}' was not found or has expired.")
+
+        if status == JobStatus.complete:
+            # Job is complete; retrieve result
+            result = await job.result()
+            from reversecore_mcp.core.result import ToolError, ToolSuccess
+
+            if isinstance(result, (ToolSuccess, ToolError)):
+                return result
+            if isinstance(result, dict) and "status" in result:
+                if result["status"] == "success" and "data" in result:
+                    return success(result["data"], **result.get("metadata") or {})
+                elif result["status"] == "error" and "error_code" in result and "message" in result:
+                    return failure(
+                        result["error_code"],
+                        result["message"],
+                        hint=result.get("hint"),
+                        **result.get("details") or {},
+                    )
+            if isinstance(result, dict):
+                return success(cast(dict[str, Any], result))
+            if isinstance(result, list):
+                return success({"results": result})
+            return cast(ToolResult, result)
+
+        # Job is still queued/in-progress/deferred
+        return success(
+            {
+                "job_id": job_id,
+                "status": status.value if hasattr(status, "value") else str(status),
+                "message": f"Job is currently in status: '{status}'",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error checking job status for {job_id}: {e}")
+        return failure("JOB_CHECK_ERROR", f"Failed to check job status: {e}")

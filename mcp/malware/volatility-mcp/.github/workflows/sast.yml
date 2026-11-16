@@ -1,0 +1,19 @@
+name: SAST
+
+on:
+  pull_request:
+    branches:
+      - "main"
+  push:
+     branches:
+       - "main"
+
+jobs:
+  scan:
+    name: Scan code changes
+    runs-on: ubuntu-latest
+    if: ${{ github.actor != 'dependabot[bot]' }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Bastion-Technologies/gh-action-run-sast@v1

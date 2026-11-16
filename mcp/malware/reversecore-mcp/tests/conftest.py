@@ -1,0 +1,240 @@
+"""Pytest configuration and shared fixtures with explicit dependency injection."""
+
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+# Set up test environment variables BEFORE importing reversecore_mcp modules
+# This is required because some modules initialize config at import time
+_test_workspace = tempfile.mkdtemp(prefix="reversecore_test_workspace_")
+_test_r2_workspace = tempfile.mkdtemp(prefix="reversecore_test_r2_")
+_test_ghidra = tempfile.mkdtemp(prefix="reversecore_test_ghidra_")
+_test_ghidra_project = tempfile.mkdtemp(prefix="reversecore_test_ghidra_project_")
+_test_read_dirs = tempfile.mkdtemp(prefix="reversecore_test_rules_")
+
+_fixtures_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "fixtures"))
+
+# Force override environment variables for testing
+# Note: The config module expects REVERSECORE_WORKSPACE, not WORKSPACE
+os.environ["REVERSECORE_WORKSPACE"] = _test_workspace
+os.environ["REVERSECORE_READ_DIRS"] = (
+    f"{_test_read_dirs},{_fixtures_dir},{os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))}"
+)
+os.environ["R2_WORKSPACE"] = _test_r2_workspace
+os.environ["GHIDRA_PATH"] = _test_ghidra
+os.environ["GHIDRA_PROJECT_PATH"] = _test_ghidra_project
+
+# These imports must come after env vars are set due to module-level config loading
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+# Generated binary fixtures are recreated from source for clean clones and CI.
+_repo_root = Path(__file__).resolve().parent.parent
+subprocess.run(
+    [sys.executable, str(_repo_root / "scripts" / "generate-ci-fixtures.py")],
+    cwd=_repo_root,
+    check=True,
+)
+
+import pytest  # noqa: E402
+
+from reversecore_mcp.core import security  # noqa: E402
+from reversecore_mcp.core.config import Config  # noqa: E402
+from reversecore_mcp.core.security import WorkspaceConfig  # noqa: E402
+
+# =============================================================================
+# System tool availability checks for conditional test skipping
+# =============================================================================
+
+
+def _has_command(cmd: str) -> bool:
+    """Check if a command is available in PATH."""
+    return shutil.which(cmd) is not None
+
+
+HAS_STRINGS = _has_command("strings")
+HAS_FILE = _has_command("file")
+HAS_BINWALK = _has_command("binwalk")
+HAS_RADARE2 = _has_command("r2") or _has_command("radare2")
+
+# Skip markers for tests requiring specific system tools
+requires_strings = pytest.mark.skipif(not HAS_STRINGS, reason="strings command not available")
+requires_file = pytest.mark.skipif(not HAS_FILE, reason="file command not available")
+requires_binwalk = pytest.mark.skipif(not HAS_BINWALK, reason="binwalk command not available")
+requires_radare2 = pytest.mark.skipif(not HAS_RADARE2, reason="radare2 not available")
+
+
+@pytest.fixture
+def workspace_dirs(tmp_path):
+    """Provision a writable workspace and read-only directory for tests."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir()
+    return workspace, rules_dir
+
+
+@pytest.fixture
+def workspace_dir(workspace_dirs):
+    """Return the workspace directory path."""
+    workspace, _ = workspace_dirs
+    return workspace
+
+
+@pytest.fixture
+def read_only_dir(workspace_dirs):
+    """Return the dedicated read-only directory path."""
+    _, read_dir = workspace_dirs
+    return read_dir
+
+
+@pytest.fixture
+def workspace_config(workspace_dirs) -> WorkspaceConfig:
+    """Provide a WorkspaceConfig instance for file validation tests."""
+    workspace, read_dir = workspace_dirs
+    return WorkspaceConfig(workspace=workspace, read_only_dirs=(read_dir,))
+
+
+@pytest.fixture
+def config(workspace_dirs, tmp_path) -> Config:
+    """Provide a Config instance for components that require it."""
+    workspace, read_dir = workspace_dirs
+    return Config(
+        workspace=workspace,
+        read_only_dirs=(read_dir,),
+        log_level="INFO",
+        log_file=tmp_path / "reversecore.log",
+        log_format="human",
+        structured_errors=False,
+        rate_limit=60,
+        lief_max_file_size=1_000_000_000,
+        mcp_transport="stdio",
+        default_tool_timeout=60,
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def ensure_test_binaries():
+    """Ensure test binaries are downloaded or generated before any tests run."""
+    fetch_script = os.path.join(
+        os.path.dirname(__file__), "..", "scripts", "fetch_test_binaries.py"
+    )
+    if os.path.exists(fetch_script):
+        print("\nEnsuring test binaries are present...")
+        subprocess.run(["python3", fetch_script], check=False)
+
+
+@pytest.fixture
+def sample_binary_path(workspace_dir):
+    """Create a simple test binary file inside the workspace."""
+    binary_path = workspace_dir / "test_binary.bin"
+    binary_path.write_bytes(b"\x00\x01\x02\x03Hello World\x00")
+    return binary_path
+
+
+@pytest.fixture
+def patched_workspace_config(workspace_config, monkeypatch):
+    """Patch the workspace config for modules that use get_workspace_config()."""
+    # Patch the lazy-initialized config variable
+    monkeypatch.setattr(security, "_WORKSPACE_CONFIG", workspace_config)
+    # Also patch the getter function to return our config
+    monkeypatch.setattr(security, "get_workspace_config", lambda: workspace_config)
+    return workspace_config
+
+
+@pytest.fixture
+def patched_config(config, monkeypatch):
+    """Ensure get_config() calls inside modules return the test Config."""
+    monkeypatch.setattr("reversecore_mcp.core.config._CONFIG", config)
+    monkeypatch.setattr("reversecore_mcp.core.config.get_config", lambda: config)
+
+    # Note: lib_tools no longer imports get_config at module level
+    # Individual tool modules import it directly from core.config
+    return config
+
+
+@pytest.fixture
+def config_isolation():
+    """
+    Fixture to isolate configuration state between tests.
+
+    1. Saves original environment variables.
+    2. Resets Config singleton.
+    3. Yields control.
+    4. Restores environment and resets singleton.
+    """
+    original_env = os.environ.copy()
+    from reversecore_mcp.core import config as config_module
+
+    # Reset before test
+    # This ensures a fresh Config is created if read
+    original_config = config_module._CONFIG
+    config_module._CONFIG = None
+
+    yield
+
+    # Restore after test
+    os.environ.clear()
+    os.environ.update(original_env)
+    config_module._CONFIG = original_config
+
+
+@pytest.fixture(autouse=True)
+def mock_shutil_which(request):
+    """Mock shutil.which to return dummy paths for forensics tools during tests."""
+    orig_which = shutil.which
+
+    def patched_which(cmd, mode=os.F_OK, path=None):
+        if cmd == "vol" and request.node.get_closest_marker("integration"):
+            return orig_which(cmd, mode, path)
+        if cmd in (
+            "fls",
+            "vol",
+            "strings",
+            "icat",
+            "mmls",
+            "pstree",
+            "pslist",
+            "psscan",
+            "netscan",
+            "malfind",
+        ):
+            return f"/usr/bin/{cmd}"
+        return orig_which(cmd, mode, path)
+
+    shutil.which = patched_which
+    yield
+    shutil.which = orig_which
+
+
+@pytest.fixture(autouse=True)
+def clean_service_container():
+    """Reset the global service container and circuit breakers before and after each test to ensure state isolation."""
+    from reversecore_mcp.core.container import _initialize_default_services, container
+    from reversecore_mcp.core.resilience import reset_circuit_breakers
+
+    container.reset_all()
+    _initialize_default_services()
+    reset_circuit_breakers()
+    yield
+    container.reset_all()
+    _initialize_default_services()
+    reset_circuit_breakers()
+
+
+def pytest_configure(config):
+    """Disable coverage fail-under for partial test runs to prevent false failures."""
+    is_partial_run = (
+        bool(config.option.markexpr)
+        or bool(config.option.keyword)
+        or any(
+            arg not in ("tests", "tests/", ".") for arg in config.args if not arg.startswith("-")
+        )
+    )
+    if is_partial_run:
+        if hasattr(config.option, "cov_fail_under"):
+            config.option.cov_fail_under = 0
+        cov_plugin = config.pluginmanager.get_plugin("_cov")
+        if cov_plugin and hasattr(cov_plugin, "options"):
+            cov_plugin.options.cov_fail_under = 0

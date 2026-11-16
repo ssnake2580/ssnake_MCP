@@ -1,0 +1,8 @@
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+suppress_unstable_features_warning = true
+
+[features]
+multi_agent = true
+child_agents_md = true

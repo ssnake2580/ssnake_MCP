@@ -1,0 +1,6 @@
+{
+  "virustotal": {
+    "type": "http",
+    "url": "https://ai.virustotal.com/mcp"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "virustotal": {
+      "type": "local",
+      "command": "vt-mcp",
+      "args": [],
+      "env": {
+        "VTAI_TOKEN_FILE": "~/.config/vt-mcp/token"
+      },
+      "tools": ["*"],
+      "timeout": 180000
+    }
+  }
+}

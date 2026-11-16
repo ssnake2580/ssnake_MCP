@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "virustotal": {
+      "url": "https://ai.virustotal.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:VTAI_MCP_TOKEN}"
+      }
+    }
+  }
+}

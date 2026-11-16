@@ -1,0 +1,168 @@
+"""
+Decorators for common tool execution patterns.
+
+This module provides decorators to reduce code duplication in tool functions
+by centralizing logging, error handling, and execution time measurement.
+"""
+
+import functools
+import os
+import time
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
+
+from reversecore_mcp.core.logging_config import (
+    get_logger,
+    reset_correlation_context,
+    start_correlation_context,
+)
+from reversecore_mcp.core.result import ToolResult
+
+logger = get_logger(__name__)
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def log_execution(tool_name: str | None = None) -> Callable[[F], F]:
+    """
+    Decorator to add logging and error handling to tool functions.
+
+    This decorator:
+    - Logs function start and completion
+    - Measures execution time
+    - Handles common exceptions and formats errors
+    - Extracts file_name from function arguments if present
+
+    Args:
+        tool_name: Name of the tool (defaults to function name)
+
+    Returns:
+        Decorated function
+    """
+
+    def decorator(func: F) -> F:
+        # Use provided tool_name or function name
+        actual_tool_name = tool_name or func.__name__
+
+        # Check if function is async
+        import inspect
+
+        is_async = inspect.iscoroutinefunction(func)
+
+        if is_async:
+
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> ToolResult:
+                start_time = time.time()
+                correlation_id, correlation_token = start_correlation_context()
+                file_name = None
+
+                # OPTIMIZATION: Extract filename without creating Path object
+                # Using os.path.basename() for cross-platform path handling
+                for arg_name in ["file_path", "path", "file"]:
+                    if arg_name in kwargs:
+                        path_str = kwargs[arg_name]
+                        if path_str:  # Handle empty strings
+                            file_name = os.path.basename(path_str)
+                        break
+                if not file_name and args:
+                    first_arg = args[0]
+                    if isinstance(first_arg, str) and first_arg:
+                        file_name = os.path.basename(first_arg)
+
+                # Log start
+                log_extra: dict[str, Any] = {
+                    "tool_name": actual_tool_name,
+                    "correlation_id": correlation_id,
+                }
+                if file_name:
+                    log_extra["file_name"] = file_name
+                logger.info(f"Starting {actual_tool_name}", extra=log_extra)
+
+                try:
+                    result = await func(*args, **kwargs)
+                    execution_time = int((time.time() - start_time) * 1000)
+
+                    # Add execution time to metadata
+                    if hasattr(result, "metadata"):
+                        if result.metadata is None:
+                            result.metadata = {}
+                        result.metadata["execution_time_ms"] = execution_time
+
+                    log_extra["execution_time_ms"] = execution_time
+                    logger.info(f"{actual_tool_name} completed successfully", extra=log_extra)
+                    reset_correlation_context(correlation_token)
+                    return cast(ToolResult, result)
+                except Exception:
+                    execution_time = int((time.time() - start_time) * 1000)
+                    log_extra["execution_time_ms"] = execution_time
+                    logger.error(
+                        f"{actual_tool_name} failed",
+                        extra=log_extra,
+                        exc_info=True,
+                    )
+                    reset_correlation_context(correlation_token)
+                    # Critical: Re-raise exception so @handle_tool_errors can catch it
+                    # returning failure() here would hide the error from outer decorators
+                    raise
+
+            return async_wrapper  # type: ignore
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> ToolResult:
+            start_time = time.time()
+            correlation_id, correlation_token = start_correlation_context()
+            file_name = None
+
+            # OPTIMIZATION: Extract filename without creating Path object
+            # Using os.path.basename() for cross-platform path handling
+            for arg_name in ["file_path", "path", "file"]:
+                if arg_name in kwargs:
+                    path_str = kwargs[arg_name]
+                    if path_str:  # Handle empty strings
+                        file_name = os.path.basename(path_str)
+                    break
+            if not file_name and args:
+                # Check first positional argument
+                first_arg = args[0]
+                if isinstance(first_arg, str) and first_arg:
+                    file_name = os.path.basename(first_arg)
+
+            # Log start
+            log_extra: dict[str, Any] = {
+                "tool_name": actual_tool_name,
+                "correlation_id": correlation_id,
+            }
+            if file_name:
+                log_extra["file_name"] = file_name
+            logger.info(f"Starting {actual_tool_name}", extra=log_extra)
+
+            try:
+                result = func(*args, **kwargs)
+                execution_time = int((time.time() - start_time) * 1000)
+
+                # Add execution time to metadata
+                if hasattr(result, "metadata"):
+                    if result.metadata is None:
+                        result.metadata = {}
+                    result.metadata["execution_time_ms"] = execution_time
+
+                log_extra["execution_time_ms"] = execution_time
+                logger.info(f"{actual_tool_name} completed successfully", extra=log_extra)
+                reset_correlation_context(correlation_token)
+                return cast(ToolResult, result)
+            except Exception:
+                execution_time = int((time.time() - start_time) * 1000)
+                log_extra["execution_time_ms"] = execution_time
+                logger.error(
+                    f"{actual_tool_name} failed",
+                    extra=log_extra,
+                    exc_info=True,
+                )
+                reset_correlation_context(correlation_token)
+                # Critical: Re-raise exception so @handle_tool_errors can catch it
+                raise
+
+        return wrapper  # type: ignore
+
+    return decorator

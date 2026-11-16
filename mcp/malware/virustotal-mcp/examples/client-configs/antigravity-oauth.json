@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "virustotal": {
+      "serverUrl": "https://ai.virustotal.com/mcp"
+    }
+  }
+}
